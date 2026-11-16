@@ -1180,6 +1180,16 @@ Continuing with completion, but this should be fixed for future subtasks.`;
         registrationWarning = `ℹ️  Could not verify swarm-mail registration (database may not be available). Consider running swarmmail_init next time.`;
       }
 
+      // Stage untracked files (best-effort) so review includes new files
+      try {
+        const { execSync } = await import("child_process");
+        if (args.files_touched?.length) {
+          for (const f of args.files_touched) {
+            try { execSync(`git add -N -- ${JSON.stringify(f)}`, { cwd: args.project_key, stdio: "ignore", timeout: 5000 }); } catch {}
+          }
+        }
+      } catch {}
+
       // Run Verification Gate unless explicitly skipped
       let verificationResult: VerificationGateResult | null = null;
 
