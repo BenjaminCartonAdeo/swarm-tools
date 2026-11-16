@@ -26,7 +26,7 @@ jobs:
 
       - name: Build CLI dependency
         working-directory: .
-        run: bun run --cwd packages/opencode-swarm-plugin build
+        run: bunx turbo build --filter=opencode-swarm-plugin
 
       - name: Test
         run: bun test
