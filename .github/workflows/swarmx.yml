@@ -1,0 +1,51 @@
+name: swarmx
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  swarmx:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/swarmx
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        working-directory: .
+        run: bun install
+
+      - name: Test
+        run: bun test
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Build
+        run: bun run build
+
+      - name: Pack
+        run: bun pm pack
+
+      - name: Verify install into temp .opencode
+        run: |
+          set -euo pipefail
+          target="$(mktemp -d)/.opencode"
+          node dist/bin/swarmx.js install --target "$target"
+          test -f "$target/.swarmx/manifest.json"
+          test -f "$target/agents/swarm/swarm-coordinator.md"
+          test -f "$target/agents/swarm/swarm-worker.md"
+          test -f "$target/commands/swarmx.md"
+          test -f "$target/skills/swarm-coordination/SKILL.md"
+          test -f "$target/skills/swarm-worker-protocol/SKILL.md"
+          test -f "$target/skills/swarm-jira-import/SKILL.md"
+          node dist/bin/swarmx.js doctor --target "$target"
