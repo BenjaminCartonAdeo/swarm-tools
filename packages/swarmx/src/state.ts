@@ -608,6 +608,9 @@ export async function finishMission(
     mission.updatedAt = store.now();
     await store.save(mission);
     await store.storage.remove(budgetKey(input.projectID, input.sessionID));
+    for (const cellID of Object.keys(mission.counts.attemptsByCell ?? {})) {
+      await store.storage.remove(assignmentKey(input.projectID, cellID));
+    }
     return mission;
   });
 }
