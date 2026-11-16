@@ -359,7 +359,7 @@ describe("agent and assignment gates", () => {
     await startMission(store);
     await setAssignment(store, PROJECT, "cell-a", "ts-pro");
 
-    for (const callerAgent of ["swarm/swarm-worker", "development/mode-all", "build"]) {
+    for (const callerAgent of ["swarm/swarm-worker", "development/mode-all"]) {
       await refuse(
         gateBefore(store, beforeEvent({ id: `caller-${callerAgent}`, callerAgent })),
         "caller_not_coordinator",

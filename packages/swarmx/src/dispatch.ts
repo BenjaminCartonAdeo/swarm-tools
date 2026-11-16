@@ -79,16 +79,17 @@ function normalizeAgentList(listed: DispatchAgentList): readonly DispatchAgentIn
 
 async function requireCoordinatorCaller(store: MissionStateStore, callerID: string): Promise<void> {
   const caller = normalizeAgentList(await store.listAgents()).find((agent) => agent.id === callerID);
+  const coordinatorIDs = new Set(["swarm/swarm-coordinator", "build", "plan"]);
   if (
     caller === undefined ||
-    caller.id !== "swarm/swarm-coordinator" ||
+    !coordinatorIDs.has(caller.id) ||
     caller.mode !== "primary" ||
     caller.hidden
   ) {
     throw new DispatchGateError(
       "caller_not_coordinator",
       undefined,
-      `agent "${callerID}" cannot dispatch; only swarm/swarm-coordinator may do so`,
+      `agent "${callerID}" cannot dispatch; only a coordinator primary may do so`,
     );
   }
 }

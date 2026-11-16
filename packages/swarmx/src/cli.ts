@@ -12,13 +12,19 @@
  * No direct `effect` import: this module is plain Promise-based Node/Bun code.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import { type CliErrorCode, type RunToolOptions, type SwarmCliRunner } from "./types";
 
 export type { CliErrorCode, RunToolOptions, SwarmCliRunner } from "./types";
 
 /** Binary used when neither `binary` nor `$SWARMX_SWARM_BIN` is set. */
-export const DEFAULT_SWARM_BINARY = "swarm";
+export const DEFAULT_SWARM_BINARY = (() => {
+  const local = join(homedir(), ".local", "bin", "swarm");
+  return existsSync(local) ? local : "swarm";
+})();
 
 /** Environment variable overriding the `swarm` executable path. */
 export const SWARMX_SWARM_BIN_ENV = "SWARMX_SWARM_BIN";

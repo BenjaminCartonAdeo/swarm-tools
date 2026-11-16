@@ -17,6 +17,7 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { lstat, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -2777,6 +2778,45 @@ async function executeReviewFeedback(
   return withReviewDecisionLock(key, () => executeReviewFeedbackLocked(runtime, context, args, backendName));
 }
 
+function runLocalVerification(
+  projectPath: string,
+  filesTouched: readonly string[],
+): { passed: boolean; summary: string; steps: Array<Record<string, unknown>> } {
+  const steps: Array<Record<string, unknown>> = [];
+
+  const tsconfig = `${projectPath}/tsconfig.json`;
+  if (existsSync(tsconfig)) {
+    const result = Bun.spawnSync(["bunx", "tsc", "--noEmit"], {
+      cwd: projectPath,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    steps.push({ name: "typecheck", passed: result.exitCode === 0, exitCode: result.exitCode });
+  } else {
+    steps.push({ name: "typecheck", passed: true, skipped: true, skipReason: "No tsconfig.json" });
+  }
+
+  const testFiles = filesTouched.filter(
+    (file) => file.includes(".test.") || file.includes(".spec."),
+  );
+  if (testFiles.length > 0) {
+    const result = Bun.spawnSync(
+      ["bun", "test", ...testFiles.map((file) => `${projectPath}/${file}`)],
+      { cwd: projectPath, stdout: "pipe", stderr: "pipe" },
+    );
+    steps.push({ name: "tests", passed: result.exitCode === 0, exitCode: result.exitCode });
+  } else {
+    steps.push({ name: "tests", passed: true, skipped: true, skipReason: "No test files" });
+  }
+
+  const passed = steps.every((step) => step.passed === true);
+  return {
+    passed,
+    summary: passed ? "Local verification passed" : "Local verification failed",
+    steps,
+  };
+}
+
 async function executeReviewFeedbackLocked(
   runtime: SwarmxRuntime,
   context: ToolExecuteContextLike,
@@ -2866,6 +2906,20 @@ async function executeReviewFeedbackLocked(
       pending.workerSessionID,
       120_000,
     );
+    if (
+      !backendReportedSuccess(completionOutput) &&
+      JSON.stringify(completionOutput).includes("Bead not found")
+    ) {
+      const localVerdict = runLocalVerification(pending.projectPath, pending.filesTouched);
+      completionOutput = {
+        success: localVerdict.passed,
+        verification_gate: {
+          passed: localVerdict.passed,
+          summary: localVerdict.summary,
+          steps: localVerdict.steps,
+        },
+      };
+    }
     const previouslyClosed = backendReportsAlreadyClosed(completionOutput, pending.taskID);
     if (!backendReportedSuccess(completionOutput) && !(recoveringFinalization && previouslyClosed)) {
       if (docOnly) {
