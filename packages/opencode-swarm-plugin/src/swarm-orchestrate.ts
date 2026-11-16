@@ -1390,7 +1390,7 @@ This will be recorded as a negative learning signal.`;
         
         try {
           const syncResult = await hive_sync.execute({ auto_pull: false }, _ctx);
-          syncSuccess = !syncResult.includes("error");
+          syncSuccess = !JSON.stringify(syncResult).includes("error");
         } finally {
           // Restore previous working directory
           setHiveWorkingDirectory(previousWorkingDir);
