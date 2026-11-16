@@ -186,6 +186,17 @@ function relativePath(root: string, full: string): string {
   return full.slice(root.length + 1).split("\\").join("/");
 }
 
+function resolvePluginBundle(): string {
+  const candidates = [
+    join(__dirname, "..", "index.js"),
+    join(__dirname, "..", "dist", "index.js"),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error("swarmx: could not locate plugin bundle");
+}
+
 export function listAssetFiles(assetsDir?: string): string[] {
   const root = assetsDir ?? resolveAssetsDir();
   const groups = ["agents", "commands", "skills"];
@@ -270,6 +281,10 @@ export async function install(opts: InstallOptions = {}): Promise<CommandResult>
   for (const rel of files) {
     assets[rel] = sha256File(join(target, rel));
   }
+  const pluginDest = join(target, "plugins", "swarmx.js");
+  mkdirSync(dirname(pluginDest), { recursive: true });
+  copyFileSync(resolvePluginBundle(), pluginDest);
+  assets["plugins/swarmx.js"] = sha256File(pluginDest);
 
   const manifest: Manifest = {
     version,
@@ -285,7 +300,7 @@ export async function install(opts: InstallOptions = {}): Promise<CommandResult>
     target,
     version,
     scope,
-    message: `Installed ${files.length} assets`,
+    message: `Installed ${Object.keys(assets).length} assets`,
     files: copied,
   };
 }
@@ -331,6 +346,15 @@ export async function upgrade(opts: InstallOptions = {}): Promise<CommandResult>
     const dest = join(target, rel);
     if (existsSync(dest)) assets[rel] = sha256File(dest);
   }
+  const pluginDest = join(target, "plugins", "swarmx.js");
+  mkdirSync(dirname(pluginDest), { recursive: true });
+  const pluginSrc = resolvePluginBundle();
+  if (!existsSync(pluginDest) || sha256File(pluginDest) !== sha256File(pluginSrc)) {
+    if (existsSync(pluginDest)) backupFile(pluginDest);
+    copyFileSync(pluginSrc, pluginDest);
+    updated.push("plugins/swarmx.js");
+  }
+  assets["plugins/swarmx.js"] = sha256File(pluginDest);
 
   const manifest: Manifest = {
     version,
@@ -362,6 +386,7 @@ export async function doctor(opts: InstallOptions = {}): Promise<CommandResult &
   const assetsDir = opts.assetsDir ?? resolveAssetsDir();
   const version = opts.version ?? resolveVersion();
   const files = listAssetFiles(assetsDir);
+  const expected = [...files, "plugins/swarmx.js"];
 
   const issues: string[] = [];
 
@@ -375,7 +400,7 @@ export async function doctor(opts: InstallOptions = {}): Promise<CommandResult &
   }
 
   // Check every expected asset
-  for (const rel of files) {
+  for (const rel of expected) {
     const dest = join(target, rel);
     const src = join(assetsDir, rel);
     if (!existsSync(dest)) {
@@ -400,7 +425,7 @@ export async function doctor(opts: InstallOptions = {}): Promise<CommandResult &
   // Check manifest entries not in source
   if (manifest) {
     for (const key of Object.keys(manifest.assets)) {
-      if (!files.includes(key)) {
+      if (!expected.includes(key)) {
         issues.push(`unknown managed asset in manifest: ${key}`);
       }
     }
