@@ -242,3 +242,6 @@ bun turbo test
 
 MIT
 Swarmx validation: OK
+
+Swarmx e2e validation: OK
+Swarmx e2e final: OK
