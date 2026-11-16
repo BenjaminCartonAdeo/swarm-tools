@@ -1167,7 +1167,7 @@ describe("mission gate → settle sequence", () => {
       rig.tools
         .get("swarm_finish")
         ?.execute({ reason: "no mission" }, toolContext("build", "call-stranger-finish")),
-    ).rejects.toThrow("only the canonical swarm coordinator may use this tool");
+    ).rejects.toThrow("no mission for session");
   });
 
   test("cleanup releases its claim when the backend fails", async () => {

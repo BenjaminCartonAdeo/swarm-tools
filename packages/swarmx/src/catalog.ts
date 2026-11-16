@@ -3356,8 +3356,9 @@ async function requireCoordinator(
   context: ToolExecuteContextLike,
   tool: string,
 ): Promise<void> {
+  const coordinatorAgents = new Set(["build", "plan", "swarm/swarm-coordinator"]);
   if (
-    context.agent !== "swarm/swarm-coordinator" ||
+    !coordinatorAgents.has(context.agent ?? "") ||
     (await resolveCallerMode(runtime, context, tool)) !== "primary"
   ) {
     throw new LocalToolError(tool, "conflict", "only the canonical swarm coordinator may use this tool");
