@@ -7,7 +7,7 @@
  *
  * Key features:
  * - Generate review prompts with full epic context
- * - Track review attempts (max 3 before task fails)
+ * - Track review attempts (max 5 before task fails)
  * - Send structured feedback to workers
  * - Gate completion on review approval
  *
