@@ -804,8 +804,18 @@ export const swarm_revoke_attempts = tool({
   },
 });
 
+export const swarm_reset = tool({
+  description: "Reset swarm mission state: clear review attempts and in-memory attempt tracking. Use to recover from blocked missions.",
+  args: {},
+  async execute() {
+    reviewAttempts.clear();
+    return JSON.stringify({ success: true, message: "Swarm attempt state reset" }, null, 2);
+  },
+});
+
 export const reviewTools = {
   swarm_review,
   swarm_review_feedback,
   swarm_revoke_attempts,
+  swarm_reset,
 };
