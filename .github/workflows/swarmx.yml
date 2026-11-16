@@ -24,6 +24,10 @@ jobs:
         working-directory: .
         run: bun install
 
+      - name: Build CLI dependency
+        working-directory: .
+        run: bun run --cwd packages/opencode-swarm-plugin build
+
       - name: Test
         run: bun test
 
