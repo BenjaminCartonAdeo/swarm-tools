@@ -414,6 +414,32 @@ export const swarm_review = tool({
       } catch {
         // Git diff failed, continue without it
       }
+
+      // Include untracked (new) file contents in the review diff
+      try {
+        const { execSync } = await import("child_process");
+        const untracked: string[] = [];
+        for (const f of args.files_touched || []) {
+          try {
+            execSync(`git ls-files --error-unmatch ${JSON.stringify(f)}`, { cwd: args.project_key, stdio: "ignore" });
+          } catch {
+            untracked.push(f);
+          }
+        }
+        if (untracked.length > 0) {
+          let extra = "\\n\\n--- Untracked (new) files ---\\n";
+          for (const f of untracked) {
+            try {
+              const fs = await import("node:fs");
+              const path = await import("node:path");
+              const full = path.join(args.project_key, f);
+              const content = fs.readFileSync(full, "utf-8");
+              extra += `\\n### ${f}\\n${content}\\n`;
+            } catch {}
+          }
+          diff += extra;
+        }
+      } catch {}
     }
 
     // Generate the review prompt
