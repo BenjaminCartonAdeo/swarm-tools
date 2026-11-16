@@ -8,6 +8,7 @@
  *   swarm setup    - Interactive installer for all dependencies
  *   swarm doctor   - Check dependency health with detailed status
  *   swarm init     - Initialize swarm in current project
+ *   swarm reset    - Reset swarm database (renames swarm.db)
  *   swarm claude   - Claude Code integration commands
  *   swarm mcp-serve - Debug-only MCP server (Claude auto-launches)
  *   swarm version  - Show version info
@@ -114,8 +115,12 @@ import { allTools } from "../src/index.js";
 import { invalidateSkillsCache, discoverSkills } from "../src/skills.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-// When bundled to dist/bin/swarm.js, need to go up two levels to find package.json
-const pkgPath = join(__dirname, "..", "..", "package.json");
+// When bundled to dist/bin/swarm.js, need to go up two levels to find package.json;
+// when run from source bin/swarm.ts, one level is enough.
+let pkgPath = join(__dirname, "..", "package.json");
+if (!existsSync(pkgPath)) {
+  pkgPath = join(__dirname, "..", "..", "package.json");
+}
 const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
 const VERSION: string = pkg.version;
 const PACKAGE_ROOT = dirname(pkgPath);
@@ -3568,6 +3573,7 @@ ${cyan("Commands:")}
     --yes, -y           Non-interactive with defaults (opus/sonnet/haiku)
   swarm doctor          Health check - shows status of all dependencies
   swarm init      Initialize beads in current project
+  swarm reset     Reset swarm database (renames swarm.db to swarm.db.reset.<timestamp>)
   swarm config    Show paths to generated config files
   swarm agents    Update AGENTS.md with skill awareness
   swarm migrate   Migrate PGlite database to libSQL
@@ -4981,6 +4987,21 @@ async function db() {
   }
   
   console.log();
+}
+
+// ============================================================================
+// reset Command
+// ============================================================================
+
+async function reset() {
+  const dbPath = join(homedir(), ".config", "swarm-tools", "swarm.db");
+  if (!existsSync(dbPath)) {
+    console.log("Aucune DB à réinitialiser.");
+    return;
+  }
+  const backup = `${dbPath}.reset.${Date.now()}`;
+  renameSync(dbPath, backup);
+  console.log(`swarm.db réinitialisée → ${backup}`);
 }
 
 // ============================================================================
@@ -7241,6 +7262,9 @@ switch (command) {
   }
   case "migrate":
     await migrate();
+    break;
+  case "reset":
+    await reset();
     break;
   case "db":
     await db();

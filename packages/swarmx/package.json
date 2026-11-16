@@ -15,7 +15,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node && bun build bin/swarmx.ts --outdir dist/bin --target node",
+    "prepare": "bun run build",
+    "build": "bun build src/index.ts --outdir dist --target node --external @opencode/plugin --external @opencode-ai/plugin && bun build bin/swarmx.ts --outdir dist/bin --target node --external @opencode/plugin --external @opencode-ai/plugin",
     "test": "bun test tests/",
     "typecheck": "tsc --noEmit"
   },
