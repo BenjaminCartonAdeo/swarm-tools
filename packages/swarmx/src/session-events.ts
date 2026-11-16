@@ -27,8 +27,9 @@ export interface SessionEvent {
   readonly session_id: string;
   readonly epic_id: string;
   readonly timestamp: string;
-  readonly event_type: "VIOLATION";
-  readonly violation_type: SessionViolationType;
+  readonly event_type: "VIOLATION" | "DECISION";
+  readonly violation_type?: SessionViolationType;
+  readonly decision_type?: string;
   readonly payload: Record<string, unknown>;
 }
 
@@ -82,6 +83,31 @@ export function createSessionEventWriter(): SessionEventSink {
  * @param sink - runtime sink; omitted runtimes are a silent no-op.
  * @param violation - violation family plus scope and payload.
  */
+export interface SessionDecision {
+  readonly sessionID?: string;
+  readonly epicID?: string;
+  readonly decisionType: string;
+  readonly payload?: Record<string, unknown>;
+}
+
+/** Emits a DECISION event through the configured sink (best-effort). */
+export function emitDecision(sink: SessionEventSink | undefined, decision: SessionDecision): void {
+  if (sink === undefined) return;
+  const sessionID = decision.sessionID?.trim();
+  try {
+    sink({
+      session_id: sessionID !== undefined && sessionID.length > 0 ? sessionID : "unknown",
+      epic_id: decision.epicID ?? "",
+      timestamp: new Date().toISOString(),
+      event_type: "DECISION",
+      decision_type: decision.decisionType,
+      payload: decision.payload ?? {},
+    });
+  } catch {
+    // A sink failure must never fail the caller.
+  }
+}
+
 export function emitViolation(sink: SessionEventSink | undefined, violation: SessionViolation): void {
   if (sink === undefined) return;
   const sessionID = violation.sessionID?.trim();

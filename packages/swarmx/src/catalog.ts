@@ -61,7 +61,7 @@ import {
   withMissionLock,
 } from "./state";
 import type { MissionStateStore } from "./state";
-import { emitViolation } from "./session-events";
+import { emitDecision, emitViolation } from "./session-events";
 import {
   LocalToolError,
   UnsupportedToolError,
@@ -928,6 +928,10 @@ const LOCAL_SPECS: readonly ToolSpec[] = [
     "swarm_reset",
     "Reset the current swarm mission: clear attempts, assignments, and budget. Use to recover from a blocked mission.",
   ),
+  local(
+    "swarm_repo_inventory",
+    "Generate a read-only repo inventory: file count by top-level directory and extension, plus a bounded file list. Useful for audit and decomposition.",
+  ),
 ];
 
 /** All exposed tool specs (82). */
@@ -1637,6 +1641,54 @@ async function runReset(
   };
 }
 
+async function runRepoInventory(
+  runtime: SwarmxRuntime,
+  _context: ToolExecuteContextLike,
+): Promise<ToolExecuteResult> {
+  const root = await canonicalProjectRoot("swarm_repo_inventory", runtime);
+  const result = Bun.spawnSync(["git", "ls-files"], {
+    cwd: root,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (result.exitCode !== 0) {
+    throw new LocalToolError(
+      "swarm_repo_inventory",
+      "runtime_unavailable",
+      `git ls-files failed in ${root}: ${result.stderr.toString().trim()}`,
+    );
+  }
+  const files = result.stdout
+    .toString()
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const byTopLevel: Record<string, number> = {};
+  const byExtension: Record<string, number> = {};
+  for (const file of files) {
+    const top = file.includes("/") ? file.slice(0, file.indexOf("/")) : ".";
+    byTopLevel[top] = (byTopLevel[top] ?? 0) + 1;
+    const dot = file.lastIndexOf(".");
+    const ext = dot >= 0 ? file.slice(dot + 1) : "(none)";
+    byExtension[ext] = (byExtension[ext] ?? 0) + 1;
+  }
+  const top = Object.entries(byTopLevel)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([name, count]) => `${name}: ${count}`)
+    .join(", ");
+  return {
+    output: {
+      root,
+      total: files.length,
+      byTopLevel,
+      byExtension,
+      files: files.slice(0, 500),
+    },
+    content: `${files.length} tracked files. Top directories: ${top}.`,
+  };
+}
+
 async function runAgentAudit(
   runtime: SwarmxRuntime,
   context: ToolExecuteContextLike,
@@ -1695,6 +1747,8 @@ async function executeLocal(
       return runFinish(runtime, context, args);
     case "swarm_reset":
       return runReset(runtime, context);
+    case "swarm_repo_inventory":
+      return runRepoInventory(runtime, context);
     case "swarm_agent_audit":
       return runAgentAudit(runtime, context);
     default:
@@ -3006,6 +3060,19 @@ async function executeReviewFeedbackLocked(
         }
       : undefined;
   await clearReviewState(store, receipt, pending, args.status === "approved" || args.status === "unverifiable", approval);
+  if (args.status === "approved" || args.status === "unverifiable") {
+    emitDecision(runtime.sessionEvents, {
+      sessionID: receipt.sessionID,
+      epicID: receipt.epicID,
+      decisionType: "review_approved",
+      payload: {
+        task_id: receipt.taskID,
+        status: args.status,
+        unverifiable,
+        ...(approval?.diffHash === undefined ? {} : { diff_hash: approval.diffHash }),
+      },
+    });
+  }
   return {
     output: {
       review_feedback: feedbackOutput,

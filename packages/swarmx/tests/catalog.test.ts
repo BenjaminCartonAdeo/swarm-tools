@@ -243,6 +243,7 @@ const LOCAL_TOOL_NAMES = [
   "swarm_agent_audit",
   "swarm_finish",
   "swarm_reset",
+  "swarm_repo_inventory",
   "swarm_resolve_agent",
   "swarm_roster",
   "swarm_set_agent",
@@ -251,7 +252,7 @@ const LOCAL_TOOL_NAMES = [
 ] as const;
 
 const CLI_NAME_SET = new Set<string>(CLI_TOOL_NAMES);
-const EXPECTED_COUNT = V1_TOOL_NAMES.length + 2; // 81 + swarm_finish + swarm_reset
+const EXPECTED_COUNT = V1_TOOL_NAMES.length + 3; // 81 + swarm_finish + swarm_reset
 const CALL_CONTEXT = {
   sessionID: "ses-catalog",
   agent: "build",
@@ -276,7 +277,7 @@ function schemaProperties(spec: ToolSpec): Record<string, unknown> {
 }
 
 describe("catalogue coverage", () => {
-  test("83 distinct tool names, all non-empty", () => {
+  test("84 distinct tool names, all non-empty", () => {
     expect(SWARMX_TOOL_SPECS).toHaveLength(EXPECTED_COUNT);
     expect(findToolSpec("swarm_finish")).toBeDefined();
 
@@ -308,7 +309,7 @@ describe("catalogue coverage", () => {
     }
 
     expect(SWARMX_TOOL_SPECS.filter((spec) => spec.name === "swarm_finish")).toHaveLength(1);
-    expect(SWARMX_TOOL_SPECS).toHaveLength(V1_TOOL_NAMES.length + 2);
+    expect(SWARMX_TOOL_SPECS).toHaveLength(V1_TOOL_NAMES.length + 3);
   });
 });
 
@@ -422,7 +423,7 @@ describe("compatibility matrix", () => {
     expect(link?.backendName).toBe("hive_link_thread");
   });
 
-  test("the seven local tools are local, active and carry no backendName", () => {
+  test("the eight local tools are local, active and carry no backendName", () => {
     for (const name of LOCAL_TOOL_NAMES) {
       const spec = findToolSpec(name);
       expect(spec).toBeDefined();
@@ -433,7 +434,7 @@ describe("compatibility matrix", () => {
 
     const locals = SWARMX_TOOL_SPECS.filter((spec) => spec.kind === "local");
     expect(locals).toHaveLength(LOCAL_TOOL_NAMES.length);
-    expect(locals).toHaveLength(8);
+    expect(locals).toHaveLength(9);
   });
 
   test("matrix exposes kind, backendName and reason for every spec", () => {
@@ -458,7 +459,7 @@ describe("compatibility matrix", () => {
     });
   });
 
-  test("distribution is exactly 70 backend active, 1 alias, 4 deprecated, 8 local (83)", () => {
+  test("distribution is exactly 70 backend active, 1 alias, 4 deprecated, 9 local (84)", () => {
     const activeBackend = SWARMX_TOOL_SPECS.filter(
       (spec) => spec.kind === "backend" && spec.status === "active",
     );
@@ -469,9 +470,9 @@ describe("compatibility matrix", () => {
     expect(activeBackend).toHaveLength(70);
     expect(aliases).toHaveLength(1);
     expect(deprecated).toHaveLength(4);
-    expect(locals).toHaveLength(8);
-    expect(activeBackend.length + aliases.length + deprecated.length + locals.length).toBe(83);
-    expect(SWARMX_TOOL_SPECS).toHaveLength(83);
+    expect(locals).toHaveLength(9);
+    expect(activeBackend.length + aliases.length + deprecated.length + locals.length).toBe(84);
+    expect(SWARMX_TOOL_SPECS).toHaveLength(84);
   });
 });
 
