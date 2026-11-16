@@ -793,7 +793,19 @@ export function markReviewRejected(taskId: string): void {
 // Exports
 // ============================================================================
 
+export const swarm_revoke_attempts = tool({
+  description: "Revoke review attempts for a task (reset attempt counter). Use after partial success or to allow re-review.",
+  args: {
+    task_id: tool.schema.string().describe("Task ID to reset attempts for"),
+  },
+  async execute(args) {
+    clearAttempts(args.task_id);
+    return JSON.stringify({ success: true, task_id: args.task_id, message: "Attempts revoked" }, null, 2);
+  },
+});
+
 export const reviewTools = {
   swarm_review,
   swarm_review_feedback,
+  swarm_revoke_attempts,
 };
