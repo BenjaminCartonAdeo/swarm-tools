@@ -607,6 +607,7 @@ export async function finishMission(
     mission.active = false;
     mission.updatedAt = store.now();
     await store.save(mission);
+    await store.storage.remove(budgetKey(input.projectID, input.sessionID));
     return mission;
   });
 }

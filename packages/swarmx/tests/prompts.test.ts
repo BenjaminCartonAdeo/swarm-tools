@@ -473,6 +473,15 @@ describe("local tool handlers", () => {
     expect((newBudget.budget as { maxSpawns: number }).maxSpawns).toBe(20);
   });
 
+  test("swarm_finish clears the budget and allows a new budget", async () => {
+    const { tool } = await setup();
+    await outputOf(tool("swarm_set_budget"), { mode: "audit" });
+    await outputOf(tool("swarm_finish"), { reason: "done" });
+
+    const newBudget = await outputOf(tool("swarm_set_budget"), { mode: "dev" });
+    expect((newBudget.budget as { maxSpawns: number }).maxSpawns).toBe(20);
+  });
+
   test("resetMission clears the budget document", async () => {
     const PROJECT = "adeo";
     const SESSION = "ses_test";
