@@ -15,6 +15,7 @@
     "README.md"
   ],
   "scripts": {
+    "prepare": "bun run build",
     "build": "bun build src/index.ts --outdir dist --target node && bun build bin/swarmx.ts --outdir dist/bin --target node",
     "test": "bun test tests/",
     "typecheck": "tsc --noEmit"
