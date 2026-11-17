@@ -1717,7 +1717,7 @@ describe("mission gate → settle sequence", () => {
   });
 
   test("local verification fallback closes and confirms the Hive cell in the project scope", async () => {
-    const projectPath = await realpath(join(process.cwd(), "packages/swarmx"));
+    const projectPath = await realpath(fileURLToPath(new URL("..", import.meta.url)));
     const file = "tests/prompts.test.ts";
     let hiveStatus = "in_progress";
     let closeCalls = 0;
@@ -1797,7 +1797,7 @@ describe("mission gate → settle sequence", () => {
   }, 30_000);
 
   test("local fallback refuses approval when Hive remains in progress after close", async () => {
-    const projectPath = await realpath(join(process.cwd(), "packages/swarmx"));
+    const projectPath = await realpath(fileURLToPath(new URL("..", import.meta.url)));
     const file = "tests/prompts.test.ts";
     const rig = await createRig({
       agents: GATE_AGENTS,
