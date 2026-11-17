@@ -16,6 +16,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type {
+  ConsolidationState,
+  ConsolidationStatus,
   DispatchAgentLister,
   DispatchAttempt,
   IsoTimestamp,
@@ -62,6 +64,11 @@ export function attemptKey(projectID: string, callID: string): string {
 /** Storage key of a cell assignment. */
 export function assignmentKey(projectID: string, cellID: string): string {
   return `${ASSIGNMENT_KEY_PREFIX}${projectID}:${cellID}`;
+}
+
+/** Owner recorded on a mission-scoped assignment. */
+export interface AssignmentOwner {
+  readonly sessionID: string;
 }
 
 /** Storage key of a budget document. */
@@ -157,6 +164,30 @@ function isMissionCounts(value: unknown): value is MissionCounts {
   );
 }
 
+const CONSOLIDATION_STATUSES: readonly ConsolidationStatus[] = [
+  "pending",
+  "ready",
+  "dispatched",
+  "completed",
+];
+
+/** Non-empty trimmed string: ids are never blank once persisted. */
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isConsolidationState(value: unknown): value is ConsolidationState {
+  return (
+    isRecord(value) &&
+    isNonEmptyString(value.epicID) &&
+    isNonEmptyString(value.cellID) &&
+    CONSOLIDATION_STATUSES.includes(value.status as ConsolidationStatus) &&
+    (value.prompt === undefined || typeof value.prompt === "string") &&
+    typeof value.createdAt === "number" &&
+    Number.isFinite(value.createdAt)
+  );
+}
+
 function isMissionState(value: unknown): value is MissionState {
   return (
     isRecord(value) &&
@@ -169,6 +200,7 @@ function isMissionState(value: unknown): value is MissionState {
     isMissionCounts(value.counts) &&
     (value.retryCauses === undefined ||
       (Array.isArray(value.retryCauses) && value.retryCauses.every(isRetryCauseRecord))) &&
+    (value.consolidation === undefined || isConsolidationState(value.consolidation)) &&
     typeof value.createdAt === "string" &&
     typeof value.updatedAt === "string"
   );
@@ -608,9 +640,7 @@ export async function finishMission(
     mission.updatedAt = store.now();
     await store.save(mission);
     await store.storage.remove(budgetKey(input.projectID, input.sessionID));
-    for (const cellID of Object.keys(mission.counts.attemptsByCell ?? {})) {
-      await store.storage.remove(assignmentKey(input.projectID, cellID));
-    }
+    await removeSessionAssignments(store, input.projectID, input.sessionID);
     return mission;
   });
 }
@@ -660,23 +690,29 @@ export async function resetMission(
   input: { readonly projectID: string; readonly sessionID: string },
 ): Promise<void> {
   return withMissionLock(input.projectID, input.sessionID, async () => {
+    const attempts = await listAttempts(store, input.projectID, input.sessionID);
+    for (const attempt of attempts) {
+      await store.storage.remove(attemptKey(input.projectID, attempt.callID));
+    }
+    await removeSessionAssignments(store, input.projectID, input.sessionID);
     await store.storage.remove(missionKey(input.projectID, input.sessionID));
     await store.storage.remove(budgetKey(input.projectID, input.sessionID));
-    const attempts = await store.storage.scan({
-      prefix: attemptKey(input.projectID, ""),
-      limit: 1000,
-    });
-    for (const entry of attempts.entries) {
-      await store.storage.remove(entry.key);
-    }
-    const assignments = await store.storage.scan({
-      prefix: assignmentKey(input.projectID, ""),
-      limit: 1000,
-    });
-    for (const entry of assignments.entries) {
-      await store.storage.remove(entry.key);
-    }
   });
+}
+
+/** Removes only assignments explicitly owned by one session. */
+async function removeSessionAssignments(
+  store: MissionStateStore,
+  projectID: string,
+  sessionID: string,
+): Promise<void> {
+  const entries = await scanAll(store.storage, `${ASSIGNMENT_KEY_PREFIX}${projectID}:`);
+  for (const entry of entries) {
+    // <!-- ponytail: Unowned legacy entries cannot be attributed safely, so preserve them. -->
+    if (isRecord(entry.value) && entry.value.sessionID === sessionID) {
+      await store.storage.remove(entry.key);
+    }
+  }
 }
 
 /** Records the agent assigned to a cell. Storage only — never a Hive write. */
@@ -685,11 +721,13 @@ export async function setAssignment(
   projectID: string,
   cellID: string,
   agent: string,
+  owner?: AssignmentOwner,
 ): Promise<void> {
   await store.storage.set(assignmentKey(projectID, cellID), {
     cellID,
     agent,
     updatedAt: store.now(),
+    ...(owner === undefined ? {} : { sessionID: owner.sessionID }),
   });
 }
 
@@ -705,10 +743,14 @@ export async function resolveAssignment(
   projectID: string,
   cellID: string,
   cellText?: string,
+  owner?: AssignmentOwner,
 ): Promise<string | undefined> {
   const raw = await store.storage.get(assignmentKey(projectID, cellID));
-  if (isRecord(raw) && typeof raw.agent === "string" && raw.agent.length > 0) {
-    return raw.agent;
+  if (isRecord(raw)) {
+    if (owner !== undefined && raw.sessionID !== undefined && raw.sessionID !== owner.sessionID) {
+      return undefined;
+    }
+    if (typeof raw.agent === "string" && raw.agent.length > 0) return raw.agent;
   }
   if (cellText !== undefined) return parseAgentTag(cellText);
   return undefined;
@@ -852,6 +894,108 @@ export function selectPendingOrphans(attempts: readonly DispatchAttempt[]): Disp
     .sort(compareAttempts);
 }
 
+/** One epic child as reported by the read-only cell lister. */
+export interface ConsolidationCellSummary {
+  readonly id: string;
+  readonly status: string;
+  readonly title?: string;
+}
+
+/** Cell and prompt produced by the injected consolidation creator. */
+export interface PreparedConsolidationCell {
+  readonly cellID: string;
+  readonly prompt: string;
+}
+
+/** Inputs of {@link maybePrepareConsolidation}. */
+export interface MaybePrepareConsolidationInput {
+  readonly projectID: string;
+  readonly sessionID: string;
+  readonly epicID: string;
+  /** Read-only epic lister (Hive). Injected so this module stays storage-only. */
+  readonly listCells: (epicID: string) => Promise<readonly ConsolidationCellSummary[]>;
+  /**
+   * Creates + assigns + starts the consolidation cell and renders its dispatch
+   * prompt. The plugin never spawns: the coordinator consumes the prompt.
+   */
+  readonly prepareCell: (
+    cells: readonly ConsolidationCellSummary[],
+  ) => Promise<PreparedConsolidationCell>;
+}
+
+/**
+ * Terminal Hive statuses for consolidation detection.
+ *
+ * Hive closes cells as `closed`; `completed`/`done` are accepted so an
+ * externally synced snapshot is not treated as in-flight.
+ */
+export function isConsolidationCellFinished(status: string): boolean {
+  const normalized = status.trim().toLowerCase();
+  return normalized === "closed" || normalized === "completed" || normalized === "done";
+}
+
+/**
+ * Prepares the epic consolidation cell once every epic child is finished.
+ *
+ * Idempotent and serialized by {@link withMissionLock}: an existing
+ * `mission.consolidation` is returned as-is, so two parallel approvals create
+ * at most one cell. Returns `undefined` while a cell is still in flight, when
+ * the epic has no children, or when the mission is absent/inactive.
+ */
+export async function maybePrepareConsolidation(
+  store: MissionStateStore,
+  input: MaybePrepareConsolidationInput,
+): Promise<ConsolidationState | undefined> {
+  return withMissionLock(input.projectID, input.sessionID, async () => {
+    const mission = await readMission(store, input.projectID, input.sessionID);
+    if (mission === undefined || !mission.active) return undefined;
+    if (mission.consolidation !== undefined) return mission.consolidation;
+
+    const cells = (await input.listCells(input.epicID)).filter(
+      (cell) => cell.id !== input.epicID,
+    );
+    if (cells.length === 0) return undefined;
+    if (cells.some((cell) => !isConsolidationCellFinished(cell.status))) return undefined;
+
+    const prepared = await input.prepareCell(cells);
+    const consolidation: ConsolidationState = {
+      epicID: input.epicID,
+      cellID: prepared.cellID,
+      status: "ready",
+      prompt: prepared.prompt,
+      createdAt: Date.now(),
+    };
+    mission.consolidation = consolidation;
+    mission.updatedAt = store.now();
+    await store.save(mission);
+    return consolidation;
+  });
+}
+
+/**
+ * Marks the epic consolidation as `completed` once its cell is approved.
+ *
+ * The plugin cannot observe the worker's own completion: the coordinator's
+ * approval of the consolidation cell is the signal. No-op for any other cell,
+ * so it is safe to call on every approval.
+ */
+export async function completeConsolidation(
+  store: MissionStateStore,
+  input: { readonly projectID: string; readonly sessionID: string; readonly cellID: string },
+): Promise<ConsolidationState | undefined> {
+  return withMissionLock(input.projectID, input.sessionID, async () => {
+    const mission = await readMission(store, input.projectID, input.sessionID);
+    const consolidation = mission?.consolidation;
+    if (mission === undefined || consolidation === undefined) return undefined;
+    if (consolidation.cellID !== input.cellID) return undefined;
+    if (consolidation.status === "completed") return consolidation;
+    consolidation.status = "completed";
+    mission.updatedAt = store.now();
+    await store.save(mission);
+    return consolidation;
+  });
+}
+
 /**
  * Structured mission summary for `swarm_agent_audit`.
  *
@@ -877,6 +1021,9 @@ export async function audit(
       counts: mission === undefined ? undefined : cloneCounts(mission.counts),
       attempts,
       pendingOrphans,
+      ...(mission?.consolidation === undefined
+        ? {}
+        : { consolidation: { ...mission.consolidation } }),
     };
   });
 }

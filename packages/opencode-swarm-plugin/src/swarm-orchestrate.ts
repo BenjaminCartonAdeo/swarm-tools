@@ -1197,6 +1197,7 @@ Continuing with completion, but this should be fixed for future subtasks.`;
         verificationResult = await runVerificationGate(
           args.files_touched,
           false,
+          args.project_key,
         );
 
         // Block completion if verification failed

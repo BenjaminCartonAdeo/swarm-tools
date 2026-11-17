@@ -89,6 +89,7 @@ interface Rig {
   readonly tools: Map<string, FakeToolInfo>;
   readonly runCalls: { name: string; args: Record<string, unknown> }[];
   readonly runEnvironments: { name: string; env?: Readonly<Record<string, string>> }[];
+  readonly runWorkingDirectories: { name: string; cwd?: string }[];
   readonly before: (payload: BeforePayload) => Promise<void>;
   readonly after: (payload: AfterPayload) => Promise<void>;
   readonly compaction: (event: FakeCompactionEvent) => Promise<void>;
@@ -109,6 +110,7 @@ async function createRig(options: RigOptions = {}): Promise<Rig> {
   });
   const runCalls: { name: string; args: Record<string, unknown> }[] = [];
   const runEnvironments: { name: string; env?: Readonly<Record<string, string>> }[] = [];
+  const runWorkingDirectories: { name: string; cwd?: string }[] = [];
   const defaultWorkerSessionID = options.workerSessionID ?? "ses-worker";
   const workerCells = new Map<string, CellMarker>();
   const workerParents = new Map<string, string | null>();
@@ -122,9 +124,17 @@ async function createRig(options: RigOptions = {}): Promise<Rig> {
 
   const plugin = createSwarmxPlugin({
     runtime: {
-      runTool: async (name, args, runOptions?: { readonly env?: Readonly<Record<string, string>> }) => {
+      runTool: async (
+        name,
+        args,
+        runOptions?: {
+          readonly cwd?: string;
+          readonly env?: Readonly<Record<string, string>>;
+        },
+      ) => {
         runCalls.push({ name, args });
         runEnvironments.push({ name, ...(runOptions?.env === undefined ? {} : { env: runOptions.env }) });
+        runWorkingDirectories.push({ name, ...(runOptions?.cwd === undefined ? {} : { cwd: runOptions.cwd }) });
         return options.payloadFor?.(name, args) ?? payload;
       },
       resolveWorkerCell: async (sessionID) => workerCells.get(sessionID) ?? options.workerCell,
@@ -151,6 +161,7 @@ async function createRig(options: RigOptions = {}): Promise<Rig> {
     tools,
     runCalls,
     runEnvironments,
+    runWorkingDirectories,
     before: async (event) => {
       await beforeHook?.(event);
     },
@@ -281,6 +292,41 @@ function scopedReviewPayload(
     ].join("\n"),
     context: { files_touched: files },
   };
+}
+
+async function stageCellReview(
+  rig: Rig,
+  input: {
+    readonly projectPath: string;
+    readonly file: string;
+    readonly cellID: string;
+    readonly label: string;
+  },
+): Promise<void> {
+  await dispatchWorker(rig, input.cellID, `call-dispatch-${input.label}`);
+  const completion = rig.tools.get("swarm_complete");
+  const review = rig.tools.get("swarm_review");
+  if (completion === undefined || review === undefined) throw new Error("completion tools are not registered");
+  await completion.execute(
+    {
+      project_key: input.projectPath,
+      agent_name: "swarm-worker",
+      bead_id: input.cellID,
+      summary: "Completed the assigned work.",
+      start_time: 1,
+      files_touched: [input.file],
+    },
+    workerToolContext("swarm/swarm-worker", `call-completion-${input.label}`),
+  );
+  await review.execute(
+    {
+      project_key: input.projectPath,
+      epic_id: "epic-1",
+      task_id: input.cellID,
+      files_touched: [input.file],
+    },
+    toolContext("swarm/swarm-coordinator", `call-review-${input.label}`),
+  );
 }
 
 function reviewReceiptStorageKey(rig: Rig): string | undefined {
@@ -1658,6 +1704,7 @@ describe("mission gate → settle sequence", () => {
       "swarm_review",
       "swarm_complete",
       "swarm_review_feedback",
+      "hive_cells",
     ]);
     expect(rig.runCalls[2]?.args.skip_review).toBe(true);
     expect(rig.runEnvironments).toEqual([
@@ -1665,7 +1712,374 @@ describe("mission gate → settle sequence", () => {
       { name: "swarm_review", env: { OPENCODE_SESSION_ID: SESSION } },
       { name: "swarm_complete", env: { OPENCODE_SESSION_ID: "ses-worker" } },
       { name: "swarm_review_feedback", env: { OPENCODE_SESSION_ID: SESSION } },
+      { name: "hive_cells", env: { OPENCODE_SESSION_ID: SESSION } },
     ]);
+  });
+
+  test("local verification fallback closes and confirms the Hive cell in the project scope", async () => {
+    const projectPath = await realpath(join(process.cwd(), "packages/swarmx"));
+    const file = "tests/prompts.test.ts";
+    let hiveStatus = "in_progress";
+    let closeCalls = 0;
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-fallback", epicID: "epic-1" },
+      payloadFor: (name) => {
+        if (name === "swarm_review") {
+          return scopedReviewPayload(
+            [file],
+            `diff --git a/${file} b/${file}\n@@ -1 +1 @@\n-old\n+reviewed`,
+          );
+        }
+        if (name === "swarm_complete") {
+          return { success: false, error: "Bead not found: cell-fallback" };
+        }
+        if (name === "hive_close") {
+          closeCalls += 1;
+          hiveStatus = "closed";
+          return "Closed cell-fallback: verified";
+        }
+        if (name === "hive_cells") {
+          return {
+            cells: [
+              { id: "cell-fallback", status: hiveStatus },
+              { id: "cell-other", status: "in_progress" },
+            ],
+          };
+        }
+        return { success: true };
+      },
+    });
+    await dispatchWorker(rig, "cell-fallback", "call-dispatch-fallback");
+    await rig.tools.get("swarm_complete")?.execute(
+      {
+        project_key: projectPath,
+        agent_name: "swarm-worker",
+        bead_id: "cell-fallback",
+        summary: "Completed the assigned work.",
+        start_time: 1,
+        files_touched: [file],
+      },
+      workerToolContext("swarm/swarm-worker", "call-completion-fallback"),
+    );
+    await rig.tools.get("swarm_review")?.execute(
+      { project_key: projectPath, epic_id: "epic-1", task_id: "cell-fallback", files_touched: [file] },
+      toolContext("swarm/swarm-coordinator", "call-review-fallback"),
+    );
+
+    const feedback = await rig.tools.get("swarm_review_feedback")?.execute(
+      {
+        project_key: projectPath,
+        task_id: "cell-fallback",
+        worker_id: "swarm-worker",
+        status: "approved",
+        summary: "Scoped diff approved after local verification.",
+      },
+      toolContext("swarm/swarm-coordinator", "call-feedback-fallback"),
+    );
+
+    expect((feedback?.output as { approval_evidence: { status: string } }).approval_evidence.status).toBe(
+      "approved",
+    );
+    expect(closeCalls).toBe(1);
+    const hiveCalls = rig.runCalls.filter((call) => call.name === "hive_cells");
+    expect(hiveCalls.length).toBeGreaterThanOrEqual(2);
+    expect(hiveCalls.every((call) => call.args.project_key === projectPath)).toBe(true);
+    expect(rig.runCalls.some((call) => call.name === "hive_close" && call.args.id === "cell-fallback")).toBe(
+      true,
+    );
+    expect(
+      rig.runWorkingDirectories
+        .filter((call) => call.name === "hive_close" || call.name === "hive_cells")
+        .every((call) => call.cwd === projectPath),
+    ).toBe(true);
+  }, 30_000);
+
+  test("local fallback refuses approval when Hive remains in progress after close", async () => {
+    const projectPath = await realpath(join(process.cwd(), "packages/swarmx"));
+    const file = "tests/prompts.test.ts";
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-still-open", epicID: "epic-1" },
+      payloadFor: (name) => {
+        if (name === "swarm_review") {
+          return scopedReviewPayload(
+            [file],
+            `diff --git a/${file} b/${file}\n@@ -1 +1 @@\n-old\n+reviewed`,
+          );
+        }
+        if (name === "swarm_complete") {
+          return { success: false, error: "Bead not found: cell-still-open" };
+        }
+        if (name === "hive_cells") {
+          return {
+            cells: [
+              { id: "cell-still-open", status: "in_progress" },
+              { id: "cell-other", status: "in_progress" },
+            ],
+          };
+        }
+        return { success: true };
+      },
+    });
+    await dispatchWorker(rig, "cell-still-open", "call-dispatch-still-open");
+    await rig.tools.get("swarm_complete")?.execute(
+      {
+        project_key: projectPath,
+        agent_name: "swarm-worker",
+        bead_id: "cell-still-open",
+        summary: "Completed the assigned work.",
+        start_time: 1,
+        files_touched: [file],
+      },
+      workerToolContext("swarm/swarm-worker", "call-completion-still-open"),
+    );
+    await rig.tools.get("swarm_review")?.execute(
+      { project_key: projectPath, epic_id: "epic-1", task_id: "cell-still-open", files_touched: [file] },
+      toolContext("swarm/swarm-coordinator", "call-review-still-open"),
+    );
+
+    await expect(
+      rig.tools.get("swarm_review_feedback")?.execute(
+        {
+          project_key: projectPath,
+          task_id: "cell-still-open",
+          worker_id: "swarm-worker",
+          status: "approved",
+          summary: "The backend closure could not be verified.",
+        },
+        toolContext("swarm/swarm-coordinator", "call-feedback-still-open"),
+      ),
+    ).rejects.toThrow(/Hive cell cell-still-open is not closed/);
+    expect(rig.runCalls.some((call) => call.name === "hive_close")).toBe(true);
+    expect(await rig.ctx.storage.get(pendingCompletionKey(PROJECT, "cell-still-open"))).toMatchObject({
+      finalizing: false,
+    });
+  }, 30_000);
+
+  test("backend completion with only skipped verification steps cannot be approved", async () => {
+    const projectPath = await realpath(fileURLToPath(new URL("../../..", import.meta.url)));
+    const file = relative(projectPath, fileURLToPath(new URL("../bin/swarmx.ts", import.meta.url)));
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-skipped-backend", epicID: "epic-1" },
+      payloadFor: (name) => {
+        if (name === "swarm_review") {
+          return scopedReviewPayload(
+            [file],
+            `diff --git a/${file} b/${file}\n@@ -1 +1 @@\n-old\n+reviewed`,
+          );
+        }
+        if (name === "swarm_complete") {
+          return {
+            success: true,
+            verification_gate: {
+              passed: true,
+              summary: "No checks executed",
+              steps: [
+                { name: "typecheck", passed: true, skipped: true, skipReason: "No tsconfig.json" },
+                { name: "tests", passed: true, skipped: true, skipReason: "No test files" },
+              ],
+            },
+          };
+        }
+        return { success: true };
+      },
+    });
+    await stageCellReview(rig, {
+      projectPath,
+      file,
+      cellID: "cell-skipped-backend",
+      label: "skipped-backend",
+    });
+
+    await expect(
+      rig.tools.get("swarm_review_feedback")?.execute(
+        {
+          project_key: projectPath,
+          task_id: "cell-skipped-backend",
+          worker_id: "swarm-worker",
+          status: "approved",
+          summary: "Review passed, but verification did not run.",
+        },
+        toolContext("swarm/swarm-coordinator", "call-feedback-skipped-backend"),
+      ),
+    ).rejects.toThrow(/completion returned no verification receipt/);
+    expect(rig.runCalls.some((call) => call.name === "swarm_review_feedback")).toBe(false);
+  });
+
+  test("persisted verification receipts with only skipped steps cannot be reused", async () => {
+    const projectPath = await realpath(process.cwd());
+    const file = SWARMX_FILE;
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-stale-skipped-receipt", epicID: "epic-1" },
+      payload: scopedReviewPayload(
+        [file],
+        `diff --git a/${file} b/${file}\n@@ -1 +1 @@\n-old\n+reviewed`,
+      ),
+    });
+    await dispatchWorker(rig, "cell-stale-skipped-receipt", "call-dispatch-stale-skipped-receipt");
+    await rig.tools.get("swarm_complete")?.execute(
+      {
+        project_key: projectPath,
+        agent_name: "swarm-worker",
+        bead_id: "cell-stale-skipped-receipt",
+        summary: "Completion awaiting review.",
+        start_time: 1,
+        files_touched: [file],
+      },
+      workerToolContext("swarm/swarm-worker", "call-completion-stale-skipped-receipt"),
+    );
+    const key = pendingCompletionKey(PROJECT, "cell-stale-skipped-receipt");
+    const pending = await rig.ctx.storage.get(key);
+    if (typeof pending !== "object" || pending === null) throw new Error("pending completion was not stored");
+    await rig.ctx.storage.set(key, {
+      ...(pending as Record<string, unknown>),
+      verification: {
+        passed: true,
+        summary: "No checks executed.",
+        recordedAt: 1,
+        steps: [
+          { name: "typecheck", passed: true, skipped: true },
+          { name: "tests", passed: true, skipped: true },
+        ],
+      },
+    });
+
+    await expect(
+      rig.tools.get("swarm_review")?.execute(
+        {
+          project_key: projectPath,
+          epic_id: "epic-1",
+          task_id: "cell-stale-skipped-receipt",
+          files_touched: [file],
+        },
+        toolContext("swarm/swarm-coordinator", "call-review-stale-skipped-receipt"),
+      ),
+    ).rejects.toThrow(/matching completion submission/);
+  });
+
+  test("local fallback with no executed checks is blocked before Hive close", async () => {
+    const projectPath = await realpath(fileURLToPath(new URL("../../..", import.meta.url)));
+    const file = relative(projectPath, fileURLToPath(new URL("../bin/swarmx.ts", import.meta.url)));
+    let hiveStatus = "in_progress";
+    let closeCalls = 0;
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-skipped-local", epicID: "epic-1" },
+      payloadFor: (name) => {
+        if (name === "swarm_review") {
+          return scopedReviewPayload(
+            [file],
+            `diff --git a/${file} b/${file}\n@@ -1 +1 @@\n-old\n+reviewed`,
+          );
+        }
+        if (name === "swarm_complete") {
+          return { success: false, error: "Bead not found: cell-skipped-local" };
+        }
+        if (name === "hive_close") {
+          closeCalls += 1;
+          hiveStatus = "closed";
+          return "Closed cell-skipped-local: should not happen";
+        }
+        if (name === "hive_cells") {
+          return {
+            cells: [
+              { id: "cell-skipped-local", status: hiveStatus },
+              { id: "cell-other", status: "in_progress" },
+            ],
+          };
+        }
+        return { success: true };
+      },
+    });
+    await stageCellReview(rig, {
+      projectPath,
+      file,
+      cellID: "cell-skipped-local",
+      label: "skipped-local",
+    });
+
+    await expect(
+      rig.tools.get("swarm_review_feedback")?.execute(
+        {
+          project_key: projectPath,
+          task_id: "cell-skipped-local",
+          worker_id: "swarm-worker",
+          status: "approved",
+          summary: "Review passed, but no local checks ran.",
+        },
+        toolContext("swarm/swarm-coordinator", "call-feedback-skipped-local"),
+      ),
+    ).rejects.toThrow(/completion verification gate failed/);
+    expect(closeCalls).toBe(0);
+    expect(await rig.ctx.storage.get(pendingCompletionKey(PROJECT, "cell-skipped-local"))).toMatchObject({
+      finalizing: false,
+    });
+  });
+
+  test("doc-only local fallback stays unverifiable but still closes Hive", async () => {
+    const projectPath = await realpath(fileURLToPath(new URL("../../..", import.meta.url)));
+    const file = "AGENTS.md";
+    let hiveStatus = "in_progress";
+    let closeCalls = 0;
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-doc-only", epicID: "epic-1" },
+      payloadFor: (name) => {
+        if (name === "swarm_review") {
+          return scopedReviewPayload(
+            [file],
+            `diff --git a/${file} b/${file}\n@@ -1 +1 @@\n-old\n+reviewed`,
+          );
+        }
+        if (name === "swarm_complete") {
+          return { success: false, error: "Bead not found: cell-doc-only" };
+        }
+        if (name === "hive_close") {
+          closeCalls += 1;
+          hiveStatus = "closed";
+          return "Closed cell-doc-only: reviewed documentation";
+        }
+        if (name === "hive_cells") {
+          return {
+            cells: [
+              { id: "cell-doc-only", status: hiveStatus },
+              { id: "cell-other", status: "in_progress" },
+            ],
+          };
+        }
+        return { success: true };
+      },
+    });
+    await stageCellReview(rig, {
+      projectPath,
+      file,
+      cellID: "cell-doc-only",
+      label: "doc-only",
+    });
+
+    const feedback = await rig.tools.get("swarm_review_feedback")?.execute(
+      {
+        project_key: projectPath,
+        task_id: "cell-doc-only",
+        worker_id: "swarm-worker",
+        status: "approved",
+        summary: "Documentation diff approved as unverifiable.",
+      },
+      toolContext("swarm/swarm-coordinator", "call-feedback-doc-only"),
+    );
+
+    expect((feedback?.output as { status: string }).status).toBe("unverifiable");
+    expect(closeCalls).toBe(1);
+    expect(hiveStatus).toBe("closed");
   });
 
   test.skip("concurrent review decisions on one cell are serialized", async () => {
@@ -1854,6 +2268,7 @@ describe("mission gate → settle sequence", () => {
       "swarm_review",
       "swarm_complete",
       "swarm_review_feedback",
+      "hive_cells",
     ]);
     await rig.tools.get("swarm_finish")?.execute({ reason: "finalized" }, toolContext());
     await expect(

@@ -21,6 +21,7 @@ import {
   type DispatchBeforeEvent,
 } from "../src/dispatch";
 import {
+  assignmentKey,
   audit,
   createMissionStateStore,
   finishMission,
@@ -28,6 +29,7 @@ import {
   putAttempt,
   readMission,
   resolveAssignment,
+  resetMission,
   setAssignment,
   setBudget,
   withMissionLock,
@@ -953,6 +955,174 @@ describe("persistence and audit", () => {
       status: "succeeded",
     });
     expect(summary.pendingOrphans).toBe(0);
+  });
+});
+
+describe("session-scoped reset and assignment ownership", () => {
+  test("reset removes only this session's attempts and assignments", async () => {
+    const { store } = setup();
+    const current = await startMission(store, { sessionID: SESSION });
+    const otherSession = "ses-other";
+    const other = await startMission(store, { sessionID: otherSession });
+    const ts = "2026-11-17T00:00:00.000Z";
+
+    await putAttempt(store, PROJECT, {
+      callID: "call-current-session",
+      missionID: current.missionID,
+      sessionID: SESSION,
+      cellID: "cell-current-session",
+      agent: "development/typescript-pro",
+      status: "failed",
+      ts,
+    });
+    await putAttempt(store, PROJECT, {
+      callID: "call-other-session",
+      missionID: other.missionID,
+      sessionID: otherSession,
+      cellID: "cell-other-session",
+      agent: "vue",
+      status: "failed",
+      ts,
+    });
+    await store.storage.set(assignmentKey(PROJECT, "cell-current-session"), {
+      cellID: "cell-current-session",
+      agent: "development/typescript-pro",
+      sessionID: SESSION,
+    });
+    await store.storage.set(assignmentKey(PROJECT, "cell-other-session"), {
+      cellID: "cell-other-session",
+      agent: "vue",
+      sessionID: otherSession,
+    });
+
+    await resetMission(store, { projectID: PROJECT, sessionID: SESSION });
+
+    expect(await store.load(PROJECT, SESSION)).toBeUndefined();
+    expect(await store.load(PROJECT, otherSession)).toMatchObject({ active: true });
+    expect(await listAttempts(store, PROJECT, SESSION)).toEqual([]);
+    expect(await listAttempts(store, PROJECT, otherSession)).toHaveLength(1);
+    expect(await resolveAssignment(store, PROJECT, "cell-current-session")).toBeUndefined();
+    expect(await resolveAssignment(store, PROJECT, "cell-other-session")).toBe("vue");
+  });
+
+  test("an assignment owned by another session cannot satisfy the dispatch gate", async () => {
+    const { store } = setup();
+    await startMission(store, { sessionID: SESSION });
+    await startMission(store, { sessionID: "ses-other" });
+    await store.storage.set(assignmentKey(PROJECT, "cell-a"), {
+      cellID: "cell-a",
+      agent: "development/typescript-pro",
+      sessionID: "ses-other",
+    });
+
+    await refuse(
+      gateBefore(store, beforeEvent({ id: "call-other-session-assignment", sessionID: SESSION })),
+      "cell_not_assigned",
+    );
+    expect((await readMission(store, PROJECT, SESSION))?.counts.spawns).toBe(0);
+  });
+
+  test("finishing a session removes its unspawned assignments, not another session's", async () => {
+    const { store } = setup();
+    await startMission(store, { sessionID: SESSION });
+    await startMission(store, { sessionID: "ses-other" });
+    await store.storage.set(assignmentKey(PROJECT, "cell-unspawned-current"), {
+      cellID: "cell-unspawned-current",
+      agent: "development/typescript-pro",
+      sessionID: SESSION,
+    });
+    await store.storage.set(assignmentKey(PROJECT, "cell-unspawned-other"), {
+      cellID: "cell-unspawned-other",
+      agent: "vue",
+      sessionID: "ses-other",
+    });
+
+    await finishMission(store, { projectID: PROJECT, sessionID: SESSION });
+
+    expect(await resolveAssignment(store, PROJECT, "cell-unspawned-current")).toBeUndefined();
+    expect(await resolveAssignment(store, PROJECT, "cell-unspawned-other")).toBe("vue");
+  });
+});
+
+describe("consolidation state", () => {
+  const VALID = {
+    epicID: "cell-epic",
+    cellID: "cell-consolidate",
+    status: "ready",
+    prompt: "Merge the cells and verify.",
+    createdAt: 1_700_000_000_000,
+  } as const;
+
+  /**
+   * Persists a mission whose `consolidation` is forced to `value` and reads it
+   * back. `undefined` therefore means "the validator rejected the document".
+   */
+  async function roundTrip(
+    value: unknown,
+  ): Promise<{ mission: MissionState | undefined; base: MissionState }> {
+    const { store } = setup();
+    const base = await startMission(store);
+    await store.save({ ...base, consolidation: value } as unknown as MissionState);
+    return { mission: await readMission(store, PROJECT, SESSION), base };
+  }
+
+  test("a mission without consolidation stays valid", async () => {
+    const { store } = setup();
+    await startMission(store);
+
+    const mission = await readMission(store, PROJECT, SESSION);
+
+    expect(mission?.consolidation).toBeUndefined();
+  });
+
+  test("every consolidation status round-trips through the validator", async () => {
+    for (const status of ["pending", "ready", "dispatched", "completed"] as const) {
+      const { mission } = await roundTrip({ ...VALID, status });
+      expect(mission?.consolidation).toEqual({ ...VALID, status });
+    }
+  });
+
+  test("prompt is optional", async () => {
+    const withoutPrompt = {
+      epicID: VALID.epicID,
+      cellID: VALID.cellID,
+      status: VALID.status,
+      createdAt: VALID.createdAt,
+    };
+
+    const { mission } = await roundTrip(withoutPrompt);
+
+    expect(mission?.consolidation).toEqual(withoutPrompt);
+  });
+
+  test("an empty prompt is accepted (it is optional content, not an id)", async () => {
+    const { mission } = await roundTrip({ ...VALID, prompt: "" });
+
+    expect(mission?.consolidation?.prompt).toBe("");
+  });
+
+  test.each([
+    ["a blank epicID", { ...VALID, epicID: "" }],
+    ["a whitespace-only epicID", { ...VALID, epicID: "   " }],
+    ["a non-string epicID", { ...VALID, epicID: 42 }],
+    ["a blank cellID", { ...VALID, cellID: "" }],
+    ["a whitespace-only cellID", { ...VALID, cellID: "\t\n" }],
+    ["a missing cellID", { ...VALID, cellID: undefined }],
+    ["an unknown status", { ...VALID, status: "merged" }],
+    ["a non-string status", { ...VALID, status: 1 }],
+    ["a missing status", { ...VALID, status: undefined }],
+    ["a string createdAt", { ...VALID, createdAt: "1700000000000" }],
+    ["a NaN createdAt", { ...VALID, createdAt: Number.NaN }],
+    ["an Infinity createdAt", { ...VALID, createdAt: Number.POSITIVE_INFINITY }],
+    ["a missing createdAt", { ...VALID, createdAt: undefined }],
+    ["a non-string prompt", { ...VALID, prompt: ["merge"] }],
+    ["null", null],
+    ["an array", []],
+    ["a bare string", "ready"],
+  ])("rejects consolidation with %s", async (_label, value) => {
+    const { mission } = await roundTrip(value);
+
+    expect(mission).toBeUndefined();
   });
 });
 

@@ -43,10 +43,13 @@ import {
 } from "./history";
 import {
   audit,
+  completeConsolidation,
   getAttempt,
   finishMission,
+  isConsolidationCellFinished,
   listAssignments,
   listAttempts,
+  maybePrepareConsolidation,
   readMission,
   resolveAssignment,
   sameMissionGeneration,
@@ -66,8 +69,10 @@ import {
   LocalToolError,
   UnsupportedToolError,
   type CellMarker,
+  type ConsolidationState,
   type DispatchAgentInfo,
   type DispatchAgentList,
+  type DispatchAttempt,
   type MissionAudit,
   type MissionMode,
   type MissionState,
@@ -265,7 +270,9 @@ USE THIS TOOL TO:
 - Find cells by type: hive_cells({ type: "bug" })
 - Get a specific cell by partial ID: hive_cells({ id: "mjkmd" })
 - Get the next ready (unblocked) cell: hive_cells({ ready: true })
+- Get children of an epic: hive_cells({ parent_id: "epic-id" })
 - Combine filters: hive_cells({ status: "open", type: "task" })
+- Query another project: hive_cells({ project_key: "/home/joel/clawd" })
 
 RETURNS: Array of cells with id, title, status, priority, type, parent_id, created_at, updated_at
 
@@ -278,8 +285,10 @@ PREFER THIS OVER hive_query when you need to:
       id: str("Partial or full cell ID to look up"),
       status: enumOf(CELL_STATUS, "Filter by status"),
       type: enumOf(["task", "bug", "feature", "epic", "chore"], "Filter by type"),
+      parent_id: str("Filter by parent epic ID (returns children of an epic)"),
       ready: bool("If true, return only the next unblocked cell"),
       limit: num("Max cells to return (default 20)"),
+      project_key: str("Override project scope (use hive_projects to list available)"),
     },
   ),
   // Proven alias: the CLI package itself declares `beads_link_thread` as
@@ -1290,6 +1299,8 @@ async function runResolveAgent(
 
   if (apply) {
     const { store, projectID } = requireStoreProject("swarm_resolve_agent", runtime);
+    const sessionID = resolveSessionID(runtime, context);
+    const owner = sessionID === undefined ? undefined : { sessionID };
     for (const result of results) {
       if (result.agent === null) continue;
       if (result.bead_id === undefined) {
@@ -1299,7 +1310,7 @@ async function runResolveAgent(
           `cannot persist the assignment of "${result.title}": bead_id is required when apply=true`,
         );
       }
-      await setAssignment(store, projectID, result.bead_id, result.agent);
+      await setAssignment(store, projectID, result.bead_id, result.agent, owner);
     }
   }
 
@@ -1349,7 +1360,14 @@ async function runSetAgent(
     );
   }
   const { store, projectID } = requireStoreProject("swarm_set_agent", runtime);
-  await setAssignment(store, projectID, beadID, entry.id);
+  const sessionID = resolveSessionID(runtime, context);
+  await setAssignment(
+    store,
+    projectID,
+    beadID,
+    entry.id,
+    sessionID === undefined ? undefined : { sessionID },
+  );
   return {
     output: { bead_id: beadID, agent: entry.id, rationale, persisted: true },
     content: `Assignment stored for ${beadID}: agent=${entry.id}`,
@@ -1557,13 +1575,65 @@ async function runSetBudget(
   }
 }
 
+/**
+ * Refuses `swarm_finish` while an epic still owes its consolidation.
+ *
+ * Rule: an epic with more than one work cell must be consolidated (a
+ * `completed` consolidation) before the mission closes; a single-cell epic or a
+ * mission whose attempts carry no epic needs nothing.
+ *
+ * Read-only and best effort: when `hive_cells` is unavailable the finish is
+ * allowed — a backend read failure must not deadlock the coordinator. The
+ * consolidation cell itself is not counted as a work cell.
+ */
+async function assertConsolidationComplete(
+  runtime: SwarmxRuntime,
+  sessionID: string,
+  mission: MissionState,
+  attempts: readonly DispatchAttempt[],
+): Promise<void> {
+  const epicIDs = new Set<string>();
+  if (mission.consolidation !== undefined) epicIDs.add(mission.consolidation.epicID);
+  for (const attempt of attempts) {
+    if (attempt.epicID !== undefined && attempt.epicID.length > 0) epicIDs.add(attempt.epicID);
+  }
+  for (const epicID of epicIDs) {
+    const consolidation = mission.consolidation?.epicID === epicID ? mission.consolidation : undefined;
+    if (consolidation?.status === "completed") continue;
+    let children: readonly EpicChildCell[];
+    try {
+      children = await listEpicChildCells(runtime, sessionID, epicID);
+    } catch {
+      continue;
+    }
+    // Self-healing: a consolidation cell already closed in the hive wins over
+    // the persisted pointer (the coordinator may have closed it directly).
+    const consolidationCell =
+      consolidation === undefined
+        ? undefined
+        : children.find((cell) => cell.id === consolidation.cellID);
+    if (consolidationCell !== undefined && isConsolidationCellFinished(consolidationCell.status)) {
+      continue;
+    }
+    const workCells = children.filter(
+      (cell) => cell.id !== epicID && cell.id !== consolidation?.cellID,
+    );
+    if (workCells.length <= 1) continue;
+    throw new LocalToolError(
+      "swarm_finish",
+      "conflict",
+      `consolidation required: epic ${epicID} has ${workCells.length} cells and no completed consolidation (${consolidation === undefined ? "none prepared" : `status=${consolidation.status}`})`,
+    );
+  }
+}
+
 async function runFinish(
   runtime: SwarmxRuntime,
   context: ToolExecuteContextLike,
   input: Record<string, unknown>,
 ): Promise<ToolExecuteResult> {
   const reason = optionalStringInput("swarm_finish", input, "reason") ?? "";
-  const { store, projectID, sessionID } = await requireMissionScope("swarm_finish", runtime, context);
+  const { store, projectID, sessionID, projectRoot } = await requireMissionScope("swarm_finish", runtime, context);
   const lockKey = [projectID, sessionID].map(encodeURIComponent).join(":");
   return withReviewDecisionLock(lockKey, async () => {
     const current = await readMission(store, projectID, sessionID);
@@ -1599,6 +1669,9 @@ async function runFinish(
         throw new LocalToolError("swarm_finish", "conflict", "the mission has pending completion reviews");
       }
     }
+    if (current.active) {
+      await assertConsolidationComplete(runtime, sessionID, current, attempts);
+    }
     let mission: MissionState | undefined;
     try {
       mission = await finishMission(store, { projectID, sessionID });
@@ -1615,6 +1688,57 @@ async function runFinish(
         `no mission for session ${sessionID}; call swarm_set_budget first`,
       );
     }
+    const cleanupWarnings: Array<{
+      readonly type: "warning";
+      readonly code: "worktree_cleanup_failed" | "worktree_cleanup_skipped";
+      readonly taskID: string;
+      readonly message: string;
+    }> = [];
+    const cellIDs = new Set(attempts.map((attempt) => attempt.cellID));
+    if (projectRoot === undefined) {
+      for (const cellID of cellIDs) {
+        cleanupWarnings.push({
+          type: "warning",
+          code: "worktree_cleanup_skipped",
+          taskID: cellID,
+          message: "canonical project root is not wired",
+        });
+      }
+    } else {
+      for (const cellID of cellIDs) {
+        try {
+          const result = parseBackendObject(
+            await runToolForSession(
+              runtime,
+              "swarm_worktree_cleanup",
+              { project_path: projectRoot, task_id: cellID },
+              sessionID,
+              120_000,
+            ),
+          );
+          const nestedOutput = parseBackendObject(result.output);
+          const failure = [result, nestedOutput].find(
+            (candidate) =>
+              candidate.success === false ||
+              candidate.ok === false ||
+              candidate.isError === true ||
+              typeof candidate.error === "string",
+          );
+          if (failure !== undefined) {
+            throw new Error(
+              typeof failure.error === "string" ? failure.error : "backend reported cleanup failure",
+            );
+          }
+        } catch (error) {
+          cleanupWarnings.push({
+            type: "warning",
+            code: "worktree_cleanup_failed",
+            taskID: cellID,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
     return {
       output: {
         sessionID,
@@ -1623,6 +1747,7 @@ async function runFinish(
         mode: mission.mode,
         counts: mission.counts,
         reason,
+        ...(cleanupWarnings.length === 0 ? {} : { warnings: cleanupWarnings }),
       },
       content: `Mission ${sessionID} finished (mode=${mission.mode}, spawns=${mission.counts.spawns}).`,
     };
@@ -1703,6 +1828,7 @@ async function runAgentAudit(
   const workerSpawns = result.attempts.filter((attempt) => isSwarmWorkerAgentID(attempt.agent)).length;
   const spawns = result.counts?.spawns ?? 0;
   const workerShare = spawns > 0 ? workerSpawns / spawns : 0;
+  const consolidation = result.consolidation;
   const lines = [
     result.active
       ? `Mission active — mode=${result.mode} spawns=${spawns}`
@@ -1710,6 +1836,11 @@ async function runAgentAudit(
     `cells: ${cells.length} (ready ${readyCells.length})`,
     `swarm-worker spawns: ${workerSpawns} (${Math.round(workerShare * 100)}%)`,
     `attempts: ${result.attempts.length}, pending orphans repaired: ${result.pendingOrphans}`,
+    ...(consolidation === undefined
+      ? []
+      : [
+          `consolidation: ${consolidation.status} — cell ${consolidation.cellID}${consolidation.status === "completed" ? "" : " (dispatch the prompt, then mark it completed)"}`,
+        ]),
   ];
   return {
     output: {
@@ -1720,6 +1851,16 @@ async function runAgentAudit(
       readyCells,
       workerSpawns,
       workerShare,
+      // Projected shape so the coordinator sees only what it must act on.
+      consolidation:
+        consolidation === undefined
+          ? null
+          : {
+              status: consolidation.status,
+              cellID: consolidation.cellID,
+              epicID: consolidation.epicID,
+              ...(consolidation.prompt === undefined ? {} : { prompt: consolidation.prompt }),
+            },
     },
     content: lines.join("\n"),
   };
@@ -2059,6 +2200,11 @@ function isVerificationGateReceipt(value: unknown): value is VerificationGateRec
     typeof record.recordedAt === "number" &&
     Array.isArray(record.steps) &&
     record.steps.length > 0 &&
+    record.steps.some((step) => asArguments(step).skipped !== true) &&
+    record.steps.every((step) => {
+      const entry = asArguments(step);
+      return entry.skipped === true || entry.passed === true;
+    }) &&
     record.steps.every((step) => {
       const entry = asArguments(step);
       return (
@@ -2188,6 +2334,12 @@ function parseCompletionVerificationReceipt(output: unknown): VerificationGateRe
       ...(step.skipReason === undefined ? {} : { skipReason: step.skipReason }),
     });
   }
+  if (
+    !steps.some((step) => step.skipped !== true) ||
+    steps.some((step) => step.skipped !== true && !step.passed)
+  ) {
+    return undefined;
+  }
   return {
     passed: true,
     summary: typeof gate.summary === "string" ? gate.summary : "",
@@ -2204,6 +2356,7 @@ function runToolForSession(
   timeoutMs?: number,
 ): Promise<unknown> {
   return runtime.runTool(name, args, {
+    ...(runtime.projectPath === undefined ? {} : { cwd: runtime.projectPath }),
     env: { OPENCODE_SESSION_ID: sessionID },
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
   });
@@ -2407,7 +2560,13 @@ async function recordScopedReview(
       throw new LocalToolError("swarm_review", "conflict", "the mission changed while review was running");
     }
     const missionID = reviewMissionID(mission);
-    const assignment = await resolveAssignment(scope.store, scope.projectID, taskID);
+    const assignment = await resolveAssignment(
+      scope.store,
+      scope.projectID,
+      taskID,
+      undefined,
+      { sessionID: scope.sessionID },
+    );
     if (assignment === undefined) {
       throw new LocalToolError("swarm_review", "conflict", "the reviewed cell has no persisted agent assignment");
     }
@@ -2863,12 +3022,217 @@ function runLocalVerification(
     steps.push({ name: "tests", passed: true, skipped: true, skipReason: "No test files" });
   }
 
-  const passed = steps.every((step) => step.passed === true);
+  const hasExecutedCheck = steps.some((step) => step.skipped !== true);
+  const passed = hasExecutedCheck && steps.every((step) => step.passed === true);
   return {
     passed,
-    summary: passed ? "Local verification passed" : "Local verification failed",
+    summary: passed
+      ? "Local verification passed"
+      : hasExecutedCheck
+        ? "Local verification failed"
+        : "No local verification checks were executed",
     steps,
   };
+}
+
+/** Deduplicated, non-empty file list; `renderSubtaskPrompt` refuses empties. */
+function consolidationFiles(files: readonly string[]): string[] {
+  const unique = [...new Set(files.map((file) => file.trim()).filter((file) => file.length > 0))];
+  return unique.length === 0 ? ["(no specific files — use judgment)"] : unique;
+}
+
+/** One epic child as returned by `hive_cells` (read-only projection). */
+interface EpicChildCell {
+  readonly id: string;
+  readonly status: string;
+  readonly title?: string;
+}
+
+function toEpicChildCell(value: unknown): EpicChildCell | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.id !== "string" || record.id.length === 0) return undefined;
+  if (typeof record.status !== "string") return undefined;
+  return {
+    id: record.id,
+    status: record.status,
+    ...(typeof record.title === "string" ? { title: record.title } : {}),
+  };
+}
+
+/** Accepts a JSON string, a bare array or a `{ cells: [...] }` envelope. */
+function parseEpicCells(output: unknown): EpicChildCell[] {
+  let parsed = output;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed) as unknown;
+    } catch {
+      return [];
+    }
+  }
+  const rows = Array.isArray(parsed)
+    ? parsed
+    : typeof parsed === "object" && parsed !== null && Array.isArray((parsed as Record<string, unknown>).cells)
+      ? ((parsed as Record<string, unknown>).cells as unknown[])
+      : [];
+  return rows
+    .map(toEpicChildCell)
+    .filter((cell): cell is EpicChildCell => cell !== undefined);
+}
+
+/** Lists the children of one epic through the backend `hive_cells` tool. */
+async function listEpicChildCells(
+  runtime: SwarmxRuntime,
+  sessionID: string,
+  epicID: string,
+): Promise<EpicChildCell[]> {
+  // `parent_id` is a first-class filter of the backend `hive_cells` schema
+  // (opencode-swarm-plugin/src/hive.ts: `parent_id` → adapter.queryCells), and
+  // the local catalog spec declares it too, so the CLI forwards it verbatim.
+  const output = await runToolForSession(
+    runtime,
+    "hive_cells",
+    {
+      ...(runtime.projectPath === undefined ? {} : { project_key: runtime.projectPath }),
+      parent_id: epicID,
+      limit: 200,
+    },
+    sessionID,
+    60_000,
+  );
+  return parseEpicCells(output);
+}
+
+/**
+ * Completes the Hive half of the reviewed local fallback.
+ *
+ * The normal backend `swarm_complete` path closes the cell itself. When that
+ * path reports `Bead not found`, approval must also close the cell in the
+ * active project and read the terminal status back. Code cells require local
+ * checks to pass; doc-only cells use the existing explicit `unverifiable` path.
+ */
+async function closeHiveCellAfterFallback(
+  runtime: SwarmxRuntime,
+  sessionID: string,
+  pending: PendingCompletionReceipt,
+): Promise<void> {
+  let closeError: unknown;
+  try {
+    await runToolForSession(
+      runtime,
+      "hive_close",
+      { id: pending.taskID, reason: `Locally verified and approved: ${pending.summary}` },
+      sessionID,
+      120_000,
+    );
+  } catch (error) {
+    // The cell may already be closed if the CLI lost the close response.
+    closeError = error;
+  }
+
+  let cell: EpicChildCell | undefined;
+  try {
+    cell = (await listEpicChildCells(runtime, sessionID, pending.epicID)).find(
+      (candidate) => candidate.id === pending.taskID,
+    );
+  } catch (error) {
+    closeError ??= error;
+  }
+  if (cell !== undefined && isConsolidationCellFinished(cell.status)) return;
+
+  const detail = closeError instanceof Error ? `: ${closeError.message}` : "";
+  throw new LocalToolError(
+    "swarm_review_feedback",
+    "conflict",
+    `Hive cell ${pending.taskID} is not closed after local verification${detail}`,
+  );
+}
+
+/**
+ * Arguments of the `hive_create` call that persists the consolidation cell.
+ *
+ * `parent_id` is mandatory: the consolidation cell must be a child of the epic
+ * it consolidates, otherwise it is an orphan in the hive tree and never shows
+ * up in `hive_cells({ parent_id: epicID })`.
+ */
+export function consolidationCreateArgs(input: {
+  readonly title: string;
+  readonly description: string;
+  readonly epicID: string;
+}): Record<string, unknown> {
+  return {
+    title: input.title,
+    type: "task",
+    description: input.description,
+    parent_id: input.epicID,
+  };
+}
+
+/**
+ * Creates, assigns and starts the consolidation cell, then renders its prompt.
+ *
+ * The plugin cannot spawn: it prepares the cell so the coordinator only has to
+ * dispatch the returned prompt once.
+ */
+async function prepareConsolidationCell(
+  runtime: SwarmxRuntime,
+  store: MissionStateStore,
+  scope: {
+    readonly projectID: string;
+    readonly sessionID: string;
+    readonly epicID: string;
+    readonly files: readonly string[];
+  },
+  cells: readonly EpicChildCell[],
+): Promise<{ readonly cellID: string; readonly prompt: string }> {
+  const title = `Consolidate ${scope.epicID}`;
+  const description = [
+    `Merge, summarize and verify the work of epic ${scope.epicID}.`,
+    "",
+    "Approved cells:",
+    ...cells.map(
+      (cell) =>
+        `- ${cell.id}${cell.title === undefined ? "" : `: ${cell.title}`} (${cell.status})`,
+    ),
+    "",
+    "Re-run the affected tests and report the final verification.",
+  ].join("\n");
+  const files = consolidationFiles(scope.files);
+
+  const created = await runToolForSession(
+    runtime,
+    "hive_create",
+    consolidationCreateArgs({ title, description, epicID: scope.epicID }),
+    scope.sessionID,
+    60_000,
+  );
+  const cellID = parseBackendObject(created).id;
+  if (typeof cellID !== "string" || cellID.length === 0) {
+    throw new LocalToolError(
+      "swarm_review_feedback",
+      "runtime_unavailable",
+      "hive_create returned no consolidation cell id",
+    );
+  }
+  await setAssignment(store, scope.projectID, cellID, SWARM_WORKER_AGENT_ID, {
+    sessionID: scope.sessionID,
+  });
+  try {
+    await runToolForSession(runtime, "hive_start", { id: cellID }, scope.sessionID, 60_000);
+  } catch {
+    // Best effort: the coordinator can start the cell before dispatching it.
+  }
+
+  const prompt = renderSubtaskPrompt({
+    cellID,
+    epicID: scope.epicID,
+    agent: SWARM_WORKER_AGENT_ID,
+    title,
+    description,
+    files,
+    ...(runtime.workerProtocol === undefined ? {} : { protocol: runtime.workerProtocol }),
+  });
+  return { cellID, prompt };
 }
 
 async function executeReviewFeedbackLocked(
@@ -2973,6 +3337,15 @@ async function executeReviewFeedbackLocked(
           steps: localVerdict.steps,
         },
       };
+      if (localVerdict.passed || docOnly) {
+        try {
+          await closeHiveCellAfterFallback(runtime, receipt.sessionID, pending);
+        } catch (error) {
+          await setPendingCompletionFinalizing(store, receipt, pending, false);
+          const message = error instanceof Error ? error.message : String(error);
+          throw new LocalToolError("swarm_review_feedback", "conflict", message);
+        }
+      }
     }
     const previouslyClosed = backendReportsAlreadyClosed(completionOutput, pending.taskID);
     if (!backendReportedSuccess(completionOutput) && !(recoveringFinalization && previouslyClosed)) {
@@ -3073,6 +3446,54 @@ async function executeReviewFeedbackLocked(
       },
     });
   }
+  let consolidation: ConsolidationState | undefined;
+  let consolidationError: string | undefined;
+  if (args.status === "approved" || args.status === "unverifiable") {
+    try {
+      consolidation = await maybePrepareConsolidation(store, {
+        projectID: receipt.projectID,
+        sessionID: receipt.sessionID,
+        epicID: receipt.epicID,
+        listCells: (epicID) => listEpicChildCells(runtime, receipt.sessionID, epicID),
+        prepareCell: (cells) =>
+          prepareConsolidationCell(
+            runtime,
+            store,
+            {
+              projectID: receipt.projectID,
+              sessionID: receipt.sessionID,
+              epicID: receipt.epicID,
+              files: receipt.filesTouched,
+            },
+            cells,
+          ),
+      });
+    } catch (error) {
+      // Consolidation is best effort: the approval itself already succeeded.
+      consolidationError = error instanceof Error ? error.message : String(error);
+    }
+    // Approving the consolidation cell itself closes the loop: the mission may
+    // now finish (see `assertConsolidationComplete`).
+    try {
+      const completed = await completeConsolidation(store, {
+        projectID: receipt.projectID,
+        sessionID: receipt.sessionID,
+        cellID: receipt.taskID,
+      });
+      if (completed !== undefined) consolidation = completed;
+    } catch (error) {
+      consolidationError = error instanceof Error ? error.message : String(error);
+    }
+    if (consolidation !== undefined) {
+      emitDecision(runtime.sessionEvents, {
+        sessionID: receipt.sessionID,
+        epicID: consolidation.epicID,
+        decisionType:
+          consolidation.status === "completed" ? "consolidation_completed" : "consolidation_ready",
+        payload: { cell_id: consolidation.cellID, status: consolidation.status },
+      });
+    }
+  }
   return {
     output: {
       review_feedback: feedbackOutput,
@@ -3087,6 +3508,16 @@ async function executeReviewFeedbackLocked(
               ...(approval.warning === undefined ? {} : { warning: approval.warning }),
             },
           }),
+      ...(consolidation === undefined
+        ? {}
+        : {
+            consolidation: {
+              status: consolidation.status,
+              cell_id: consolidation.cellID,
+              ...(consolidation.prompt === undefined ? {} : { prompt: consolidation.prompt }),
+            },
+          }),
+      ...(consolidationError === undefined ? {} : { consolidation_error: consolidationError }),
       ...(unverifiable
         ? {
             status: "unverifiable",
@@ -3173,7 +3604,9 @@ async function requireAssignedWorkerScope(
   }
 
   const { store, projectID } = requireStoreProject(tool, runtime);
-  const assignment = await resolveAssignment(store, projectID, marker.cellID);
+  const assignment = await resolveAssignment(store, projectID, marker.cellID, undefined, {
+    sessionID: parentSessionID,
+  });
   if (assignment === undefined) {
     throw new LocalToolError(tool, "conflict", "the dispatched cell has no persisted agent assignment");
   }

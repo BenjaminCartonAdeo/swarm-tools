@@ -204,11 +204,12 @@ async function requireDispatchableAgent(
 async function requireAssignment(
   store: MissionStateStore,
   projectID: string,
+  sessionID: string,
   marker: CellMarker,
   agent: DispatchAgentInfo,
   agentID: string,
 ): Promise<void> {
-  const assigned = await resolveAssignment(store, projectID, marker.cellID);
+  const assigned = await resolveAssignment(store, projectID, marker.cellID, undefined, { sessionID });
   if (assigned === undefined) {
     throw new DispatchGateError(
       "cell_not_assigned",
@@ -404,7 +405,7 @@ export async function gateBefore(
   }
   const dispatchedAgentID = targetAgentID;
   const agent = await requireDispatchableAgent(store, dispatchedAgentID);
-  await requireAssignment(store, projectID, marker, agent, dispatchedAgentID);
+  await requireAssignment(store, projectID, event.sessionID, marker, agent, dispatchedAgentID);
   const reservation = await reserveSpawn(store, projectID, event, marker, agent, mission);
   if (reservation.status === "replay" || reservation.status === "reserved") {
     attachDispatchToken(event.input, reservation.dispatchToken, marker.cellID);

@@ -56,7 +56,7 @@ export interface VerificationGateResult {
  * Attempts to run TypeScript type checking on the project.
  * Falls back gracefully if tsc is not available.
  */
-export async function runTypecheckVerification(): Promise<VerificationStep> {
+export async function runTypecheckVerification(projectPath?: string): Promise<VerificationStep> {
   const step: VerificationStep = {
     name: "typecheck",
     command: "tsc --noEmit",
@@ -65,8 +65,9 @@ export async function runTypecheckVerification(): Promise<VerificationStep> {
   };
 
   try {
-    // Check if tsconfig.json exists in current directory
-    const tsconfigExists = await Bun.file("tsconfig.json").exists();
+    // Check if tsconfig.json exists in the project directory
+    const tsconfigPath = projectPath ? `${projectPath}/tsconfig.json` : "tsconfig.json";
+    const tsconfigExists = await Bun.file(tsconfigPath).exists();
     if (!tsconfigExists) {
       step.skipped = true;
       step.skipReason = "No tsconfig.json found";
@@ -74,7 +75,8 @@ export async function runTypecheckVerification(): Promise<VerificationStep> {
       return step;
     }
 
-    const result = await Bun.$`tsc --noEmit`.quiet().nothrow();
+    const command = Bun.$`tsc --noEmit`;
+    const result = await (projectPath ? command.cwd(projectPath) : command).quiet().nothrow();
     step.exitCode = result.exitCode;
     step.passed = result.exitCode === 0;
 
@@ -99,6 +101,7 @@ export async function runTypecheckVerification(): Promise<VerificationStep> {
  */
 export async function runTestVerification(
   filesTouched: string[],
+  projectPath?: string,
 ): Promise<VerificationStep> {
   const step: VerificationStep = {
     name: "tests",
@@ -134,9 +137,10 @@ export async function runTestVerification(
   const existingTests: string[] = [];
   for (const pattern of testPatterns) {
     try {
-      const exists = await Bun.file(pattern).exists();
+      const resolved = projectPath ? `${projectPath}/${pattern}` : pattern;
+      const exists = await Bun.file(resolved).exists();
       if (exists) {
-        existingTests.push(pattern);
+        existingTests.push(resolved);
       }
     } catch {
       // File doesn't exist, skip
@@ -152,7 +156,8 @@ export async function runTestVerification(
 
   try {
     step.command = `bun test ${existingTests.join(" ")}`;
-    const result = await Bun.$`bun test ${existingTests}`.quiet().nothrow();
+    const command = Bun.$`bun test ${existingTests}`;
+    const result = await (projectPath ? command.cwd(projectPath) : command).quiet().nothrow();
     step.exitCode = result.exitCode;
     step.passed = result.exitCode === 0;
 
@@ -184,12 +189,13 @@ export async function runTestVerification(
 export async function runVerificationGate(
   filesTouched: string[],
   _skipUbs: boolean = false, // Kept for backward compatibility, now ignored
+  projectPath?: string,
 ): Promise<VerificationGateResult> {
   const steps: VerificationStep[] = [];
   const blockers: string[] = [];
 
   // Step 1: Typecheck
-  const typecheckStep = await runTypecheckVerification();
+  const typecheckStep = await runTypecheckVerification(projectPath);
   steps.push(typecheckStep);
   if (!typecheckStep.passed && !typecheckStep.skipped) {
     blockers.push(
@@ -198,7 +204,7 @@ export async function runVerificationGate(
   }
 
   // Step 2: Tests
-  const testStep = await runTestVerification(filesTouched);
+  const testStep = await runTestVerification(filesTouched, projectPath);
   steps.push(testStep);
   if (!testStep.passed && !testStep.skipped) {
     blockers.push(

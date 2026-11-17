@@ -329,6 +329,26 @@ export interface RetryCauseRecord extends RetryRootCause {
   readonly ts: IsoTimestamp;
 }
 
+/** Lifecycle of the epic consolidation cell prepared by the plugin. */
+export type ConsolidationStatus = "pending" | "ready" | "dispatched" | "completed";
+
+/**
+ * Pointer to the consolidation cell of one epic.
+ *
+ * The plugin cannot spawn a subagent: it prepares the cell, assigns it and
+ * stores the generated prompt here. The coordinator dispatches it.
+ */
+export interface ConsolidationState {
+  /** Epic whose cells are being consolidated. */
+  epicID: string;
+  /** Consolidation cell created (or reserved) for this epic. */
+  cellID: string;
+  status: ConsolidationStatus;
+  /** Prompt handed to the coordinator when dispatching the cell. */
+  prompt?: string;
+  createdAt: number;
+}
+
 /**
  * Persisted mission state.
  *
@@ -347,6 +367,8 @@ export interface MissionState {
   counts: MissionCounts;
   /** Retry root causes recorded by `swarm_spawn_retry`, oldest first. */
   retryCauses?: RetryCauseRecord[];
+  /** Consolidation cell of the active epic, once prepared. */
+  consolidation?: ConsolidationState;
   createdAt: IsoTimestamp;
   updatedAt: IsoTimestamp;
 }
@@ -543,4 +565,11 @@ export interface MissionAudit {
   readonly attempts: readonly DispatchAttempt[];
   /** Pending attempts abandoned by a crash and moved to `aborted` by this call. */
   readonly pendingOrphans: number;
+  /**
+   * Consolidation cell of the active epic, once prepared.
+   *
+   * Exposed so `swarm_agent_audit` can tell the coordinator that a consolidation
+   * prompt is waiting to be dispatched (or that it already ran).
+   */
+  readonly consolidation?: ConsolidationState;
 }
