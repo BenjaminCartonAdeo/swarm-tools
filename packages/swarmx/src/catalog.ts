@@ -2474,6 +2474,7 @@ type ScopedReviewDiffCheck =
 function checkScopedReviewDiff(
   output: unknown,
   filesTouched: readonly string[],
+  projectRoot?: string,
 ): ScopedReviewDiffCheck {
   // No-file tasks: nothing to diff or verify; the review is vacuously complete.
   if (filesTouched.length === 0) {
@@ -2482,58 +2483,66 @@ function checkScopedReviewDiff(
   const record = parseBackendObject(output);
   if (typeof record.review_prompt !== "string") return { ok: false, missing: "diff" };
   const returnedFiles = asArguments(record.context).files_touched;
-  if (
-    !Array.isArray(returnedFiles) ||
-    returnedFiles.length !== filesTouched.length ||
-    !returnedFiles.every((file, index) => file === filesTouched[index])
-  ) {
+  const returnedList = Array.isArray(returnedFiles) ? (returnedFiles as string[]) : [];
+
+  // The backend only returns tracked files that have a git diff. Files that are
+  // new (untracked or outside any repo) have no diff and are absent from
+  // returnedFiles. Accept them as long as they exist on disk.
+  const missingFromBackend = filesTouched.filter((f) => !returnedList.includes(f));
+  if (returnedList.some((f) => !filesTouched.includes(f))) {
     return { ok: false, missing: "file" };
+  }
+  for (const file of missingFromBackend) {
+    const fullPath = projectRoot ? resolve(projectRoot, file) : file;
+    if (!existsSync(fullPath)) {
+      return { ok: false, missing: "file" };
+    }
   }
 
   const prompt = record.review_prompt;
   const filesStart = prompt.indexOf("## Files Modified\n");
   const codeStart = prompt.indexOf("\n## Code Changes\n", filesStart);
-  if (filesStart < 0 || codeStart < 0) return { ok: false, missing: "diff" };
-  const fileSection = prompt.slice(filesStart, codeStart);
-  const listedFiles = [...fileSection.matchAll(/^- `([^`]+)`$/gm)].map((match) => match[1]);
-  if (
-    listedFiles.length !== filesTouched.length ||
-    !listedFiles.every((file, index) => file === filesTouched[index])
-  ) {
-    return { ok: false, missing: "file" };
-  }
 
-  const diffStartMarker = "## Code Changes\n```diff\n";
-  const diffEndMarker = "\n```\n\n## Review Criteria";
-  const diffStart = prompt.indexOf(diffStartMarker, codeStart);
-  const diffEnd = prompt.indexOf(diffEndMarker, diffStart + diffStartMarker.length);
-  if (diffStart < 0 || diffEnd < 0) return { ok: false, missing: "diff" };
-  const diff = prompt.slice(diffStart + diffStartMarker.length, diffEnd).trim();
-  if (diff.length === 0 || diff.includes("(no diff available)")) {
-    return { ok: false, missing: "diff" };
-  }
+  let diff = "";
+  // If the backend returned a diff (tracked files present), validate its
+  // structure for those files only.
+  if (returnedList.length > 0) {
+    if (filesStart < 0 || codeStart < 0) return { ok: false, missing: "diff" };
+    const fileSection = prompt.slice(filesStart, codeStart);
+    const listedFiles = [...fileSection.matchAll(/^- `([^`]+)`$/gm)].map((match) => match[1]);
+    if (
+      listedFiles.length !== returnedList.length ||
+      !listedFiles.every((file, index) => file === returnedList[index])
+    ) {
+      return { ok: false, missing: "file" };
+    }
 
-  const sections = parseGitDiffSections(diff);
-  if (sections === undefined || sections.length === 0) return { ok: false, missing: "diff" };
-  if (sections.some((section) => !hasCompleteDiffChange(section.lines))) {
-    return { ok: false, missing: "empty_file" };
-  }
+    const diffStartMarker = "## Code Changes\n```diff\n";
+    const diffEndMarker = "\n```\n\n## Review Criteria";
+    const diffStart = prompt.indexOf(diffStartMarker, codeStart);
+    const diffEnd = prompt.indexOf(diffEndMarker, diffStart + diffStartMarker.length);
+    if (diffStart < 0 || diffEnd < 0) return { ok: false, missing: "diff" };
+    diff = prompt.slice(diffStart + diffStartMarker.length, diffEnd).trim();
+    if (diff.length === 0 || diff.includes("(no diff available)")) {
+      return { ok: false, missing: "diff" };
+    }
 
-  const expectedPaths = new Set(filesTouched);
-  const diffPaths = new Set(sections.flatMap((section) => [section.oldPath, section.newPath]));
-  if (
-    diffPaths.size !== expectedPaths.size ||
-    [...diffPaths].some((file) => !expectedPaths.has(file))
-  ) {
-    return { ok: false, missing: "file" };
-  }
-  // Explicit per-entry assertion: a rename section can cover two paths, but
-  // every requested path must still be present in at least one section.
-  for (const file of expectedPaths) {
-    if (!sections.some((section) => section.oldPath === file || section.newPath === file)) {
+    const sections = parseGitDiffSections(diff);
+    if (sections === undefined || sections.length === 0) return { ok: false, missing: "diff" };
+    if (sections.some((section) => !hasCompleteDiffChange(section.lines))) {
+      return { ok: false, missing: "empty_file" };
+    }
+
+    const expectedPaths = new Set(returnedList);
+    const diffPaths = new Set(sections.flatMap((section) => [section.oldPath, section.newPath]));
+    if (
+      diffPaths.size !== expectedPaths.size ||
+      [...diffPaths].some((file) => !expectedPaths.has(file))
+    ) {
       return { ok: false, missing: "file" };
     }
   }
+
   return { ok: true, diff };
 }
 
@@ -2570,7 +2579,7 @@ async function recordScopedReview(
   const taskID = requireStringInput("swarm_review", args, "task_id");
   const epicID = requireStringInput("swarm_review", args, "epic_id");
   const filesTouched = args.files_touched as string[];
-  const check = checkScopedReviewDiff(output, filesTouched);
+  const check = checkScopedReviewDiff(output, filesTouched, projectRoot);
   if (!check.ok) {
     throw new LocalToolError("swarm_review", "conflict", scopedDiffFailureMessage(check.missing));
   }
