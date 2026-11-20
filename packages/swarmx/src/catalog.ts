@@ -4191,7 +4191,10 @@ async function executeSpec(
       }
       if (untrackedFiles.length > 0) {
         try {
-          spawnSync("git", ["add", "--intent-to-add", "--", ...untrackedFiles], {
+          // Stage the (previously untracked) files so they also appear in
+          // `git diff --cached` (used by some review backends). Unstaged
+          // afterwards in the finally block.
+          spawnSync("git", ["add", "--", ...untrackedFiles], {
             cwd: projectRoot,
             stdio: "ignore",
           });
