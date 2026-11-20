@@ -19,6 +19,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { lstat, realpath, stat } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 import {
@@ -1920,7 +1921,21 @@ async function validateReviewScope(
   input: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const projectRoot = await validateProjectRoot(runtime, "swarm_review", input.project_key);
-  return validateProjectFiles(runtime, "swarm_review", input, projectRoot);
+  const result = await validateProjectFiles(runtime, "swarm_review", input, projectRoot);
+  // Make untracked (newly created) files visible to `git diff` so the review
+  // backend can include them (intent-to-add, no real staging).
+  const files = Array.isArray(result.files_touched) ? (result.files_touched as string[]) : [];
+  if (files.length > 0 && typeof projectRoot === "string") {
+    try {
+      spawnSync("git", ["add", "--intent-to-add", "--", ...files], {
+        cwd: projectRoot,
+        stdio: "ignore",
+      });
+    } catch {
+      // Best-effort: ignore failures (not a git repo, etc.).
+    }
+  }
+  return result;
 }
 
 /** Stale plugin copy: `.opencode1/...` must never be treated as the active project. */
