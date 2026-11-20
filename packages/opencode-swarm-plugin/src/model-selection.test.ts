@@ -17,7 +17,7 @@ interface TestConfig {
 describe("selectWorkerModel", () => {
   const mockConfig: TestConfig = {
     primaryModel: "anthropic/claude-sonnet-4-5",
-    liteModel: "anthropic/claude-haiku-4-5",
+    liteModel: "opencode-go/deepseek-v4.1-flash",
   };
 
   test("uses explicit model field from subtask when provided", () => {
@@ -42,7 +42,7 @@ describe("selectWorkerModel", () => {
     };
 
     const result = selectWorkerModel(subtask, mockConfig);
-    expect(result).toBe("anthropic/claude-haiku-4-5");
+    expect(result).toBe("opencode-go/deepseek-v4.1-flash");
   });
 
   test("uses liteModel for all MDX files", () => {
@@ -54,7 +54,7 @@ describe("selectWorkerModel", () => {
     };
 
     const result = selectWorkerModel(subtask, mockConfig);
-    expect(result).toBe("anthropic/claude-haiku-4-5");
+    expect(result).toBe("opencode-go/deepseek-v4.1-flash");
   });
 
   test("uses liteModel for test files with .test. pattern", () => {
@@ -66,7 +66,7 @@ describe("selectWorkerModel", () => {
     };
 
     const result = selectWorkerModel(subtask, mockConfig);
-    expect(result).toBe("anthropic/claude-haiku-4-5");
+    expect(result).toBe("opencode-go/deepseek-v4.1-flash");
   });
 
   test("uses liteModel for test files with .spec. pattern", () => {
@@ -78,7 +78,7 @@ describe("selectWorkerModel", () => {
     };
 
     const result = selectWorkerModel(subtask, mockConfig);
-    expect(result).toBe("anthropic/claude-haiku-4-5");
+    expect(result).toBe("opencode-go/deepseek-v4.1-flash");
   });
 
   test("uses primaryModel when files are mixed (code + docs)", () => {
@@ -147,7 +147,7 @@ describe("selectWorkerModel", () => {
     };
 
     const result = selectWorkerModel(subtask, emptyConfig);
-    expect(result).toBe("anthropic/claude-haiku-4-5");
+    expect(result).toBe("opencode-go/deepseek-v4.1-flash");
   });
 
   test("handles empty files array by defaulting to primaryModel", () => {
@@ -171,7 +171,7 @@ describe("selectWorkerModel", () => {
     };
 
     const result = selectWorkerModel(subtask, mockConfig);
-    expect(result).toBe("anthropic/claude-haiku-4-5");
+    expect(result).toBe("opencode-go/deepseek-v4.1-flash");
   });
 
   test("case insensitive file extension matching", () => {
@@ -183,6 +183,6 @@ describe("selectWorkerModel", () => {
     };
 
     const result = selectWorkerModel(subtask, mockConfig);
-    expect(result).toBe("anthropic/claude-haiku-4-5");
+    expect(result).toBe("opencode-go/deepseek-v4.1-flash");
   });
 });

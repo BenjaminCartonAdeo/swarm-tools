@@ -45,9 +45,9 @@ and must be a non-empty array » + boucle de re-spawn à coût doublé) :
     Un subagent ne peut pas clore la cellule ni modifier sa description ou sa priorité.
 8. **`hivemind_store(information, tags=...)`** — stocker ce que tu as appris
    (patterns, pièges, contraintes découvertes).
-9. **`swarm_complete(...)`** — PAS `hive_close`. Fournis une liste non vide
-     `files_touched`; `start_time` est optionnel (auto-rempli avec l'heure de soumission
-     si absent, et toujours exploitable pour la télémétrie). Cela soumet le résultat à la
+9. **`swarm_complete(...)`** — PAS `hive_close`. `files_touched` peut être vide pour
+     les tâches sans modification de fichier (recherche, analyse) ; `start_time` est
+     optionnel (auto-rempli avec l'heure de soumission si absent). Cela soumet le résultat à la
      review, sans clore
      la cellule. Après l'approbation du coordinateur, swarmx exécute la Verification Gate et
      finalise la cellule. `skip_review` et `skip_verification` sont toujours refusés.

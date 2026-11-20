@@ -82,6 +82,7 @@ interface RigOptions {
   /** Payload returned by the fake CLI runner for every backend tool. */
   readonly payload?: unknown;
   readonly payloadFor?: (name: string, args: Record<string, unknown>) => unknown;
+  readonly workerProtocol?: string;
 }
 
 interface Rig {
@@ -139,6 +140,7 @@ async function createRig(options: RigOptions = {}): Promise<Rig> {
       },
       resolveWorkerCell: async (sessionID) => workerCells.get(sessionID) ?? options.workerCell,
       resolveWorkerParentSession: async (sessionID) => workerParents.get(sessionID),
+      ...(options.workerProtocol === undefined ? {} : { workerProtocol: options.workerProtocol }),
     },
   });
   await plugin.setup(ctx as unknown as Plugin.Context);
@@ -2812,7 +2814,7 @@ describe("mission gate → settle sequence", () => {
   });
 
   test("generated subtask prompts fail closed when the worker protocol skill is missing", async () => {
-    const rig = await createRig({ skills: [] });
+    const rig = await createRig({ skills: [], workerProtocol: "" });
     const tool = rig.tools.get("swarm_subtask_prompt");
     expect(tool).toBeDefined();
 

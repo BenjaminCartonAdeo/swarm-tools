@@ -59,10 +59,10 @@ export function selectWorkerModel(
 
     if (allDocs || allTests) {
       // Use lite model if configured, otherwise fall back to primary
-      return config.liteModel || config.primaryModel || "anthropic/claude-haiku-4-5";
+      return config.liteModel || config.primaryModel || "opencode-go/deepseek-v4.1-flash";
     }
   }
 
   // Priority 3: Default to primary model
-  return config.primaryModel || "anthropic/claude-haiku-4-5";
+  return config.primaryModel || "opencode-go/deepseek-v4.1-flash";
 }

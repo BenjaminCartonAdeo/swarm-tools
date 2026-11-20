@@ -1850,7 +1850,7 @@ export const swarm_spawn_subtask = tool({
     // For now, we use reasonable defaults
     const config = {
       primaryModel: "anthropic/claude-sonnet-4-5",
-      liteModel: "anthropic/claude-haiku-4-5",
+      liteModel: "opencode-go/deepseek-v4.1-flash",
     };
     
     const selectedModel = selectWorkerModel(subtask, config);

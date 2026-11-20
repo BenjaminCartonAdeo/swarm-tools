@@ -78,6 +78,7 @@ async function createRig(projectPath: string): Promise<Rig> {
       runTool: async () => ({ ok: true }),
       sessionID: () => SESSION,
       sessionEvents: createSessionEventWriter(),
+      workerProtocol: "",
       resolveWorkerCell: async (sessionID) => workerCells.get(sessionID),
       resolveWorkerParentSession: async (sessionID) => workerParents.get(sessionID),
     },

@@ -19,7 +19,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { lstat, realpath, stat } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 import {
   countOccurrences,
@@ -492,7 +492,7 @@ const SWARM_SPECS: readonly ToolSpec[] = [
   ),
   backend(
     "swarm_complete",
-    "Submit a worker's completion for coordinator review. Requires a non-empty files_touched list; start_time is optional and defaults to the submission time. swarmx runs the verification gate and finalizes only after an approved scoped review. Skip flags are rejected.",
+    "Submit a worker's completion for coordinator review. files_touched may be empty for no-file tasks (research, analysis); start_time is optional and defaults to the submission time. swarmx runs the verification gate and finalizes only after an approved scoped review. Skip flags are rejected.",
     {
       project_key: str("Project key"),
       agent_name: str("Agent name"),
@@ -500,8 +500,8 @@ const SWARM_SPECS: readonly ToolSpec[] = [
       summary: str("Completion summary", { minLength: 1 }),
       evaluation: str("Self-evaluation JSON"),
       files_touched: withDescription(
-        { type: "array", items: str(), minItems: 1 },
-        "Non-empty list of changed file paths; these paths will be verified",
+        { type: "array", items: str(), minItems: 0 },
+        "List of changed file paths (may be empty for no-file tasks); these paths will be verified",
       ),
       start_time: num(
         "Optional task start timestamp in Unix milliseconds; defaults to the submission time",
@@ -510,7 +510,7 @@ const SWARM_SPECS: readonly ToolSpec[] = [
       skip_verification: bool("Legacy override; swarmx rejects true and always requires verification"),
       skip_review: bool("Legacy override; swarmx rejects true and always requires coordinator review"),
     },
-    ["project_key", "agent_name", "bead_id", "summary", "files_touched"],
+    ["project_key", "agent_name", "bead_id", "summary"],
   ),
   backend(
     "swarm_record_outcome",
@@ -647,17 +647,17 @@ const WORKTREE_REVIEW_SPECS: readonly ToolSpec[] = [
   ),
   backend(
     "swarm_review",
-    "Coordinator-only: generate a review prompt with the epic context and a complete diff limited to non-empty files_touched paths in the active project.",
+    "Coordinator-only: generate a review prompt with the epic context and a complete diff limited to files_touched paths in the active project. files_touched may be empty for no-file tasks.",
     {
       project_key: str("Canonical active project root"),
       epic_id: str("Epic bead ID"),
       task_id: str("Subtask bead ID to review"),
       files_touched: withDescription(
-        { type: "array", items: str(), minItems: 1 },
-        "Non-empty list of changed paths; review output includes only these files' diff",
+        { type: "array", items: str(), minItems: 0 },
+        "List of changed paths (may be empty for no-file tasks); review output includes only these files' diff",
       ),
     },
-    ["project_key", "epic_id", "task_id", "files_touched"],
+    ["project_key", "epic_id", "task_id"],
   ),
   backend(
     "swarm_review_feedback",
@@ -2011,6 +2011,23 @@ async function resolveCanonicalProjectKey(
     throw new LocalToolError(tool, "invalid_input", "project_key must identify the active project root");
   }
   const requested = projectKey.trim();
+  // Normalize benign variants (bare project name) to the canonical root instead
+  // of rejecting them. Only genuinely different roots (or malformed shapes such
+  // as trailing separators / dot segments) still raise non_canonical.
+  const shapeIsClean =
+    stripTrailingSeparators(requested) === requested &&
+    !requested.split(/[\\/]+/).some((segment) => segment === "." || segment === "..");
+  // Only normalize truly bare project names (no path separators) to the
+  // canonical root. Paths — even ones whose final segment matches — keep going
+  // through the strict validation below so malformed shapes are still rejected.
+  if (
+    shapeIsClean &&
+    !/[\\/]/.test(requested) &&
+    requested.toLowerCase() === basename(projectRoot).toLowerCase() &&
+    !isAbsolute(requested)
+  ) {
+    return projectRoot;
+  }
   assertProjectKeyShape(tool, requested);
 
   if (isAbsolute(requested)) {
@@ -2039,8 +2056,9 @@ async function validateProjectFiles(
   input: Record<string, unknown>,
   projectRoot: string,
 ): Promise<Record<string, unknown>> {
+  // Allow empty/absent files_touched for no-file tasks (research, analysis).
   if (!Array.isArray(input.files_touched) || input.files_touched.length === 0) {
-    throw new LocalToolError(tool, "invalid_input", "files_touched must contain at least one file");
+    return { ...input, project_key: projectRoot, files_touched: [] };
   }
 
   const filesTouched: string[] = [];
@@ -2456,6 +2474,10 @@ function checkScopedReviewDiff(
   output: unknown,
   filesTouched: readonly string[],
 ): ScopedReviewDiffCheck {
+  // No-file tasks: nothing to diff or verify; the review is vacuously complete.
+  if (filesTouched.length === 0) {
+    return { ok: true, diff: "" };
+  }
   const record = parseBackendObject(output);
   if (typeof record.review_prompt !== "string") return { ok: false, missing: "diff" };
   const returnedFiles = asArguments(record.context).files_touched;
@@ -2852,7 +2874,7 @@ async function submitPendingCompletion(
     projectPath: await canonicalProjectRoot("swarm_complete", runtime),
     summary: args.summary as string,
     startTime: typeof args.start_time === "number" ? args.start_time : Date.now(),
-    filesTouched: args.files_touched as string[],
+    filesTouched: Array.isArray(args.files_touched) ? (args.files_touched as string[]) : [],
     submittedAt: Date.now(),
   };
   const key = pendingCompletionKey(projectID, receipt.taskID);

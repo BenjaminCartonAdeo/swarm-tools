@@ -16,6 +16,7 @@ import { pendingCompletionKey, registerTools } from "./catalog";
 import { createSwarmCliRunner } from "./cli";
 import { COMPACTION_HOOK_NAME, buildCompactionContribution } from "./compaction";
 import { resolveWorkerProtocol } from "./roster";
+import { DEFAULT_WORKER_PROTOCOL } from "./worker-protocol-default";
 import { createSessionEventWriter } from "./session-events";
 import { TOKEN_PRESSURE_HOOK_NAME, createTokenWatchdog } from "./token-watchdog";
 import {
@@ -236,8 +237,10 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
       });
       const skills = await ctx.skill.list().catch(() => undefined);
       const catalogProtocol = skills?.data.find((skill) => skill.id === "swarm-worker-protocol")?.content;
+      // Fall back to the bundled protocol so workers always receive the survival
+      // checklist even when the host does not expose the skill via ctx.skill.list().
       const workerProtocol = resolveWorkerProtocol(
-        typeof catalogProtocol === "string" ? catalogProtocol : undefined,
+        typeof catalogProtocol === "string" ? catalogProtocol : DEFAULT_WORKER_PROTOCOL,
       );
 
       // Session id fallback: local tool handlers prefer their per-call context,

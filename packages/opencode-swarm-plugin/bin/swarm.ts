@@ -2531,7 +2531,7 @@ async function setup(forceReinstall = false, nonInteractive = false) {
   // Model defaults: opus for coordinator, sonnet for worker, haiku for lite
   const DEFAULT_COORDINATOR = "anthropic/claude-opus-4-5";
   const DEFAULT_WORKER = "anthropic/claude-sonnet-4-5";
-  const DEFAULT_LITE = "anthropic/claude-haiku-4-5";
+  const DEFAULT_LITE = "opencode-go/deepseek-v4.1-flash";
 
   // Model selection (skip if non-interactive)
   let coordinatorModel: string;
@@ -2651,9 +2651,14 @@ async function setup(forceReinstall = false, nonInteractive = false) {
       message: "Select lite model (for docs, tests, simple edits):",
       options: [
         {
+          value: "opencode-go/deepseek-v4.1-flash",
+          label: "DeepSeek V4.1 Flash (opencode-go)",
+          hint: "Fast and cost-effective (recommended)",
+        },
+        {
           value: "anthropic/claude-haiku-4-5",
           label: "Claude Haiku 4.5",
-          hint: "Fast and cost-effective (recommended)",
+          hint: "Fast and cost-effective",
         },
         {
           value: "anthropic/claude-sonnet-4-5",
@@ -5243,7 +5248,7 @@ async function stats() {
 			(strategyResult.rows as Array<{ strategy: string | null; success: string }>).map(
 				(row) => ({
 					strategy: row.strategy,
-					success: row.success === "true",
+					success: row.success === true || row.success === "true" || row.success === 1,
 				}),
 			),
 		);
@@ -5283,9 +5288,11 @@ async function stats() {
 					for (const line of lines) {
 						try {
 							const event = JSON.parse(line);
-							if (event.type === "VIOLATION") violations++;
-							if (event.type === "DECISION" && event.action === "spawn") spawns++;
-							if (event.type === "DECISION" && event.action === "review") reviews++;
+							const eventType = event.event_type || event.type;
+							const decisionType = event.decision_type || event.action;
+							if (eventType === "VIOLATION") violations++;
+							if (eventType === "DECISION" && decisionType === "worker_spawned") spawns++;
+							if (eventType === "DECISION" && decisionType === "review_completed") reviews++;
 						} catch {
 							// Skip invalid lines
 						}
