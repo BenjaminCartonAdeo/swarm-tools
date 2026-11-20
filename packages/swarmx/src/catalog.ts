@@ -4175,13 +4175,29 @@ async function executeSpec(
     const isReview = spec.name === "swarm_review";
     const projectRoot = isReview && typeof runtime.projectPath === "string" ? runtime.projectPath : undefined;
     const files = isReview && Array.isArray(args.files_touched) ? (args.files_touched as string[]) : [];
-    // Make untracked (newly created) files visible to `git diff` for the review,
-    // then restore the index afterwards so no intent-to-add leaks into the repo.
+    // Only files that are not yet tracked need an intent-to-add so they show up
+    // in `git diff`. Tracked (or already-staged) files are left untouched to
+    // avoid unstaging the worker's staged changes.
+    const untrackedFiles: string[] = [];
     if (isReview && files.length > 0 && typeof projectRoot === "string") {
-      try {
-        spawnSync("git", ["add", "--intent-to-add", "--", ...files], { cwd: projectRoot, stdio: "ignore" });
-      } catch {
-        // Best-effort.
+      for (const file of files) {
+        const probe = spawnSync("git", ["ls-files", "--error-unmatch", "--", file], {
+          cwd: projectRoot,
+          stdio: "ignore",
+        });
+        if (probe.status !== 0) {
+          untrackedFiles.push(file);
+        }
+      }
+      if (untrackedFiles.length > 0) {
+        try {
+          spawnSync("git", ["add", "--intent-to-add", "--", ...untrackedFiles], {
+            cwd: projectRoot,
+            stdio: "ignore",
+          });
+        } catch {
+          // Best-effort.
+        }
       }
     }
     const slowBackend = isReview || spec.name === "swarm_complete";
@@ -4198,9 +4214,9 @@ async function executeSpec(
         await recordScopedReview(runtime, context, args, output);
       }
     } finally {
-      if (isReview && files.length > 0 && typeof projectRoot === "string") {
+      if (untrackedFiles.length > 0 && typeof projectRoot === "string") {
         try {
-          spawnSync("git", ["reset", "-q", "--", ...files], { cwd: projectRoot, stdio: "ignore" });
+          spawnSync("git", ["reset", "-q", "--", ...untrackedFiles], { cwd: projectRoot, stdio: "ignore" });
         } catch {
           // Best-effort.
         }
