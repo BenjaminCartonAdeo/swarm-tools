@@ -4173,7 +4173,19 @@ async function executeSpec(
       throw new UnsupportedToolError(spec.name, "backendName manquant dans le catalogue");
     }
     const isReview = spec.name === "swarm_review";
-    const projectRoot = isReview && typeof runtime.projectPath === "string" ? runtime.projectPath : undefined;
+    // Resolve the actual git toplevel instead of trusting runtime.projectPath,
+    // which may point at a subdirectory or a non-git path.
+    let projectRoot: string | undefined;
+    if (isReview && typeof runtime.projectPath === "string") {
+      const toplevel = spawnSync("git", ["rev-parse", "--show-toplevel"], {
+        cwd: runtime.projectPath,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      projectRoot = toplevel.status === 0 && typeof toplevel.stdout === "string"
+        ? toplevel.stdout.trim()
+        : runtime.projectPath;
+    }
     const files = isReview && Array.isArray(args.files_touched) ? (args.files_touched as string[]) : [];
     // Only files that are not yet tracked need an intent-to-add so they show up
     // in `git diff`. Tracked (or already-staged) files are left untouched to
