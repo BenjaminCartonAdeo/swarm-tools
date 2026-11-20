@@ -1921,21 +1921,7 @@ async function validateReviewScope(
   input: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const projectRoot = await validateProjectRoot(runtime, "swarm_review", input.project_key);
-  const result = await validateProjectFiles(runtime, "swarm_review", input, projectRoot);
-  // Make untracked (newly created) files visible to `git diff` so the review
-  // backend can include them (intent-to-add, no real staging).
-  const files = Array.isArray(result.files_touched) ? (result.files_touched as string[]) : [];
-  if (files.length > 0 && typeof projectRoot === "string") {
-    try {
-      spawnSync("git", ["add", "--intent-to-add", "--", ...files], {
-        cwd: projectRoot,
-        stdio: "ignore",
-      });
-    } catch {
-      // Best-effort: ignore failures (not a git repo, etc.).
-    }
-  }
-  return result;
+  return validateProjectFiles(runtime, "swarm_review", input, projectRoot);
 }
 
 /** Stale plugin copy: `.opencode1/...` must never be treated as the active project. */
@@ -4186,16 +4172,39 @@ async function executeSpec(
     if (backendName === undefined) {
       throw new UnsupportedToolError(spec.name, "backendName manquant dans le catalogue");
     }
-    const slowBackend = spec.name === "swarm_review" || spec.name === "swarm_complete";
-    const output = await runToolForSession(
-      runtime,
-      backendName,
-      args,
-      sessionID,
-      slowBackend ? 120_000 : undefined,
-    );
-    if (spec.name === "swarm_review") {
-      await recordScopedReview(runtime, context, args, output);
+    const isReview = spec.name === "swarm_review";
+    const projectRoot = isReview && typeof runtime.projectPath === "string" ? runtime.projectPath : undefined;
+    const files = isReview && Array.isArray(args.files_touched) ? (args.files_touched as string[]) : [];
+    // Make untracked (newly created) files visible to `git diff` for the review,
+    // then restore the index afterwards so no intent-to-add leaks into the repo.
+    if (isReview && files.length > 0 && typeof projectRoot === "string") {
+      try {
+        spawnSync("git", ["add", "--intent-to-add", "--", ...files], { cwd: projectRoot, stdio: "ignore" });
+      } catch {
+        // Best-effort.
+      }
+    }
+    const slowBackend = isReview || spec.name === "swarm_complete";
+    let output: unknown;
+    try {
+      output = await runToolForSession(
+        runtime,
+        backendName,
+        args,
+        sessionID,
+        slowBackend ? 120_000 : undefined,
+      );
+      if (isReview) {
+        await recordScopedReview(runtime, context, args, output);
+      }
+    } finally {
+      if (isReview && files.length > 0 && typeof projectRoot === "string") {
+        try {
+          spawnSync("git", ["reset", "-q", "--", ...files], { cwd: projectRoot, stdio: "ignore" });
+        } catch {
+          // Best-effort.
+        }
+      }
     }
     return { output };
   }
