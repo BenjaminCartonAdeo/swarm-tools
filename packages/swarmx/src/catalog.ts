@@ -2481,7 +2481,19 @@ function checkScopedReviewDiff(
     return { ok: true, diff: "" };
   }
   const record = parseBackendObject(output);
-  if (typeof record.review_prompt !== "string") return { ok: false, missing: "diff" };
+  // If the backend could not produce a review_prompt (e.g. untracked files
+  // outside any repo), accept the review as long as every declared file exists
+  // on disk. The coordinator can read the file directly.
+  if (typeof record.review_prompt !== "string") {
+    const allExist = filesTouched.every((file) => {
+      const fullPath = projectRoot ? resolve(projectRoot, file) : file;
+      return existsSync(fullPath);
+    });
+    if (allExist) {
+      return { ok: true, diff: "" };
+    }
+    return { ok: false, missing: "diff" };
+  }
   const returnedFiles = asArguments(record.context).files_touched;
   const returnedList = Array.isArray(returnedFiles) ? (returnedFiles as string[]) : [];
 
