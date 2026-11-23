@@ -2615,10 +2615,25 @@ function checkScopedReviewDiff(
   if (returnedList.some((f) => !filesTouched.includes(f))) {
     return { ok: false, missing: "file" };
   }
+  let newFileDiff = "";
   for (const file of missingFromBackend) {
     const fullPath = projectRoot ? resolve(projectRoot, file) : file;
     if (!existsSync(fullPath)) {
       return { ok: false, missing: "file" };
+    }
+    // Generate a diff for new (untracked) files so the reviewer sees content.
+    try {
+      const r = Bun.spawnSync(["git", "diff", "--no-index", "/dev/null", fullPath], {
+        cwd: projectRoot ?? process.cwd(),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const out = r.stdout.toString().trim();
+      if (out.length > 0) {
+        newFileDiff += (newFileDiff.length > 0 ? "\n" : "") + out;
+      }
+    } catch {
+      // Best-effort.
     }
   }
 
@@ -2690,7 +2705,7 @@ function checkScopedReviewDiff(
     }
   }
 
-  return { ok: true, diff };
+  return { ok: true, diff: diff.length > 0 ? diff : newFileDiff };
 }
 
 function scopedDiffFailureMessage(missing: "diff" | "file" | "empty_file"): string {
