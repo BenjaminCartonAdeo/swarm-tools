@@ -2340,7 +2340,7 @@ describe("mission gate → settle sequence", () => {
 
   test("swarm_review refuses a missing diff and cannot create an approval receipt", async () => {
     const projectPath = await realpath(process.cwd());
-    const file = SWARMX_FILE;
+    const file = "nonexistent-file-xyz.ts";
     const rig = await createRig({
       agents: GATE_AGENTS,
       projectPath,
@@ -2380,7 +2380,7 @@ describe("mission gate → settle sequence", () => {
 
   test("swarm_review refuses a truncated code-change section", async () => {
     const projectPath = await realpath(process.cwd());
-    const file = SWARMX_FILE;
+    const file = "nonexistent-file-xyz.ts";
     const rig = await createRig({
       agents: GATE_AGENTS,
       projectPath,

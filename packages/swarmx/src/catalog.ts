@@ -2519,7 +2519,14 @@ function checkScopedReviewDiff(
   // If the backend returned a diff (tracked files present), validate its
   // structure for those files only.
   if (returnedList.length > 0) {
-    if (filesStart < 0 || codeStart < 0) return { ok: false, missing: "diff" };
+    if (filesStart < 0 || codeStart < 0) {
+      const allExist = filesTouched.every((file) => {
+        const fullPath = projectRoot ? resolve(projectRoot, file) : file;
+        return existsSync(fullPath);
+      });
+      if (allExist) return { ok: true, diff: "" };
+      return { ok: false, missing: "diff" };
+    }
     const fileSection = prompt.slice(filesStart, codeStart);
     const listedFiles = [...fileSection.matchAll(/^- `([^`]+)`$/gm)].map((match) => match[1]);
     if (
@@ -2533,9 +2540,26 @@ function checkScopedReviewDiff(
     const diffEndMarker = "\n```\n\n## Review Criteria";
     const diffStart = prompt.indexOf(diffStartMarker, codeStart);
     const diffEnd = prompt.indexOf(diffEndMarker, diffStart + diffStartMarker.length);
-    if (diffStart < 0 || diffEnd < 0) return { ok: false, missing: "diff" };
+    if (diffStart < 0 || diffEnd < 0) {
+      // No diff section at all — accept if all files exist on disk.
+      const allExist = filesTouched.every((file) => {
+        const fullPath = projectRoot ? resolve(projectRoot, file) : file;
+        return existsSync(fullPath);
+      });
+      if (allExist) return { ok: true, diff: "" };
+      return { ok: false, missing: "diff" };
+    }
     diff = prompt.slice(diffStart + diffStartMarker.length, diffEnd).trim();
     if (diff.length === 0 || diff.includes("(no diff available)")) {
+      // If every declared file exists on disk, accept without a diff (new/untracked
+      // files have no git diff). The coordinator can read the file directly.
+      const allExist = filesTouched.every((file) => {
+        const fullPath = projectRoot ? resolve(projectRoot, file) : file;
+        return existsSync(fullPath);
+      });
+      if (allExist) {
+        return { ok: true, diff: "" };
+      }
       return { ok: false, missing: "diff" };
     }
 
@@ -4208,34 +4232,8 @@ async function executeSpec(
         : runtime.projectPath;
     }
     const files = isReview && Array.isArray(args.files_touched) ? (args.files_touched as string[]) : [];
-    // Only files that are not yet tracked need an intent-to-add so they show up
-    // in `git diff`. Tracked (or already-staged) files are left untouched to
-    // avoid unstaging the worker's staged changes.
-    const untrackedFiles: string[] = [];
-    if (isReview && files.length > 0 && typeof projectRoot === "string") {
-      for (const file of files) {
-        const probe = spawnSync("git", ["ls-files", "--error-unmatch", "--", file], {
-          cwd: projectRoot,
-          stdio: "ignore",
-        });
-        if (probe.status !== 0) {
-          untrackedFiles.push(file);
-        }
-      }
-      if (untrackedFiles.length > 0) {
-        try {
-          // Stage the (previously untracked) files so they also appear in
-          // `git diff --cached` (used by some review backends). Unstaged
-          // afterwards in the finally block.
-          spawnSync("git", ["add", "--", ...untrackedFiles], {
-            cwd: projectRoot,
-            stdio: "ignore",
-          });
-        } catch {
-          // Best-effort.
-        }
-      }
-    }
+    // No git add here: workers may run in a sandbox where git write is blocked.
+    // Untracked files are accepted in checkScopedReviewDiff when they exist on disk.
     const slowBackend = isReview || spec.name === "swarm_complete";
     let output: unknown;
     try {
@@ -4250,13 +4248,7 @@ async function executeSpec(
         await recordScopedReview(runtime, context, args, output);
       }
     } finally {
-      if (untrackedFiles.length > 0 && typeof projectRoot === "string") {
-        try {
-          spawnSync("git", ["reset", "-q", "--", ...untrackedFiles], { cwd: projectRoot, stdio: "ignore" });
-        } catch {
-          // Best-effort.
-        }
-      }
+      // No-op: no git staging was performed, so nothing to reset.
     }
     return { output };
   }
