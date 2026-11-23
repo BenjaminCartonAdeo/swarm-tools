@@ -86,7 +86,7 @@ export const WORKER_PROTOCOL_FALLBACK =
   "Load the swarm-worker-protocol skill before work. If it is unavailable, stop and report the blocker.";
 
 /** Technology priors: file evidence is stronger than a title word. */
-const TECH_BONUS = 5;
+const TECH_BONUS = 10;
 /** Score granted to the mechanical worker when a mechanical verb is present. */
 const MECHANICAL_BONUS = 3;
 
@@ -116,11 +116,21 @@ const TECH_HINTS: readonly TechHint[] = [
     test: (file) => /(^|\/)(tests?|specs?|__tests__)\//i.test(file),
     agents: ["test-automator", "qa-expert"],
   },
+  {
+    test: (file) => /\.spec\.[tj]sx?$/i.test(file) || /\.test\.[tj]sx?$/i.test(file),
+    agents: ["test-automator", "qa-expert"],
+  },
   { test: (file) => /\.tsx?$/i.test(file), agents: ["typescript-pro"] },
+  { test: (file) => /\.jsx?$/i.test(file) || /\.mjs$/i.test(file), agents: ["typescript-pro", "frontend-developer"] },
   { test: (file) => /\.vue$/i.test(file), agents: ["vue", "vue-pro", "frontend-developer"] },
   { test: (file) => /\.py$/i.test(file), agents: ["python-pro", "python-coder"] },
-  { test: (file) => /\.md$/i.test(file), agents: ["prompt-engineer", "documentation-expert"] },
-  { test: (file) => /\.sql$/i.test(file), agents: ["postgresql-pglite-pro"] },
+  { test: (file) => /\.java$/i.test(file), agents: ["java-pro", "sdp-java-developer"] },
+  { test: (file) => /\.sql$/i.test(file), agents: ["database-optimizer", "postgresql-pglite-pro"] },
+  { test: (file) => /\.agent\.md$/i.test(file), agents: ["prompt-engineer"] },
+  { test: (file) => /(^|\/)agents\//i.test(file) && /\.md$/i.test(file), agents: ["prompt-engineer"] },
+  { test: (file) => /\.md$/i.test(file) && /(^|\/)(docs?|documentation)\//i.test(file), agents: ["documentation-expert"] },
+  { test: (file) => /\.md$/i.test(file), agents: ["documentation-expert", "prompt-engineer"] },
+  { test: (file) => /apm\.ya?ml$/i.test(file) || /(^|\/)packages\/.*\.ya?ml$/i.test(file), agents: ["prompt-engineer"] },
 ];
 
 /** Locale-independent comparison so ordering never depends on the host. */
@@ -262,11 +272,15 @@ export function resolveAgent(
 
   const topScore = scored[0]?.score ?? 0;
   if (topScore <= 0) {
+    // No roster agent matched. If tech targets suggest a specialized agent that
+    // is NOT in the roster, surface it as a candidate so the coordinator can
+    // register/assign it instead of silently falling back to `medium`.
+    const suggested = [...targets].sort();
     return {
       agent: null,
-      rationale: `no roster agent matched title words or technology hints (tech hints: ${describeTargets(targets)})`,
+      rationale: `no roster agent matched title words or technology hints (tech hints: ${describeTargets(targets)}). Suggested specialized agent(s): ${suggested.length > 0 ? suggested.join(", ") : "none detected"}`,
       needs_arbitration: true,
-      candidates: [],
+      candidates: suggested,
     };
   }
 

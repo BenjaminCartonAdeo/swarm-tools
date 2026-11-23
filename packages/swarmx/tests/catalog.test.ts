@@ -359,13 +359,13 @@ describe("JSON Schemas", () => {
     expect(schemaProperties(ready as ToolSpec)).toEqual({});
   });
 
-  test("swarm_review requires a non-empty path list for scoped diff generation", () => {
+  test("swarm_review accepts an optional (possibly empty) path list for scoped diff generation", () => {
     const review = findToolSpec("swarm_review");
     expect(review).toBeDefined();
-    expect(review?.inputSchema.required).toContain("files_touched");
+    expect(review?.inputSchema.required).not.toContain("files_touched");
     expect(schemaProperties(review as ToolSpec).files_touched).toMatchObject({
       type: "array",
-      minItems: 1,
+      minItems: 0,
     });
   });
 
@@ -373,14 +373,14 @@ describe("JSON Schemas", () => {
     const complete = findToolSpec("swarm_complete");
     expect(complete).toBeDefined();
     expect(complete?.inputSchema.required).not.toContain("start_time");
-    expect(complete?.inputSchema.required).toContain("files_touched");
+    expect(complete?.inputSchema.required).not.toContain("files_touched");
     expect(schemaProperties(complete as ToolSpec).start_time).toMatchObject({
       type: "integer",
       minimum: 0,
     });
     expect(schemaProperties(complete as ToolSpec).files_touched).toMatchObject({
       type: "array",
-      minItems: 1,
+      minItems: 0,
     });
     expect(schemaProperties(complete as ToolSpec).summary).toMatchObject({
       type: "string",

@@ -161,10 +161,9 @@ describe("resolveAgent", () => {
     );
   });
 
-  test("a .md file arbitrates between prompt-engineer and documentation-expert", () => {
+  test("a .md file under docs/ resolves to documentation-expert", () => {
     const result = resolveAgent({ title: "Implement feature", files: ["docs/a.md"] }, ROSTER);
-    expect(result.agent).toBeNull();
-    expect(result.needs_arbitration).toBe(true);
-    expect(result.candidates).toEqual(["documentation-expert", "prompt-engineer"]);
+    expect(result.agent).toBe("documentation-expert");
+    expect(result.needs_arbitration).toBe(false);
   });
 });

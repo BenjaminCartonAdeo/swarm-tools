@@ -75,6 +75,20 @@ Si le résolveur renvoie `agent: null` + `needs_arbitration`, **tu arbitres** :
 `swarm_set_agent({ bead_id, agent, rationale })` avec motif, ou tu scindes la cellule.
 Jamais de repli silencieux sur `swarm/swarm-worker`.
 
+**Règle d'arbitrage** : quand le résolveur propose des candidats spécialisés
+(`candidates`), choisir le plus adapté au domaine de la cellule :
+- fichiers `.ts`/`.tsx`/`.js`/`.mjs` → `typescript-pro` (ou `frontend-developer` pour UI)
+- fichiers `.py` → `python-pro` ou `python-coder`
+- fichiers `.vue` → `vue-developer` ou `frontend-developer`
+- fichiers `.sql` → `database-optimizer`
+- fichiers `.md` dans `docs/` → `documentation-expert`
+- fichiers `.agent.md` ou `apm.yml` → `prompt-engineer`
+- fichiers de tests (`.spec.*`, `.test.*`, sous `tests/`) → `test-automator`
+- fichiers `.java` → `java-pro` ou `sdp-java-developer`
+
+`medium` n'est acceptable **que** pour des tâches de configuration pure (package.json,
+config sans code). Ne jamais utiliser `medium` par défaut pour du code applicatif.
+
 ## Ce qui est appliqué automatiquement — ne le ré-écris pas
 
 Un gate qui refuse est un **succès**, pas un bug. Ne contourne pas un refus :
