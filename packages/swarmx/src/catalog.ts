@@ -931,8 +931,13 @@ const LOCAL_SPECS: readonly ToolSpec[] = [
   ),
   local(
     "swarm_finish",
-    "Coordinator-only: finish the current swarmx mission, deactivate dispatch gates, and report the closing reason.",
-    { reason: str("Why the mission ends") },
+    "Coordinator-only: finish the current swarmx mission, deactivate dispatch gates, and report the closing reason. Set abandon=true to revoke all pending/succeeded attempts and force-close.",
+    { reason: str("Why the mission ends"), abandon: bool("Revoke all pending/succeeded attempts and force-close the mission") },
+  ),
+  local(
+    "swarm_probe",
+    "Coordinator-only: run a read-only probe (git status, gh pr checks, etc.) without dispatching a worker. Does not consume spawn or iteration budget.",
+    { command: str("Read-only command to execute", { minLength: 1 }) },
   ),
   local(
     "swarm_reset",
@@ -941,6 +946,10 @@ const LOCAL_SPECS: readonly ToolSpec[] = [
   local(
     "swarm_repo_inventory",
     "Generate a read-only repo inventory: file count by top-level directory and extension, plus a bounded file list. Useful for audit and decomposition.",
+  ),
+  local(
+    "swarm_preflight",
+    "Check repository prerequisites before running swarm work: dependencies, test runner, Git remote, and GitHub CLI.",
   ),
 ];
 
@@ -1272,6 +1281,13 @@ async function runResolveAgent(
   const roster = await loadRosterEntries("swarm_resolve_agent", runtime, context);
 
   const results = cells.map((cell) => {
+    // Tech hints take priority over tier: if the files indicate a specialized
+    // agent that exists in the roster, use it instead of the generic tier.
+    const techResolved = resolveAgent(
+      { title: cell.title, ...(cell.files === undefined ? {} : { files: cell.files }) },
+      roster,
+      worker,
+    );
     const tierAgent =
       cell.tier === undefined
         ? undefined
@@ -1282,14 +1298,16 @@ async function runResolveAgent(
               entry.mode !== "primary",
           );
     const resolved =
-      tierAgent === undefined
-        ? resolveAgent({ title: cell.title, ...(cell.files === undefined ? {} : { files: cell.files }) }, roster, worker)
-        : {
-            agent: tierAgent.id,
-            rationale: `explicit tier ${cell.tier}: ${tierAgent.id}`,
-            needs_arbitration: false,
-            candidates: [tierAgent.id],
-          };
+      techResolved.agent !== null && techResolved.agent !== worker
+        ? techResolved
+        : tierAgent === undefined
+          ? techResolved
+          : {
+              agent: tierAgent.id,
+              rationale: `explicit tier ${cell.tier}: ${tierAgent.id}`,
+              needs_arbitration: false,
+              candidates: [tierAgent.id],
+            };
     return {
       ...(cell.beadID === undefined ? {} : { bead_id: cell.beadID }),
       title: cell.title,
@@ -1634,6 +1652,7 @@ async function runFinish(
   input: Record<string, unknown>,
 ): Promise<ToolExecuteResult> {
   const reason = optionalStringInput("swarm_finish", input, "reason") ?? "";
+  const abandon = input.abandon === true;
   const { store, projectID, sessionID, projectRoot } = await requireMissionScope("swarm_finish", runtime, context);
   const lockKey = [projectID, sessionID].map(encodeURIComponent).join(":");
   return withReviewDecisionLock(lockKey, async () => {
@@ -1646,13 +1665,11 @@ async function runFinish(
       );
     }
     const attempts = await listAttempts(store, projectID, sessionID, current);
-    if (
-      attempts.some(
-        (attempt) =>
-          attempt.revokedAt === undefined &&
-          (attempt.status === "pending" || attempt.status === "succeeded"),
-      )
-    ) {
+    if (!abandon && attempts.some(
+      (attempt) =>
+        attempt.revokedAt === undefined &&
+        (attempt.status === "pending" || attempt.status === "succeeded"),
+    )) {
       throw new LocalToolError("swarm_finish", "conflict", "the mission has unrevoked worker attempts");
     }
     const missionID = reviewMissionID(current);
@@ -1675,7 +1692,7 @@ async function runFinish(
     }
     let mission: MissionState | undefined;
     try {
-      mission = await finishMission(store, { projectID, sessionID });
+      mission = await finishMission(store, { projectID, sessionID, abandon });
     } catch (error) {
       if (error instanceof Error && error.message === "mission has unrevoked worker attempts") {
         throw new LocalToolError("swarm_finish", "conflict", error.message);
@@ -1815,6 +1832,87 @@ async function runRepoInventory(
   };
 }
 
+async function runPreflight(runtime: SwarmxRuntime): Promise<ToolExecuteResult> {
+  const root = await canonicalProjectRoot("swarm_preflight", runtime);
+  const nodeModulesAvailable = existsSync(resolve(root, "node_modules"));
+  const testRunner = Bun.spawnSync(["bun", "test", "--help"], {
+    cwd: root,
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 10_000,
+  });
+  const remote = Bun.spawnSync(["git", "ls-remote", "origin"], {
+    cwd: root,
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 10_000,
+  });
+  const gh = Bun.spawnSync(["gh", "--version"], {
+    cwd: root,
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 10_000,
+  });
+  const testRunnerOk = testRunner.exitCode === 0;
+  const remoteOk = remote.exitCode === 0;
+  const ghOk = gh.exitCode === 0;
+  const checks = [
+    {
+      name: "node_modules",
+      ok: nodeModulesAvailable,
+      detail: nodeModulesAvailable ? `found in ${root}` : `missing ${resolve(root, "node_modules")}`,
+    },
+    {
+      name: "test runner",
+      ok: testRunnerOk,
+      detail: testRunnerOk
+        ? "Bun test runner is available"
+        : testRunner.stderr.toString().trim() || "Bun test runner is unavailable",
+    },
+    {
+      name: "git remote",
+      ok: remoteOk,
+      detail: remoteOk
+        ? "origin is accessible"
+        : remote.stderr.toString().trim() || "git ls-remote origin failed",
+    },
+    {
+      name: "gh CLI",
+      ok: ghOk,
+      detail: ghOk ? gh.stdout.toString().split("\n")[0]!.trim() : gh.stderr.toString().trim() || "gh is unavailable",
+    },
+  ];
+  const ok = checks.every((check) => check.ok);
+  return {
+    output: { ok, checks },
+    content: checks.map((check) => `${check.ok ? "PASS" : "FAIL"} ${check.name}: ${check.detail}`).join("\n"),
+  };
+}
+
+async function runProbe(
+  runtime: SwarmxRuntime,
+  args: Record<string, unknown>,
+): Promise<ToolExecuteResult> {
+  const root = await canonicalProjectRoot("swarm_probe", runtime);
+  const command = String(args.command ?? "");
+  if (command.length === 0) {
+    throw new LocalToolError("swarm_probe", "invalid_input", "command must be non-empty");
+  }
+  const result = Bun.spawnSync(["sh", "-c", command], {
+    cwd: root,
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 30_000,
+  });
+  const stdout = result.stdout.toString().trim();
+  const stderr = result.stderr.toString().trim();
+  const ok = result.exitCode === 0;
+  return {
+    output: { ok, exit_code: result.exitCode, stdout, stderr },
+    content: `probe exit=${result.exitCode}\\n${stdout}${stderr ? "\\n" + stderr : ""}`.trim(),
+  };
+}
+
 async function runAgentAudit(
   runtime: SwarmxRuntime,
   context: ToolExecuteContextLike,
@@ -1891,6 +1989,10 @@ async function executeLocal(
       return runReset(runtime, context);
     case "swarm_repo_inventory":
       return runRepoInventory(runtime, context);
+    case "swarm_preflight":
+      return runPreflight(runtime);
+    case "swarm_probe":
+      return runProbe(runtime, args);
     case "swarm_agent_audit":
       return runAgentAudit(runtime, context);
     default:
@@ -2045,8 +2147,17 @@ async function resolveCanonicalProjectKey(
   if (requestedRoot === undefined) {
     throw new LocalToolError(tool, "not_found", "project_key must name the active project root");
   }
+  // Allow nested git repositories under the workspace root (multi-repo setups).
+  // A nested repo is accepted when it contains a .git directory and is under
+  // the workspace root.
   if (requestedRoot !== projectRoot) {
-    throw new LocalToolError(tool, "conflict", "project_key must name the active project root");
+    const isNestedRepo =
+      requestedRoot.startsWith(projectRoot + sep) &&
+      (await stat(resolve(requestedRoot, ".git")).catch(() => undefined)) !== undefined;
+    if (!isNestedRepo) {
+      throw new LocalToolError(tool, "conflict", "project_key must name the active project root");
+    }
+    return requestedRoot;
   }
   return projectRoot;
 }

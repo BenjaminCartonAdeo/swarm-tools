@@ -407,9 +407,9 @@ describe("swarmx plugin registration", () => {
     const editor = ctx.createEditor();
     const expected = listToolNames();
 
-    expect(expected).toHaveLength(84);
+    expect(expected).toHaveLength(86);
     expect(() => transform(editor)).not.toThrow();
-    expect(editor.list()).toHaveLength(84);
+    expect(editor.list()).toHaveLength(86);
     expect(editor.list().map((tool) => tool.name).sort()).toEqual(expected);
     // The editor derives ids from the effective name (the real SDK never
     // receives an id); a single `undefined` key would collapse the registry.
@@ -417,7 +417,7 @@ describe("swarmx plugin registration", () => {
 
     // Replaying the exact same transform on the same editor must not duplicate.
     expect(() => transform(editor)).not.toThrow();
-    expect(editor.list()).toHaveLength(84);
+    expect(editor.list()).toHaveLength(86);
     expect(editor.list().map((tool) => tool.name).sort()).toEqual(expected);
   });
 

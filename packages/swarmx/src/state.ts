@@ -620,14 +620,21 @@ export async function setBudget(
 /** Marks the mission inactive. No-op when it does not exist or is already over. */
 export async function finishMission(
   store: MissionStateStore,
-  input: { readonly projectID: string; readonly sessionID: string },
+  input: { readonly projectID: string; readonly sessionID: string; readonly abandon?: boolean },
 ): Promise<MissionState | undefined> {
   return withMissionLock(input.projectID, input.sessionID, async () => {
     const mission = await readMission(store, input.projectID, input.sessionID);
     if (mission === undefined) return undefined;
     if (!mission.active) return mission;
     const attempts = await listAttempts(store, input.projectID, input.sessionID, mission);
-    if (
+    if (input.abandon === true) {
+      // Abandon: revoke all pending/succeeded attempts so the mission can close.
+      for (const attempt of attempts) {
+        if (attempt.revokedAt === undefined && (attempt.status === "pending" || attempt.status === "succeeded")) {
+          await putAttempt(store, input.projectID, { ...attempt, revokedAt: store.now() });
+        }
+      }
+    } else if (
       attempts.some(
         (attempt) =>
           attempt.revokedAt === undefined &&

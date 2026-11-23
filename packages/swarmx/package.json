@@ -17,6 +17,7 @@
   "scripts": {
     "prepare": "bun run build",
     "build": "bun build src/index.ts --outdir dist --target node --external @opencode/plugin --external @opencode-ai/plugin && bun build bin/swarmx.ts --outdir dist/bin --target node --external @opencode/plugin --external @opencode-ai/plugin",
+    "deploy:local": "bun run build && bun run bin/swarmx.ts upgrade --target /home/benjamin/Dev/.opencode",
     "test": "bun test tests/",
     "typecheck": "tsc --noEmit"
   },

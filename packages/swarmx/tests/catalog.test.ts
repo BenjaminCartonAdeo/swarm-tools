@@ -249,10 +249,12 @@ const LOCAL_TOOL_NAMES = [
   "swarm_set_agent",
   "swarm_set_budget",
   "swarm_subtask_prompt",
+  "swarm_preflight",
+  "swarm_probe",
 ] as const;
 
 const CLI_NAME_SET = new Set<string>(CLI_TOOL_NAMES);
-const EXPECTED_COUNT = V1_TOOL_NAMES.length + 3; // 81 + swarm_finish + swarm_reset
+const EXPECTED_COUNT = V1_TOOL_NAMES.length + 5; // 81 + swarm_finish + swarm_reset + swarm_preflight + swarm_probe
 const CALL_CONTEXT = {
   sessionID: "ses-catalog",
   agent: "build",
@@ -277,7 +279,7 @@ function schemaProperties(spec: ToolSpec): Record<string, unknown> {
 }
 
 describe("catalogue coverage", () => {
-  test("84 distinct tool names, all non-empty", () => {
+  test("85 distinct tool names, all non-empty", () => {
     expect(SWARMX_TOOL_SPECS).toHaveLength(EXPECTED_COUNT);
     expect(findToolSpec("swarm_finish")).toBeDefined();
 
@@ -309,7 +311,7 @@ describe("catalogue coverage", () => {
     }
 
     expect(SWARMX_TOOL_SPECS.filter((spec) => spec.name === "swarm_finish")).toHaveLength(1);
-    expect(SWARMX_TOOL_SPECS).toHaveLength(V1_TOOL_NAMES.length + 3);
+    expect(SWARMX_TOOL_SPECS).toHaveLength(V1_TOOL_NAMES.length + 5);
   });
 });
 
@@ -423,7 +425,7 @@ describe("compatibility matrix", () => {
     expect(link?.backendName).toBe("hive_link_thread");
   });
 
-  test("the eight local tools are local, active and carry no backendName", () => {
+  test("the ten local tools are local, active and carry no backendName", () => {
     for (const name of LOCAL_TOOL_NAMES) {
       const spec = findToolSpec(name);
       expect(spec).toBeDefined();
@@ -434,7 +436,6 @@ describe("compatibility matrix", () => {
 
     const locals = SWARMX_TOOL_SPECS.filter((spec) => spec.kind === "local");
     expect(locals).toHaveLength(LOCAL_TOOL_NAMES.length);
-    expect(locals).toHaveLength(9);
   });
 
   test("matrix exposes kind, backendName and reason for every spec", () => {
@@ -459,7 +460,7 @@ describe("compatibility matrix", () => {
     });
   });
 
-  test("distribution is exactly 70 backend active, 1 alias, 4 deprecated, 9 local (84)", () => {
+  test("distribution is exactly 70 backend active, 1 alias, 4 deprecated, 11 local (86)", () => {
     const activeBackend = SWARMX_TOOL_SPECS.filter(
       (spec) => spec.kind === "backend" && spec.status === "active",
     );
@@ -470,9 +471,9 @@ describe("compatibility matrix", () => {
     expect(activeBackend).toHaveLength(70);
     expect(aliases).toHaveLength(1);
     expect(deprecated).toHaveLength(4);
-    expect(locals).toHaveLength(9);
-    expect(activeBackend.length + aliases.length + deprecated.length + locals.length).toBe(84);
-    expect(SWARMX_TOOL_SPECS).toHaveLength(84);
+    expect(locals).toHaveLength(11);
+    expect(activeBackend.length + aliases.length + deprecated.length + locals.length).toBe(86);
+    expect(SWARMX_TOOL_SPECS).toHaveLength(86);
   });
 });
 

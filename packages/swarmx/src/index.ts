@@ -130,12 +130,14 @@ function isSwarmCliToolCommand(command: string): boolean {
   });
 }
 
-async function workerMutationIsUnbound(
+type WorkerMutationDenial = "mission_inactive" | "pending_completion" | "token_missing" | "revoked" | "not_owner";
+
+async function workerMutationDenial(
   runtime: SwarmxRuntime,
   sessionID: string,
   agentID: string | undefined,
-): Promise<boolean> {
-  if (runtime.listAgents === undefined) return true;
+): Promise<WorkerMutationDenial | undefined> {
+  if (runtime.listAgents === undefined) return "token_missing";
   let caller: { readonly mode: string } | undefined;
   try {
     const listed = await runtime.listAgents();
@@ -144,17 +146,17 @@ async function workerMutationIsUnbound(
       : (listed as { readonly data: readonly DispatchAgentInfo[] }).data;
     caller = agents.find((agent: DispatchAgentInfo) => agent.id === agentID);
   } catch {
-    return true;
+    return "token_missing";
   }
-  if (caller === undefined) return true;
-  if (caller.mode === "primary") return false;
+  if (caller === undefined) return "token_missing";
+  if (caller.mode === "primary") return undefined;
   if (
     runtime.store === undefined ||
     runtime.projectID === undefined ||
     runtime.resolveWorkerParentSession === undefined ||
     runtime.resolveWorkerCell === undefined
   ) {
-    return true;
+    return "token_missing";
   }
   let parentSessionID: string | null | undefined;
   let marker;
@@ -164,24 +166,24 @@ async function workerMutationIsUnbound(
       runtime.resolveWorkerCell(sessionID),
     ]);
   } catch {
-    return true;
+    return "token_missing";
   }
-  if (parentSessionID === null) return caller.mode !== "primary" && caller.mode !== "all";
-  if (parentSessionID === undefined) return true;
+  if (parentSessionID === null) return caller.mode !== "all" ? "token_missing" : undefined;
+  if (parentSessionID === undefined) return "token_missing";
   let mission;
   try {
     mission = await readMission(runtime.store, runtime.projectID, parentSessionID);
   } catch {
-    return true;
+    return "token_missing";
   }
-  if (mission === undefined) return false;
-  if (!mission.active) return marker !== undefined;
-  if (marker?.dispatchToken === undefined || agentID === undefined) return true;
+  if (mission === undefined) return undefined;
+  if (!mission.active) return marker !== undefined ? "mission_inactive" : undefined;
+  if (marker?.dispatchToken === undefined || agentID === undefined) return "token_missing";
   let attempts;
   try {
     attempts = await listAttempts(runtime.store, runtime.projectID, parentSessionID, mission);
   } catch {
-    return true;
+    return "token_missing";
   }
   const attempt = attempts.find(
     (candidate) =>
@@ -190,23 +192,19 @@ async function workerMutationIsUnbound(
       candidate.epicID === marker.epicID &&
       candidate.agent === agentID,
   );
-  if (
-    attempt === undefined ||
-    attempt.revokedAt !== undefined ||
-    attempt.workerSessionID !== sessionID ||
-    (attempt.status !== "pending" && attempt.status !== "succeeded")
-  ) {
-    return true;
-  }
+  if (attempt === undefined) return "token_missing";
+  if (attempt.revokedAt !== undefined) return "revoked";
+  if (attempt.workerSessionID !== sessionID) return "not_owner";
+  if (attempt.status !== "pending" && attempt.status !== "succeeded") return "token_missing";
   const pending = await runtime.store.storage.get(pendingCompletionKey(runtime.projectID, marker.cellID));
   const pendingRecord =
     typeof pending === "object" && pending !== null ? (pending as Record<string, unknown>) : undefined;
-  return (
-    pendingRecord?.projectID === runtime.projectID &&
+  return pendingRecord?.projectID === runtime.projectID &&
     pendingRecord.parentSessionID === parentSessionID &&
     pendingRecord.missionID === (mission.missionID ?? `legacy:${mission.createdAt}`) &&
     pendingRecord.taskID === marker.cellID
-  );
+    ? "pending_completion"
+    : undefined;
 }
 
 /** Optional seams, used by tests to prove the compaction hook calls no CLI. */
@@ -285,12 +283,11 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
           event.message = "Use the swarmx plugin tools; direct swarm CLI calls bypass mission gates.";
           return;
         }
-        if (
-          ["edit", "write", "patch", "shell"].includes(event.action) &&
-          (await workerMutationIsUnbound(runtime, event.sessionID, event.agent))
-        ) {
+        if (["edit", "write", "patch", "shell"].includes(event.action)) {
+          const reason = await workerMutationDenial(runtime, event.sessionID, event.agent);
+          if (reason === undefined) return;
           event.effect = "deny";
-          event.message = "worker dispatch capability is revoked, unbound, or not owned by this session.";
+          event.message = `worker dispatch capability is revoked, unbound, or not owned by this session (${reason}).`;
         }
       });
 
