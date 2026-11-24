@@ -2976,18 +2976,17 @@ type ScopedReviewDiffCheck =
  *   - `empty_file`: a section is header-only / has no complete change hunk.
  */
 function generateNewFileDiff(file: string, projectRoot?: string): string {
-  const fullPath = projectRoot ? resolve(projectRoot, file) : file;
+  const cwd = projectRoot ?? process.cwd();
+  if (!existsSync(resolve(cwd, file))) return "";
   try {
-    const result = Bun.spawnSync(["git", "diff", "--no-index", "/dev/null", fullPath], {
-      cwd: projectRoot ?? process.cwd(),
+    // Run with a project-relative path so git emits `a/<file> b/<file>` headers
+    // regardless of whether cwd sits inside a git repository.
+    const result = Bun.spawnSync(["git", "diff", "--no-index", "--", "/dev/null", file], {
+      cwd,
       stdout: "pipe",
       stderr: "pipe",
     });
-    let diff = result.stdout.toString().trim();
-    if (diff.length === 0) return "";
-    diff = diff.replaceAll(fullPath, `/${file}`);
-    diff = diff.replace(/^diff --git a\/dev\/null b\//m, `diff --git a/${file} b/${file}`);
-    return diff;
+    return result.stdout.toString().trim();
   } catch {
     return "";
   }
@@ -3027,7 +3026,7 @@ function enrichReviewOutputWithNewFiles(
     review_prompt: reviewPrompt,
     context: {
       ...(typeof record.context === "object" && record.context !== null ? record.context : {}),
-      files_touched: [...returnedList, ...missing],
+      files_touched: [...missing, ...returnedList],
     },
   };
 }
@@ -3185,6 +3184,9 @@ async function recordScopedReview(
   const check = checkScopedReviewDiff(output, filesTouched, projectRoot);
   if (!check.ok) {
     throw new LocalToolError("swarm_review", "conflict", `${scopedDiffFailureMessage(check.missing)} (${check.missing})`);
+  }
+  if (filesTouched.length > 0 && check.diff.trim().length === 0) {
+    throw new LocalToolError("swarm_review", "conflict", "scoped review diff is empty for the touched files");
   }
   const diff = check.diff;
 
@@ -4871,7 +4873,7 @@ async function executeSpec(
         );
       }
       if (isReview) {
-        output = enrichReviewOutputWithNewFiles(output, files, projectRoot);
+        output = enrichReviewOutputWithNewFiles(output, files, runtime.projectPath ?? projectRoot);
         await recordScopedReview(runtime, context, args, output);
       }
     } finally {

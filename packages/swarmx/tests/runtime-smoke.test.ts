@@ -3113,6 +3113,156 @@ describe("mission gate → settle sequence", () => {
     expect(reviewReceipt?.approval).toBeUndefined();
   });
 
+  async function createReviewReceiptRig(
+    reviewPayload: unknown,
+    filesTouched: string[],
+    projectPath: string,
+  ) {
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-a", epicID: "epic-1" },
+      payloadFor: (name) => {
+        if (name === "swarm_review") return reviewPayload;
+        if (name === "swarm_complete") return completionVerification();
+        return { success: true };
+      },
+    });
+    await dispatchWorker(rig, "cell-a", "call-dispatch-review-receipt");
+    await rig.tools.get("swarm_complete")?.execute(
+      {
+        project_key: projectPath,
+        agent_name: "swarm-worker",
+        bead_id: "cell-a",
+        summary: "Completed review receipt scenario.",
+        start_time: 1,
+        files_touched: filesTouched,
+      },
+      workerToolContext("swarm/swarm-worker", "call-completion-review-receipt"),
+    );
+    try {
+      const review = await rig.tools.get("swarm_review")?.execute(
+        { project_key: projectPath, epic_id: "epic-1", task_id: "cell-a", files_touched: filesTouched },
+        toolContext("swarm/swarm-coordinator", "call-review-receipt"),
+      );
+      return { rig, review, error: undefined };
+    } catch (error) {
+      return { rig, review: undefined, error };
+    }
+  }
+
+  test("reviewReceiptMissingDiffIsRejected", async () => {
+    const projectPath = await realpath(process.cwd());
+    const file = SWARMX_FILE;
+    const { rig, error } = await createReviewReceiptRig({ success: true, files_touched: [file] }, [file], projectPath);
+
+    expect(error).toBeDefined();
+    expect(reviewReceiptStorageKey(rig)).toBeUndefined();
+  });
+
+  test("reviewReceiptMalformedDiffIsRejected", async () => {
+    const projectPath = await realpath(process.cwd());
+    const file = SWARMX_FILE;
+    const { rig, error } = await createReviewReceiptRig(
+      scopedReviewPayload([file], "this is not a unified diff"),
+      [file],
+      projectPath,
+    );
+
+    expect(error).toBeDefined();
+    expect(reviewReceiptStorageKey(rig)).toBeUndefined();
+  });
+
+  test("reviewReceiptOutOfScopeDiffIsRejected", async () => {
+    const projectPath = await realpath(process.cwd());
+    const file = SWARMX_FILE;
+    const outOfScopeDiff = ["diff --git a/outside.txt b/outside.txt", "@@ -1 +1 @@", "-old", "+new"].join("\n");
+    const { rig, error } = await createReviewReceiptRig(
+      scopedReviewPayload([file], outOfScopeDiff),
+      [file],
+      projectPath,
+    );
+
+    expect(error).toBeDefined();
+    expect(reviewReceiptStorageKey(rig)).toBeUndefined();
+  });
+
+  test("reviewReceiptRejectsEmptySynthesizedDiff", async () => {
+    const projectPath = await realpath(process.cwd());
+    const file = SWARMX_FILE;
+    const { rig, error } = await createReviewReceiptRig({ success: true, files_touched: [file] }, [file], projectPath);
+
+    expect(error).toBeDefined();
+    expect(reviewReceiptStorageKey(rig)).toBeUndefined();
+  });
+
+  test("reviewReceiptMixedTrackedAndUntrackedDiffIsHashed", async () => {
+    const projectPath = await realpath(join(process.cwd(), "../.."));
+    const packagePath = "packages/swarmx";
+    const trackedFile = `${packagePath}/${SWARMX_FILE}`;
+    const untrackedFile = `review-receipt-${crypto.randomUUID()}.txt`;
+    const scopedUntrackedFile = `${packagePath}/${untrackedFile}`;
+    const untrackedPath = join(projectPath, scopedUntrackedFile);
+    const trackedDiff = [
+      `diff --git a/${trackedFile} b/${trackedFile}`,
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+    ].join("\n");
+    try {
+      await Bun.write(untrackedPath, "untracked evidence\n");
+      const { review, error } = await createReviewReceiptRig(
+        scopedReviewPayload([trackedFile], trackedDiff),
+        [trackedFile, scopedUntrackedFile],
+        projectPath,
+      );
+      expect(error).toBeUndefined();
+      const prompt = (review?.output as { review_prompt?: string }).review_prompt ?? "";
+      expect(prompt).toContain(trackedFile);
+      expect(prompt).toContain(scopedUntrackedFile);
+      expect(prompt).toContain("untracked evidence");
+    } finally {
+      await rm(untrackedPath, { force: true });
+    }
+  });
+
+  test("reviewReceiptUsesCanonicalProjectRootForGitSubdirectory", async () => {
+    const repoRoot = join("/tmp/opencode", `review-receipt-repo-${crypto.randomUUID()}`);
+    const run = (cmd: string[]) => {
+      const result = Bun.spawnSync(cmd, { cwd: repoRoot, stdout: "pipe", stderr: "pipe" });
+      if (result.exitCode !== 0) throw new Error(`${cmd.join(" ")} failed: ${result.stderr.toString()}`);
+    };
+    try {
+      Bun.spawnSync(["mkdir", "-p", join(repoRoot, "sub")]);
+      run(["git", "init", "-q"]);
+      run(["git", "config", "user.email", "test@example.com"]);
+      run(["git", "config", "user.name", "test"]);
+      await Bun.write(join(repoRoot, "sub/tracked.txt"), "old\n");
+      run(["git", "add", "sub/tracked.txt"]);
+      run(["git", "commit", "-q", "-m", "init"]);
+      await Bun.write(join(repoRoot, "sub/tracked.txt"), "new\n");
+      await Bun.write(join(repoRoot, "sub/untracked.txt"), "subdir untracked evidence\n");
+      const projectPath = await realpath(join(repoRoot, "sub"));
+      const trackedFile = "tracked.txt";
+      const untrackedFile = "untracked.txt";
+      const diff = [`diff --git a/${trackedFile} b/${trackedFile}`, "@@ -1 +1 @@", "-old", "+new"].join("\n");
+      const { review, error } = await createReviewReceiptRig(
+        scopedReviewPayload([trackedFile], diff),
+        [trackedFile, untrackedFile],
+        projectPath,
+      );
+
+      expect(error).toBeUndefined();
+      const prompt = (review?.output as { review_prompt?: string }).review_prompt ?? "";
+      expect(prompt).toContain(trackedFile);
+      expect(prompt).toContain("+new");
+      expect(prompt).toContain(untrackedFile);
+      expect(prompt).toContain("subdir untracked evidence");
+    } finally {
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
   test("doc-only cells can be approved as unverifiable without a verification receipt", async () => {
     const projectPath = await realpath(join(import.meta.dir, ".."));
     const file = "assets/commands/swarmx.md";
