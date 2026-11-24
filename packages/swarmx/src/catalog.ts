@@ -940,8 +940,17 @@ const LOCAL_SPECS: readonly ToolSpec[] = [
   ),
   local(
     "swarm_finish",
-    "Coordinator-only: finish the current swarmx mission, deactivate dispatch gates, and report the closing reason. Set abandon=true to revoke all pending/succeeded attempts and force-close.",
-    { reason: str("Why the mission ends"), abandon: bool("Revoke all pending/succeeded attempts and force-close the mission") },
+    "Coordinator-only: finish the current swarmx mission, deactivate dispatch gates, and report the closing reason. Set abandon=true to revoke all pending/succeeded attempts and force-close. Use session_id to target another session, or all_sessions=true to abandon every active mission in the project.",
+    {
+      reason: str("Why the mission ends"),
+      abandon: bool("Revoke all pending/succeeded attempts and force-close the mission"),
+      session_id: str("Target session ID (defaults to current session)"),
+      all_sessions: bool("Abandon all active missions in the project"),
+    },
+  ),
+  local(
+    "swarm_mission_status",
+    "Coordinator-only: read-only status of all missions and attempts in the project, including stale sessions and orphaned attempts.",
   ),
   local(
     "swarm_cancel_completion",
@@ -1671,6 +1680,103 @@ async function assertConsolidationComplete(
   }
 }
 
+async function runMissionStatus(
+  runtime: SwarmxRuntime,
+  context: ToolExecuteContextLike,
+): Promise<ToolExecuteResult> {
+  const projectID = resolveProjectID(runtime);
+  if (runtime.store === undefined || projectID === undefined) {
+    throw new LocalToolError("swarm_mission_status", "runtime_unavailable", "mission store is not available");
+  }
+  const missions = (await runtime.store.list()).filter((mission) => mission.projectID === projectID);
+  const allAttempts = await listAttempts(runtime.store, projectID);
+  const missionSessionIDs = new Set(missions.map((mission) => mission.sessionID));
+  const rows = [];
+  for (const mission of missions) {
+    const attempts = allAttempts.filter(
+      (attempt) =>
+        attempt.sessionID === mission.sessionID &&
+        (mission.missionID === undefined
+          ? attempt.ts >= mission.createdAt
+          : attempt.missionID === mission.missionID),
+    );
+    const pendingCells: string[] = [];
+    for (const cellID of new Set(attempts.map((attempt) => attempt.cellID))) {
+      const pending = await readPendingCompletion(runtime.store, projectID, cellID);
+      if (pending?.parentSessionID === mission.sessionID && pending.finalized !== true) {
+        pendingCells.push(cellID);
+      }
+    }
+    rows.push({
+      sessionID: mission.sessionID,
+      active: mission.active,
+      mode: mission.mode,
+      createdAt: mission.createdAt,
+      updatedAt: mission.updatedAt,
+      counts: mission.counts,
+      attempts: attempts.length,
+      unrevokedAttempts: attempts.filter(
+        (attempt) =>
+          attempt.revokedAt === undefined &&
+          (attempt.status === "pending" || attempt.status === "succeeded"),
+      ).length,
+      pendingCompletions: pendingCells,
+    });
+  }
+  const orphanAttempts = allAttempts.filter((attempt) => !missionSessionIDs.has(attempt.sessionID));
+  return {
+    output: { projectID, missions: rows, orphanAttempts: orphanAttempts.length },
+    content: rows
+      .map(
+        (row) =>
+          `${row.active ? "ACTIVE" : "inactive"} ${row.sessionID} mode=${row.mode} spawns=${row.counts.spawns} unrevoked=${row.unrevokedAttempts} pending=${row.pendingCompletions.length}`,
+      )
+      .concat(`orphan attempts: ${orphanAttempts.length}`)
+      .join("\n"),
+  };
+}
+
+async function abandonMissionSession(
+  store: MissionStateStore,
+  projectID: string,
+  targetSessionID: string,
+  reason: string,
+): Promise<MissionState> {
+  const mission = await readMission(store, projectID, targetSessionID);
+  if (mission === undefined) {
+    throw new LocalToolError("swarm_finish", "not_found", `no mission for session ${targetSessionID}`);
+  }
+  const attempts = await listAttempts(store, projectID, targetSessionID, mission);
+  const missionID = reviewMissionID(mission);
+  for (const cellID of new Set(attempts.map((attempt) => attempt.cellID))) {
+    const pending = await readPendingCompletion(store, projectID, cellID);
+    if (
+      pending !== undefined &&
+      pending.parentSessionID === targetSessionID &&
+      pending.missionID === missionID &&
+      pending.finalized !== true
+    ) {
+      await store.storage.set(pendingCompletionKey(projectID, cellID), {
+        ...pending,
+        canceled: true,
+        cancelReason: reason || "mission abandoned",
+        canceledAt: store.now(),
+        finalized: true,
+        finalizing: false,
+      });
+    }
+  }
+  const finished = await finishMission(store, {
+    projectID,
+    sessionID: targetSessionID,
+    abandon: true,
+  });
+  if (finished === undefined) {
+    throw new LocalToolError("swarm_finish", "not_found", `no mission for session ${targetSessionID}`);
+  }
+  return finished;
+}
+
 async function runFinish(
   runtime: SwarmxRuntime,
   context: ToolExecuteContextLike,
@@ -1679,6 +1785,33 @@ async function runFinish(
   const reason = optionalStringInput("swarm_finish", input, "reason") ?? "";
   const abandon = input.abandon === true;
   const { store, projectID, sessionID, projectRoot } = await requireMissionScope("swarm_finish", runtime, context);
+  const targetSessionID = optionalStringInput("swarm_finish", input, "session_id");
+  const allSessions = input.all_sessions === true;
+  if (allSessions || (targetSessionID !== undefined && targetSessionID !== sessionID)) {
+    if (!abandon) {
+      throw new LocalToolError("swarm_finish", "invalid_input", "abandon=true is required when targeting another session");
+    }
+    const missions = (await store.list()).filter((mission) => mission.projectID === projectID);
+    const targets = allSessions
+      ? missions.filter((mission) => mission.active)
+      : missions.filter((mission) => mission.sessionID === targetSessionID);
+    if (targets.length === 0) {
+      throw new LocalToolError("swarm_finish", "not_found", "no matching mission to abandon");
+    }
+    const finished = [];
+    for (const mission of targets) {
+      finished.push(await abandonMissionSession(store, projectID, mission.sessionID, reason));
+    }
+    return {
+      output: {
+        finished: true,
+        active: false,
+        abandoned: finished.map((mission) => mission.sessionID),
+        reason,
+      },
+      content: `Abandoned ${finished.length} mission(s): ${finished.map((mission) => mission.sessionID).join(", ")}`,
+    };
+  }
   const lockKey = [projectID, sessionID].map(encodeURIComponent).join(":");
   return withReviewDecisionLock(lockKey, async () => {
     const current = await readMission(store, projectID, sessionID);
@@ -2150,6 +2283,8 @@ async function executeLocal(
       return runSetBudget(runtime, context, args);
     case "swarm_finish":
       return runFinish(runtime, context, args);
+    case "swarm_mission_status":
+      return runMissionStatus(runtime, context);
     case "swarm_cancel_completion":
       return runCancelCompletion(runtime, context, args);
     case "swarm_amend_completion":
@@ -4365,6 +4500,7 @@ const COORDINATOR_ONLY_TOOL_NAMES = new Set([
   "hive_sync",
   "swarm_worktree_cleanup",
   "swarm_finish",
+  "swarm_mission_status",
   "swarm_cancel_completion",
   "swarmmail_release_agent",
   "swarmmail_release_all",

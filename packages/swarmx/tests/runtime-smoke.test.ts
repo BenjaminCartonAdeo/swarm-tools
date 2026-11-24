@@ -407,9 +407,9 @@ describe("swarmx plugin registration", () => {
     const editor = ctx.createEditor();
     const expected = listToolNames();
 
-    expect(expected).toHaveLength(88);
+    expect(expected).toHaveLength(89);
     expect(() => transform(editor)).not.toThrow();
-    expect(editor.list()).toHaveLength(88);
+    expect(editor.list()).toHaveLength(89);
     expect(editor.list().map((tool) => tool.name).sort()).toEqual(expected);
     // The editor derives ids from the effective name (the real SDK never
     // receives an id); a single `undefined` key would collapse the registry.
@@ -417,7 +417,7 @@ describe("swarmx plugin registration", () => {
 
     // Replaying the exact same transform on the same editor must not duplicate.
     expect(() => transform(editor)).not.toThrow();
-    expect(editor.list()).toHaveLength(88);
+    expect(editor.list()).toHaveLength(89);
     expect(editor.list().map((tool) => tool.name).sort()).toEqual(expected);
   });
 
@@ -2717,6 +2717,47 @@ describe("mission gate → settle sequence", () => {
       canceled: true,
       finalized: true,
     });
+  });
+
+  test("swarm_mission_status lists stale sessions and all_sessions abandon clears them", async () => {
+    const rig = await createRig({ agents: GATE_AGENTS });
+    const store = missionStore(rig.ctx);
+    await dispatchWorker(rig, "cell-a", "call-dispatch-current");
+    const staleSession = "ses-stale";
+    await setBudget(store, {
+      projectID: PROJECT,
+      sessionID: staleSession,
+      mode: "dev",
+      maxSpawns: 3,
+      maxIterations: 3,
+      workerShare: 1,
+    });
+    await setAssignment(store, PROJECT, "cell-stale", "swarm/swarm-worker", { sessionID: staleSession });
+    const stalePayload = {
+      ...workerDispatchPayload("cell-stale", "call-dispatch-stale"),
+      sessionID: staleSession,
+    };
+    await rig.before(stalePayload);
+
+    const status = await rig.tools.get("swarm_mission_status")?.execute({}, toolContext());
+    expect(status?.output).toMatchObject({
+      missions: [
+        { sessionID: SESSION, active: true },
+        { sessionID: staleSession, active: true },
+      ],
+    });
+
+    const finished = await rig.tools.get("swarm_finish")?.execute(
+      { reason: "Clear stale missions.", abandon: true, all_sessions: true },
+      toolContext("swarm/swarm-coordinator", "call-finish-all"),
+    );
+    expect(finished?.output).toMatchObject({
+      finished: true,
+      active: false,
+      abandoned: [SESSION, staleSession],
+    });
+    expect(await readMission(store, PROJECT, SESSION)).toMatchObject({ active: false });
+    expect(await readMission(store, PROJECT, staleSession)).toMatchObject({ active: false });
   });
 
   test("swarm_complete stores worker verification steps", async () => {

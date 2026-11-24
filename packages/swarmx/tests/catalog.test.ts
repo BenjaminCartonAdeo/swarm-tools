@@ -253,10 +253,11 @@ const LOCAL_TOOL_NAMES = [
   "swarm_probe",
   "swarm_cancel_completion",
   "swarm_amend_completion",
+  "swarm_mission_status",
 ] as const;
 
 const CLI_NAME_SET = new Set<string>(CLI_TOOL_NAMES);
-const EXPECTED_COUNT = V1_TOOL_NAMES.length + 7; // 81 + swarm_finish + swarm_reset + swarm_preflight + swarm_probe + swarm_cancel_completion + swarm_amend_completion
+const EXPECTED_COUNT = V1_TOOL_NAMES.length + 8; // 81 + swarm_finish + swarm_reset + swarm_preflight + swarm_probe + swarm_cancel_completion + swarm_amend_completion + swarm_mission_status
 const CALL_CONTEXT = {
   sessionID: "ses-catalog",
   agent: "build",
@@ -281,7 +282,7 @@ function schemaProperties(spec: ToolSpec): Record<string, unknown> {
 }
 
 describe("catalogue coverage", () => {
-  test("88 distinct tool names, all non-empty", () => {
+  test("89 distinct tool names, all non-empty", () => {
     expect(SWARMX_TOOL_SPECS).toHaveLength(EXPECTED_COUNT);
     expect(findToolSpec("swarm_finish")).toBeDefined();
 
@@ -313,7 +314,7 @@ describe("catalogue coverage", () => {
     }
 
     expect(SWARMX_TOOL_SPECS.filter((spec) => spec.name === "swarm_finish")).toHaveLength(1);
-    expect(SWARMX_TOOL_SPECS).toHaveLength(V1_TOOL_NAMES.length + 7);
+    expect(SWARMX_TOOL_SPECS).toHaveLength(V1_TOOL_NAMES.length + 8);
   });
 });
 
@@ -427,7 +428,7 @@ describe("compatibility matrix", () => {
     expect(link?.backendName).toBe("hive_link_thread");
   });
 
-  test("the thirteen local tools are local, active and carry no backendName", () => {
+  test("the fourteen local tools are local, active and carry no backendName", () => {
     for (const name of LOCAL_TOOL_NAMES) {
       const spec = findToolSpec(name);
       expect(spec).toBeDefined();
@@ -462,7 +463,7 @@ describe("compatibility matrix", () => {
     });
   });
 
-  test("distribution is exactly 70 backend active, 1 alias, 4 deprecated, 13 local (88)", () => {
+  test("distribution is exactly 70 backend active, 1 alias, 4 deprecated, 14 local (89)", () => {
     const activeBackend = SWARMX_TOOL_SPECS.filter(
       (spec) => spec.kind === "backend" && spec.status === "active",
     );
@@ -473,9 +474,9 @@ describe("compatibility matrix", () => {
     expect(activeBackend).toHaveLength(70);
     expect(aliases).toHaveLength(1);
     expect(deprecated).toHaveLength(4);
-    expect(locals).toHaveLength(13);
-    expect(activeBackend.length + aliases.length + deprecated.length + locals.length).toBe(88);
-    expect(SWARMX_TOOL_SPECS).toHaveLength(88);
+    expect(locals).toHaveLength(14);
+    expect(activeBackend.length + aliases.length + deprecated.length + locals.length).toBe(89);
+    expect(SWARMX_TOOL_SPECS).toHaveLength(89);
   });
 });
 
@@ -541,7 +542,7 @@ describe("registerTools", () => {
     }
   });
 
-  test("registers all 88 tools synchronously and replay stays idempotent", async () => {
+  test("registers all 89 tools synchronously and replay stays idempotent", async () => {
     const { editor, ctx } = await registerWithFakeRuntime();
     expect(editor.list()).toHaveLength(EXPECTED_COUNT);
 
