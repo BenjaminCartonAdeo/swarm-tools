@@ -479,7 +479,7 @@ const SWARM_SPECS: readonly ToolSpec[] = [
   ),
   backend(
     "swarm_progress",
-    "Report progress on a subtask to coordinator",
+    "Report progress on a subtask to coordinator. Terminal statuses (completed/failed) are refused: use swarm_complete to submit a completion for review.",
     {
       project_key: str("Project key"),
       agent_name: str("Agent name"),
