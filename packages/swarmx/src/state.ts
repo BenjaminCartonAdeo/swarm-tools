@@ -645,12 +645,10 @@ export async function reconcileMissionCounts(
 }
 
 /**
- * Settles abandoned `pending` attempts as `aborted`.
+ * Reports pending attempts for explicit reconciliation without changing them.
+ * An elapsed grace period cannot establish whether a worker is still live.
  *
- * No counter is decremented and no counter is incremented: the reservation
- * already paid for the attempt, recovery only repairs the ledger status.
- *
- * @returns How many attempts were moved to `aborted`.
+ * @returns How many pending attempts remain candidates for reconciliation.
  */
 export async function recoverPendingOrphans(
   store: MissionStateStore,
@@ -659,18 +657,7 @@ export async function recoverPendingOrphans(
 ): Promise<number> {
   const mission = await readMission(store, projectID, sessionID);
   const attempts = await listAttempts(store, projectID, sessionID, mission);
-  const pending = attempts.filter((attempt) => attempt.status === "pending");
-  if (pending.length === 0) return 0;
-  const nowMs = Date.parse(store.now());
-  let recovered = 0;
-  for (const attempt of pending) {
-    const tsMs = Date.parse(attempt.ts);
-    const age = Number.isFinite(tsMs) ? nowMs - tsMs : Number.POSITIVE_INFINITY;
-    if (age < store.orphanGraceMs) continue;
-    await putAttempt(store, projectID, { ...attempt, status: "aborted" });
-    recovered += 1;
-  }
-  return recovered;
+  return attempts.filter((attempt) => attempt.status === "pending").length;
 }
 
 export interface SetBudgetInput {
@@ -1108,8 +1095,8 @@ export async function completeConsolidation(
 /**
  * Structured mission summary for `swarm_agent_audit`.
  *
- * Runs orphan recovery first, so `pendingOrphans` reports what this call
- * repaired and `attempts` never contains a stale `pending` from a crash.
+ * Reports pending attempts as reconciliation candidates without changing
+ * their status; elapsed time alone cannot establish that a worker is gone.
  */
 export async function audit(
   store: MissionStateStore,

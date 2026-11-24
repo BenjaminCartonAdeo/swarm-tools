@@ -848,7 +848,7 @@ describe("ledger idempotency", () => {
     expect(attempts[0]?.status).toBe("succeeded");
   });
 
-  test("an execute.before without execute.after is recovered as aborted, no double gain", async () => {
+  test("an execute.before without execute.after remains a pending orphan candidate", async () => {
     const { store } = setup();
     await startMission(store);
     await setAssignment(store, PROJECT, "cell-a", "ts-pro");
@@ -861,13 +861,36 @@ describe("ledger idempotency", () => {
 
     const summary = await audit(store, PROJECT, SESSION);
     expect(summary.pendingOrphans).toBe(1);
-    expect(summary.attempts[0]?.status).toBe("aborted");
+    expect(summary.attempts[0]?.status).toBe("pending");
     expect(summary.counts?.spawns).toBe(1);
 
-    // Second audit: nothing left to recover, counters still unchanged.
+    // Second audit: the pending attempt remains a candidate, counters unchanged.
     const next = await audit(store, PROJECT, SESSION);
-    expect(next.pendingOrphans).toBe(0);
+    expect(next.pendingOrphans).toBe(1);
     expect(next.counts?.spawns).toBe(1);
+  });
+
+  test("timerExpiryDoesNotAbortLiveWorkerAttempt", async () => {
+    const ctx = createFakeContext({ agents: AGENTS, projectId: PROJECT });
+    let now = "2026-01-01T00:00:00.000Z";
+    const store = createMissionStateStore(ctx.storage as unknown as MissionStorageLike, {
+      projectID: PROJECT,
+      listAgents: () => ctx.agent.list(),
+      now: () => now,
+      orphanGraceMs: 1_000,
+    });
+    await startMission(store);
+    await setAssignment(store, PROJECT, "cell-a", "ts-pro");
+    await gateBefore(store, beforeEvent({ id: "call-live-worker" }));
+    const countsBeforeAudit = (await readMission(store, PROJECT, SESSION))?.counts;
+    now = "2026-01-01T00:00:02.000Z";
+
+    const summary = await audit(store, PROJECT, SESSION);
+
+    expect(summary.pendingOrphans).toBe(1);
+    expect(summary.attempts[0]?.status).toBe("pending");
+    expect(summary.counts).toEqual(countsBeforeAudit);
+    expect((await listAttempts(store, PROJECT, SESSION))[0]?.status).toBe("pending");
   });
 
   test("settleAfter never rejects, even with a broken payload", async () => {
@@ -903,7 +926,7 @@ describe("persistence and audit", () => {
     const summary = await audit(store, PROJECT, SESSION);
 
     expect(summary.pendingOrphans).toBe(1);
-    expect(summary.attempts[0]?.status).toBe("aborted");
+    expect(summary.attempts[0]?.status).toBe("pending");
     expect(summary.counts?.spawns).toBe(1);
     expect(summary.counts?.attemptsByCell).toEqual({ "cell-a": 1 });
   });
