@@ -3853,7 +3853,8 @@ async function resolveParentMissionForWorker(
       (attempt.status === "pending" || attempt.status === "succeeded"),
   );
   if (attempt === undefined) {
-    throw new LocalToolError(tool, "conflict", "the worker prompt is not bound to a dispatched cell in its parent mission");
+    const detail = `cell=${worker.marker.cellID} epic=${worker.marker.epicID} agent=${worker.agent.id} token=${worker.marker.dispatchToken ?? "none"} attempts=${attempts.length} (revoked=${attempts.filter((a) => a.revokedAt !== undefined).length})`;
+    throw new LocalToolError(tool, "conflict", `the worker prompt is not bound to a dispatched cell in its parent mission (${detail})`);
   }
 
   const boundAttempt = await withMissionLock(projectID, parentSessionID, async () => {
