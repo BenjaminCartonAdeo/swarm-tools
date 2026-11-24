@@ -2702,9 +2702,10 @@ function runToolForSession(
   args: Record<string, unknown>,
   sessionID: string,
   timeoutMs?: number,
+  cwd?: string,
 ): Promise<unknown> {
   return runtime.runTool(name, args, {
-    ...(runtime.projectPath === undefined ? {} : { cwd: runtime.projectPath }),
+    ...(cwd === undefined && runtime.projectPath === undefined ? {} : { cwd: cwd ?? runtime.projectPath }),
     env: { OPENCODE_SESSION_ID: sessionID },
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
   });
@@ -3261,7 +3262,7 @@ async function submitPendingCompletion(
     workerAgentName: worker.agent.name,
     attemptCallID: worker.attemptCallID,
     dispatchToken: worker.marker.dispatchToken as string,
-    projectPath: await canonicalProjectRoot("swarm_complete", runtime),
+    projectPath: typeof args.project_key === "string" ? args.project_key : await canonicalProjectRoot("swarm_complete", runtime),
     summary: args.summary as string,
     startTime: typeof args.start_time === "number" ? args.start_time : Date.now(),
     filesTouched: Array.isArray(args.files_touched) ? (args.files_touched as string[]) : [],
@@ -3498,6 +3499,7 @@ async function listEpicChildCells(
   runtime: SwarmxRuntime,
   sessionID: string,
   epicID: string,
+  projectRoot?: string,
 ): Promise<EpicChildCell[]> {
   // `parent_id` is a first-class filter of the backend `hive_cells` schema
   // (opencode-swarm-plugin/src/hive.ts: `parent_id` → adapter.queryCells), and
@@ -3506,12 +3508,15 @@ async function listEpicChildCells(
     runtime,
     "hive_cells",
     {
-      ...(runtime.projectPath === undefined ? {} : { project_key: runtime.projectPath }),
+      ...(projectRoot === undefined && runtime.projectPath === undefined
+        ? {}
+        : { project_key: projectRoot ?? runtime.projectPath }),
       parent_id: epicID,
       limit: 200,
     },
     sessionID,
     60_000,
+    projectRoot,
   );
   return parseEpicCells(output);
 }
@@ -3537,6 +3542,7 @@ async function closeHiveCellAfterFallback(
       { id: pending.taskID, reason: `Locally verified and approved: ${pending.summary}` },
       sessionID,
       120_000,
+      pending.projectPath,
     );
   } catch (error) {
     // The cell may already be closed if the CLI lost the close response.
@@ -3545,7 +3551,7 @@ async function closeHiveCellAfterFallback(
 
   let cell: EpicChildCell | undefined;
   try {
-    cell = (await listEpicChildCells(runtime, sessionID, pending.epicID)).find(
+    cell = (await listEpicChildCells(runtime, sessionID, pending.epicID, pending.projectPath)).find(
       (candidate) => candidate.id === pending.taskID,
     );
   } catch (error) {
@@ -3736,6 +3742,7 @@ async function executeReviewFeedbackLocked(
       },
       pending.workerSessionID,
       120_000,
+      pending.projectPath,
     );
     if (
       !backendReportedSuccess(completionOutput) &&
@@ -3754,7 +3761,9 @@ async function executeReviewFeedbackLocked(
         try {
           await closeHiveCellAfterFallback(runtime, receipt.sessionID, pending);
         } catch (error) {
-          await setPendingCompletionFinalizing(store, receipt, pending, false);
+          // Keep finalizing=true: the review was approved and local checks
+          // passed, only the backend close failed. This allows an explicit
+          // coordinator hive_close without reopening the review gate.
           const message = error instanceof Error ? error.message : String(error);
           throw new LocalToolError("swarm_review_feedback", "conflict", message);
         }
@@ -4101,6 +4110,62 @@ async function resolveParentMissionForWorker(
 function requireAssignedAgentName(tool: string, value: unknown, agent: RosterAgent): void {
   if (value !== agent.id && value !== agent.name) {
     throw new LocalToolError(tool, "conflict", "agent_name does not match the caller assigned to this cell");
+  }
+}
+
+async function requireHiveCloseAllowed(
+  runtime: SwarmxRuntime,
+  input: Record<string, unknown>,
+): Promise<void> {
+  const cellID = typeof input.id === "string" ? input.id : "";
+  const projectID = resolveProjectID(runtime);
+  if (runtime.store === undefined || projectID === undefined || cellID.length === 0) {
+    throw new LocalToolError("hive_close", "runtime_unavailable", "cannot verify active project missions");
+  }
+  let missions: readonly MissionState[];
+  try {
+    missions = await runtime.store.list();
+  } catch {
+    throw new LocalToolError("hive_close", "runtime_unavailable", "cannot verify active project missions");
+  }
+  const activeMissions = missions.filter((entry) => entry.projectID === projectID && entry.active);
+  for (const mission of activeMissions) {
+    const attempts = await listAttempts(runtime.store, projectID, mission.sessionID, mission);
+    if (!attempts.some((attempt) => attempt.cellID === cellID)) continue;
+    const pending = await readPendingCompletion(runtime.store, projectID, cellID);
+    if (pending?.finalized === true || pending?.canceled === true || pending?.finalizing === true) return;
+    const review = await runtime.store.storage.get(
+      reviewReceiptKey(projectID, mission.sessionID, reviewMissionID(mission), cellID),
+    );
+    if (isScopedReviewReceipt(review) && review.approval !== undefined) return;
+    throw new LocalToolError(
+      "hive_close",
+      "conflict",
+      "active swarmx cells close only through an approved swarm_complete call or an approved review receipt",
+    );
+  }
+  if (activeMissions.length > 0) {
+    throw new LocalToolError(
+      "hive_close",
+      "conflict",
+      "active swarmx cells close only through an approved swarm_complete call",
+    );
+  }
+  // No active mission owns this cell; still block orphaned unrevoked attempts.
+  const attempts = await listAttempts(runtime.store, projectID);
+  if (
+    attempts.some(
+      (attempt) =>
+        attempt.cellID === cellID &&
+        attempt.revokedAt === undefined &&
+        (attempt.status === "pending" || attempt.status === "succeeded"),
+    )
+  ) {
+    throw new LocalToolError(
+      "hive_close",
+      "conflict",
+      "the cell still has an unrevoked worker attempt",
+    );
   }
 }
 
@@ -4519,7 +4584,7 @@ async function executeSpec(
     await restrictSwarmMailRelease(runtime, context, args);
   }
   if (spec.name === "hive_close") {
-    await requireNoActiveProjectMission(runtime, "hive_close");
+    await requireHiveCloseAllowed(runtime, args);
   }
   if (spec.name === "hive_update") {
     await restrictHiveUpdate(runtime, context, args);

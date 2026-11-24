@@ -1869,8 +1869,16 @@ describe("mission gate → settle sequence", () => {
     ).rejects.toThrow(/Hive cell cell-still-open is not closed/);
     expect(rig.runCalls.some((call) => call.name === "hive_close")).toBe(true);
     expect(await rig.ctx.storage.get(pendingCompletionKey(PROJECT, "cell-still-open"))).toMatchObject({
-      finalizing: false,
+      finalizing: true,
     });
+    // The review was approved and local checks passed; only the backend close
+    // failed. The coordinator can now close explicitly without reopening review.
+    await expect(
+      rig.tools.get("hive_close")?.execute(
+        { id: "cell-still-open", reason: "Manual close after approved review." },
+        toolContext("swarm/swarm-coordinator", "call-manual-close-still-open"),
+      ),
+    ).resolves.toBeDefined();
   }, 30_000);
 
   test("backend completion with only skipped verification steps cannot be approved", async () => {
