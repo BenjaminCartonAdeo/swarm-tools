@@ -27,11 +27,13 @@ import {
   type DispatchBeforeEvent,
 } from "./dispatch";
 import {
+  acquireBuildLock,
   bindWorkerAttemptSession,
   createMissionStateStore,
   listAssignments,
   listAttempts,
   readMission,
+  releaseBuildLock,
   selectPendingOrphans,
   type MissionStorageLike,
 } from "./state";
@@ -129,6 +131,16 @@ function isSwarmCliToolCommand(command: string): boolean {
       );
     });
   });
+}
+
+function isBuildOrTestCommand(command: string): boolean {
+  const normalized = command.toLowerCase();
+  return [
+    /\b(?:\.\/)?mvnw?\b.*\b(?:test|compile|package|verify|install)\b/,
+    /\b(?:\.\/)?gradlew?\b.*\b(?:test|build|check)\b/,
+    /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|typecheck|check)\b/,
+    /\b(?:go|cargo)\s+(?:test|build|check)\b/,
+  ].some((pattern) => pattern.test(normalized));
 }
 
 type WorkerMutationDenial = "mission_inactive" | "pending_completion" | "token_missing" | "revoked" | "not_owner" | "read_only_followup";
@@ -288,9 +300,27 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
         }
         if (["edit", "write", "patch", "shell"].includes(event.action)) {
           const reason = await workerMutationDenial(runtime, event.sessionID, event.agent);
-          if (reason === undefined) return;
-          event.effect = "deny";
-          event.message = `worker dispatch capability is revoked, unbound, or not owned by this session (${reason}).`;
+          if (reason !== undefined) {
+            event.effect = "deny";
+            event.message = `worker dispatch capability is revoked, unbound, or not owned by this session (${reason}).`;
+            return;
+          }
+          if (event.action === "shell") {
+            const command = event.resources.join(" ");
+            if (isBuildOrTestCommand(command)) {
+              const acquired = await acquireBuildLock(
+                store,
+                projectID,
+                event.sessionID,
+                command,
+              ).catch(() => false);
+              if (!acquired) {
+                event.effect = "deny";
+                event.message = "another build/test is already running in this project; wait for it to finish before compiling again.";
+                return;
+              }
+            }
+          }
         }
       });
 
@@ -320,6 +350,9 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
       });
 
       await ctx.tool.hook("execute.after", async (event) => {
+        if (event.tool === "shell") {
+          await releaseBuildLock(store, projectID, event.sessionID).catch(() => undefined);
+        }
         const base = before(event);
         const settled: DispatchAfterEvent =
           event.status === "completed"

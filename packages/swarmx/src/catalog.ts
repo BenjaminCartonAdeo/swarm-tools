@@ -984,7 +984,11 @@ const LOCAL_SPECS: readonly ToolSpec[] = [
   ),
   local(
     "swarm_preflight",
-    "Check repository prerequisites before running swarm work: dependencies, test runner, Git remote, and GitHub CLI.",
+    "Check repository prerequisites before running swarm work: dependencies, test runner, Git remote, GitHub CLI, and working-tree cleanliness. Dirty trees require an explicit audited override.",
+    {
+      allow_dirty: bool("Accept a dirty working tree after an explicit audit"),
+      dirty_reason: str("Why existing changes were audited and accepted", { minLength: 1 }),
+    },
   ),
 ];
 
@@ -2131,7 +2135,10 @@ async function runRepoInventory(
   };
 }
 
-async function runPreflight(runtime: SwarmxRuntime): Promise<ToolExecuteResult> {
+async function runPreflight(
+  runtime: SwarmxRuntime,
+  input: Record<string, unknown>,
+): Promise<ToolExecuteResult> {
   const root = await canonicalProjectRoot("swarm_preflight", runtime);
   const nodeModulesAvailable = existsSync(resolve(root, "node_modules"));
   const testRunner = Bun.spawnSync(["bun", "test", "--help"], {
@@ -2152,6 +2159,18 @@ async function runPreflight(runtime: SwarmxRuntime): Promise<ToolExecuteResult> 
     stderr: "pipe",
     timeout: 10_000,
   });
+  const status = Bun.spawnSync(["git", "status", "--porcelain"], {
+    cwd: root,
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 10_000,
+  });
+  const statusLines = status.stdout.toString().split("\n").filter((line) => line.length > 0);
+  const changedFiles = statusLines.map((line) => line.slice(3));
+  const untrackedFiles = statusLines.filter((line) => line.startsWith("??")).map((line) => line.slice(3));
+  const clean = status.exitCode === 0 && changedFiles.length === 0;
+  const dirtyReason = typeof input.dirty_reason === "string" ? input.dirty_reason.trim() : "";
+  const dirtyAudited = input.allow_dirty === true && dirtyReason.length > 0;
   const testRunnerOk = testRunner.exitCode === 0;
   const remoteOk = remote.exitCode === 0;
   const ghOk = gh.exitCode === 0;
@@ -2180,10 +2199,29 @@ async function runPreflight(runtime: SwarmxRuntime): Promise<ToolExecuteResult> 
       ok: ghOk,
       detail: ghOk ? gh.stdout.toString().split("\n")[0]!.trim() : gh.stderr.toString().trim() || "gh is unavailable",
     },
+    {
+      name: "working tree",
+      ok: clean || dirtyAudited,
+      detail: clean
+        ? "clean"
+        : dirtyAudited
+          ? `dirty tree accepted after audit: ${dirtyReason}`
+          : `${changedFiles.length} changed file(s); audit them or clean the tree before retrying`,
+    },
   ];
   const ok = checks.every((check) => check.ok);
   return {
-    output: { ok, checks },
+    output: {
+      ok,
+      checks,
+      working_tree: {
+        clean,
+        changed_files: changedFiles,
+        untracked_files: untrackedFiles,
+        audited: dirtyAudited,
+        ...(dirtyAudited ? { audit_reason: dirtyReason } : {}),
+      },
+    },
     content: checks.map((check) => `${check.ok ? "PASS" : "FAIL"} ${check.name}: ${check.detail}`).join("\n"),
   };
 }
@@ -2295,7 +2333,7 @@ async function executeLocal(
     case "swarm_repo_inventory":
       return runRepoInventory(runtime, context);
     case "swarm_preflight":
-      return runPreflight(runtime);
+      return runPreflight(runtime, args);
     case "swarm_probe":
       return runProbe(runtime, args);
     case "swarm_agent_audit":
@@ -2937,6 +2975,63 @@ type ScopedReviewDiffCheck =
  *     requested file has no section at all;
  *   - `empty_file`: a section is header-only / has no complete change hunk.
  */
+function generateNewFileDiff(file: string, projectRoot?: string): string {
+  const fullPath = projectRoot ? resolve(projectRoot, file) : file;
+  try {
+    const result = Bun.spawnSync(["git", "diff", "--no-index", "/dev/null", fullPath], {
+      cwd: projectRoot ?? process.cwd(),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let diff = result.stdout.toString().trim();
+    if (diff.length === 0) return "";
+    diff = diff.replaceAll(fullPath, `/${file}`);
+    diff = diff.replace(/^diff --git a\/dev\/null b\//m, `diff --git a/${file} b/${file}`);
+    return diff;
+  } catch {
+    return "";
+  }
+}
+
+function enrichReviewOutputWithNewFiles(
+  output: unknown,
+  filesTouched: readonly string[],
+  projectRoot?: string,
+): unknown {
+  const record = parseBackendObject(output);
+  if (typeof record.review_prompt !== "string") return output;
+  const returned = asArguments(record.context).files_touched;
+  const returnedList = Array.isArray(returned) ? (returned as string[]) : [];
+  const missing = filesTouched.filter((file) => !returnedList.includes(file));
+  const diffs = missing
+    .map((file) => generateNewFileDiff(file, projectRoot))
+    .filter((diff) => diff.length > 0);
+  if (diffs.length === 0) return output;
+
+  const endMarker = "\n```\n\n## Review Criteria";
+  let reviewPrompt = record.review_prompt;
+  const filesHeader = "## Files Modified\n";
+  if (reviewPrompt.includes(filesHeader)) {
+    reviewPrompt = reviewPrompt.replace(
+      filesHeader,
+      `${filesHeader}${missing.map((file) => `- \`${file}\``).join("\n")}\n`,
+    );
+  } else {
+    reviewPrompt = `${filesHeader}${missing.map((file) => `- \`${file}\``).join("\n")}\n\n${reviewPrompt}`;
+  }
+  reviewPrompt = reviewPrompt.includes(endMarker)
+    ? reviewPrompt.replace(endMarker, `\n${diffs.join("\n")}${endMarker}`)
+    : `${reviewPrompt}\n\n## New Files\n\`\`\`diff\n${diffs.join("\n")}\n\`\`\``;
+  return {
+    ...record,
+    review_prompt: reviewPrompt,
+    context: {
+      ...(typeof record.context === "object" && record.context !== null ? record.context : {}),
+      files_touched: [...returnedList, ...missing],
+    },
+  };
+}
+
 function checkScopedReviewDiff(
   output: unknown,
   filesTouched: readonly string[],
@@ -2977,18 +3072,9 @@ function checkScopedReviewDiff(
       return { ok: false, missing: "file" };
     }
     // Generate a diff for new (untracked) files so the reviewer sees content.
-    try {
-      const r = Bun.spawnSync(["git", "diff", "--no-index", "/dev/null", fullPath], {
-        cwd: projectRoot ?? process.cwd(),
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const out = r.stdout.toString().trim();
-      if (out.length > 0) {
-        newFileDiff += (newFileDiff.length > 0 ? "\n" : "") + out;
-      }
-    } catch {
-      // Best-effort.
+    const generated = generateNewFileDiff(file, projectRoot);
+    if (generated.length > 0) {
+      newFileDiff += (newFileDiff.length > 0 ? "\n" : "") + generated;
     }
   }
 
@@ -3098,7 +3184,7 @@ async function recordScopedReview(
   const filesTouched = args.files_touched as string[];
   const check = checkScopedReviewDiff(output, filesTouched, projectRoot);
   if (!check.ok) {
-    throw new LocalToolError("swarm_review", "conflict", scopedDiffFailureMessage(check.missing));
+    throw new LocalToolError("swarm_review", "conflict", `${scopedDiffFailureMessage(check.missing)} (${check.missing})`);
   }
   const diff = check.diff;
 
@@ -4785,6 +4871,7 @@ async function executeSpec(
         );
       }
       if (isReview) {
+        output = enrichReviewOutputWithNewFiles(output, files, projectRoot);
         await recordScopedReview(runtime, context, args, output);
       }
     } finally {

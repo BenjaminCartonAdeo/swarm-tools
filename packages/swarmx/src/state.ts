@@ -498,6 +498,52 @@ export type WorkerAttemptBindingResult =
       readonly status: "not_owner" | "not_found" | "revoked" | "inactive" | "invalid_status";
     };
 
+/** Prefix of the project-scoped build/test lock. */
+const BUILD_LOCK_PREFIX = "build-lock:";
+const BUILD_LOCK_TTL_MS = 15 * 60 * 1000;
+
+function buildLockKey(projectID: string): string {
+  return `${BUILD_LOCK_PREFIX}${projectID}`;
+}
+
+/** Acquires the project build lock. Returns false when another build is active. */
+export async function acquireBuildLock(
+  store: MissionStateStore,
+  projectID: string,
+  sessionID: string,
+  command: string,
+): Promise<boolean> {
+  return withMissionLock(projectID, "__build__", async () => {
+    const key = buildLockKey(projectID);
+    const raw = await store.storage.get(key);
+    const record = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : undefined;
+    const acquiredAt = typeof record?.acquiredAt === "string" ? Date.parse(record.acquiredAt) : 0;
+    const active = Number.isFinite(acquiredAt) && Date.now() - acquiredAt < BUILD_LOCK_TTL_MS;
+    if (active && record?.sessionID !== sessionID) return false;
+    await store.storage.set(key, {
+      projectID,
+      sessionID,
+      command,
+      acquiredAt: store.now(),
+    });
+    return true;
+  });
+}
+
+/** Releases the project build lock when the owning shell call settles. */
+export async function releaseBuildLock(
+  store: MissionStateStore,
+  projectID: string,
+  sessionID: string,
+): Promise<void> {
+  return withMissionLock(projectID, "__build__", async () => {
+    const key = buildLockKey(projectID);
+    const raw = await store.storage.get(key);
+    const record = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : undefined;
+    if (record?.sessionID === sessionID) await store.storage.remove(key);
+  });
+}
+
 /**
  * Atomically binds a dispatched attempt to its worker session on first use.
  *

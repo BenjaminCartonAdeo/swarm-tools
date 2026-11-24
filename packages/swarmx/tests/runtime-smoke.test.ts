@@ -16,7 +16,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -891,6 +891,33 @@ describe("mission gate → settle sequence", () => {
     const winner = results[0]?.status === "fulfilled" ? "ses-worker-a" : "ses-worker-b";
     const attempt = await getAttempt(missionStore(rig.ctx), PROJECT, "call-dispatch-race");
     expect(attempt?.workerSessionID).toBe(winner);
+  });
+
+  test("concurrent build commands are serialized per project", async () => {
+    const rig = await createRig({ agents: GATE_AGENTS });
+    const first = {
+      ...beforePayload({ id: "call-build-a" }),
+      tool: "shell",
+      input: { command: "./mvnw test" },
+    };
+    const second = {
+      ...beforePayload({ id: "call-build-b" }),
+      tool: "shell",
+      input: { command: "./mvnw test" },
+    };
+    const assertion = (callID: string, sessionID = SESSION) =>
+      rig.ctx.permission.assert({
+        sessionID,
+        agent: "swarm/swarm-coordinator",
+        source: { type: "tool", messageID: "msg-build", id: callID },
+        action: "shell",
+        resources: ["./mvnw test"],
+      });
+
+    await expect(assertion("call-build-a")).resolves.toBeUndefined();
+    await expect(assertion("call-build-b", "ses-other-coordinator")).rejects.toThrow(/another build|build.*progress/);
+    await rig.after({ ...first, status: "completed", result: {} });
+    await expect(assertion("call-build-b", "ses-other-coordinator")).resolves.toBeUndefined();
   });
 
   test("root mode-all sessions keep native write access", async () => {
@@ -2840,6 +2867,90 @@ describe("mission gate → settle sequence", () => {
     expect(await readMission(store, PROJECT, staleSession)).toMatchObject({ active: false });
   });
 
+  test("a specialized worker can submit swarm_complete before swarmmail_init", async () => {
+    const agents = [
+      ...GATE_AGENTS,
+      {
+        id: "sdp-java-developer",
+        name: "sdp-java-developer",
+        description: "Java backend implementation",
+        mode: "subagent" as const,
+        hidden: false,
+        permissions: [],
+      },
+    ];
+    const rig = await createRig({
+      agents,
+      projectPath: process.cwd(),
+      workerCell: { cellID: "cell-a", epicID: "epic-1" },
+    });
+    const store = missionStore(rig.ctx);
+    await setBudget(store, {
+      projectID: PROJECT,
+      sessionID: SESSION,
+      mode: "dev",
+      maxSpawns: 3,
+      maxIterations: 3,
+      workerShare: 1,
+    });
+    await setAssignment(store, PROJECT, "cell-a", "sdp-java-developer");
+    const payload = workerDispatchPayload("cell-a", "call-dispatch-java-complete");
+    payload.input = {
+      agent: "sdp-java-developer",
+      prompt: `Implement the assigned cell.\n\n${cellMarker("cell-a")}`,
+    };
+    await rig.before(payload);
+    const marker = extractCellMarker({ prompt: (payload.input as { prompt: string }).prompt });
+    rig.bindWorkerSession("ses-java-worker", marker, SESSION);
+
+    const completion = await rig.tools.get("swarm_complete")?.execute(
+      {
+        project_key: process.cwd(),
+        agent_name: "sdp-java-developer",
+        bead_id: "cell-a",
+        summary: "Implementation complete.",
+        start_time: 1,
+        files_touched: [],
+      },
+      workerToolContext("sdp-java-developer", "call-java-complete", "ses-java-worker"),
+    );
+    expect(completion?.output).toMatchObject({ status: "pending_review" });
+    expect((await getAttempt(store, PROJECT, "call-dispatch-java-complete"))?.workerSessionID).toBe(
+      "ses-java-worker",
+    );
+  });
+
+  test("swarm_preflight reports a dirty working tree and accepts an explicit audit", async () => {
+    const projectPath = await realpath(await mkdtemp(join(tmpdir(), "swarmx-preflight-dirty-")));
+    try {
+      Bun.spawnSync(["git", "init", "-q"], { cwd: projectPath });
+      await writeFile(join(projectPath, "existing-change.txt"), "audit me\n");
+      const rig = await createRig({ agents: GATE_AGENTS, projectPath });
+      const preflight = rig.tools.get("swarm_preflight");
+      expect(preflight).toBeDefined();
+
+      const dirty = await preflight?.execute({}, toolContext());
+      expect(dirty?.output).toMatchObject({
+        working_tree: { clean: false, untracked_files: ["existing-change.txt"] },
+      });
+      const dirtyCheck = (dirty?.output as { checks?: Array<{ name: string; ok: boolean }> }).checks?.find(
+        (check) => check.name === "working tree",
+      );
+      expect(dirtyCheck?.ok).toBe(false);
+
+      const audited = await preflight?.execute(
+        { allow_dirty: true, dirty_reason: "Existing changes audited before retry." },
+        toolContext("swarm/swarm-coordinator", "call-preflight-audited"),
+      );
+      const auditedCheck = (audited?.output as { checks?: Array<{ name: string; ok: boolean }> }).checks?.find(
+        (check) => check.name === "working tree",
+      );
+      expect(auditedCheck?.ok).toBe(true);
+    } finally {
+      await rm(projectPath, { recursive: true, force: true });
+    }
+  });
+
   test("swarm_complete stores worker verification steps", async () => {
     const projectPath = await realpath(process.cwd());
     const rig = await createRig({
@@ -2868,6 +2979,44 @@ describe("mission gate → settle sequence", () => {
         steps: [{ name: "targeted tests", command: "npm test -- --runInBand", exitCode: 0, output: "PASS", passed: true }],
       },
     });
+  });
+
+  test("swarm_review exposes the diff of a new untracked file", async () => {
+    const projectPath = await realpath(await mkdtemp(join(tmpdir(), "swarmx-review-new-")));
+    try {
+      await writeFile(join(projectPath, "new-file.txt"), "hello\nworld\n");
+      const rig = await createRig({
+        agents: GATE_AGENTS,
+        projectPath,
+        workerCell: { cellID: "cell-a", epicID: "epic-1" },
+        payload: {
+          review_prompt: "## Files Modified\n\n## Code Changes\n```diff\n\n```\n\n## Review Criteria",
+          context: { files_touched: [] },
+        },
+      });
+      await dispatchWorker(rig, "cell-a", "call-dispatch-new-file");
+      await rig.tools.get("swarm_complete")?.execute(
+        {
+          project_key: projectPath,
+          agent_name: "swarm-worker",
+          bead_id: "cell-a",
+          summary: "Added a new file.",
+          start_time: 1,
+          files_touched: ["new-file.txt"],
+        },
+        workerToolContext("swarm/swarm-worker", "call-completion-new-file"),
+      );
+      const review = await rig.tools.get("swarm_review")?.execute(
+        { project_key: projectPath, epic_id: "epic-1", task_id: "cell-a", files_touched: ["new-file.txt"] },
+        toolContext("swarm/swarm-coordinator", "call-review-new-file"),
+      );
+      const prompt = (review?.output as { review_prompt?: string }).review_prompt ?? "";
+      expect(prompt).toContain("new-file.txt");
+      expect(prompt).toContain("+hello");
+      expect(prompt).toContain("+world");
+    } finally {
+      await rm(projectPath, { recursive: true, force: true });
+    }
   });
 
   test("approval requires a completion verification receipt", async () => {

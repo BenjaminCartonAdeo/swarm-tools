@@ -120,7 +120,9 @@ session neuve pour renouveler le compteur, pas de polling d'attente.
 
 ## Phases
 
-1. Knowledge + `hivemind_find` (mémoire des missions passées).
+1. Knowledge + `hivemind_find` (mémoire des missions passées), puis `swarm_preflight()`.
+   Si le working tree est sale, le nettoyer ou l'auditer explicitement avec
+   `swarm_preflight({ allow_dirty: true, dirty_reason: "..." })` avant tout dispatch.
 2. Si une recherche est nécessaire, note-la comme cellule en lecture seule ; ne la
    dispatche pas avant la création de l'épic, l'affectation et le marqueur de cellule.
 3. **Décomposition** → `swarm_validate_decomposition` → `hive_create_epic` →
@@ -132,10 +134,14 @@ session neuve pour renouveler le compteur, pas de polling d'attente.
    `subagent({agent, description, prompt})` avec l'ID exact affecté et le prompt marqué.
    Chaque appel compte dans le budget de la mission.
  5. Attends les rapports V2 `<subagent>` sans polling. Après chaque résultat : inbox,
-    `swarm_review` avec `files_touched` non vide, puis `swarm_review_feedback`. `approved`
-    relance la soumission worker via la Verification Gate et finalise uniquement si elle passe.
-    Si le diff est vide/tronqué, scinde les chemins ou bloque; aucun shell/read fallback.
-    3 tentatives max dont un seul retry automatique.
+    `swarm_review` avec les chemins déclarés (liste vide autorisée pour la recherche),
+    puis `swarm_review_feedback`. Le plugin enrichit la review avec le diff des nouveaux
+    fichiers non suivis. `approved` relance la soumission worker via la Verification Gate
+    et finalise uniquement si elle passe. Un fichier absent ou un diff invalide bloque ;
+    ne pas prétendre l'avoir relu. 3 tentatives max dont un seul retry automatique.
+    Tous les workers, y compris les spécialistes et les chercheurs, soumettent via
+    `swarm_complete`. Les commandes de build/test sont sérialisées automatiquement ;
+    dispatcher séquentiellement les cellules qui recompilent tout le projet.
 6. Clôture — `swarm_agent_audit`, `hive_sync`, `hivemind_store`, `swarm_finish`.
 
 ## Références
