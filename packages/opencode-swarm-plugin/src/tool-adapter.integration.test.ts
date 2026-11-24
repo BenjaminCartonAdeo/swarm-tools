@@ -657,6 +657,43 @@ describe("hive tools adapter wiring", () => {
     }
   });
 
+  it("hive_create forwards operationId to the adapter and preserves absence", async () => {
+    const ctx = createTestContext();
+    const originalDir = getHiveWorkingDirectory();
+    setHiveWorkingDirectory(TEST_DB_PATH);
+
+    try {
+      const operationId = `op-task6-${Date.now()}`;
+      const first = await executeTool<Bead>(
+        hive_create,
+        { title: "Op id cell", operation_id: operationId },
+        ctx,
+      );
+      createdCellIds.push(first.id);
+      const second = await executeTool<Bead>(
+        hive_create,
+        { title: "Op id cell retry", operation_id: operationId },
+        ctx,
+      );
+      expect(second.id).toBe(first.id);
+
+      const { getHiveAdapter } = await import("./hive");
+      const hiveAdapter = await getHiveAdapter(TEST_DB_PATH);
+      const found = await hiveAdapter.queryCells(TEST_DB_PATH, {
+        operation_id: operationId,
+        limit: 1,
+      });
+      expect(found.map((c) => c.id)).toEqual([first.id]);
+
+      const a = await executeTool<Bead>(hive_create, { title: "No op id" }, ctx);
+      const b = await executeTool<Bead>(hive_create, { title: "No op id" }, ctx);
+      createdCellIds.push(a.id, b.id);
+      expect(a.id).not.toBe(b.id);
+    } finally {
+      setHiveWorkingDirectory(originalDir);
+    }
+  });
+
   /**
    * TEST: hive_query returns cells
    * 

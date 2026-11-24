@@ -2302,3 +2302,17 @@ describe("swarm db repair", () => {
   });
 });
 
+
+describe("executeTool args forwarding operationId", () => {
+  test("supplied operation_id survives CLI JSON parsing unchanged", async () => {
+    const { parseToolArgsJson } = await import("./tool-args");
+    const args = { title: "t", operation_id: "op-ÉX 42/α" };
+    expect(parseToolArgsJson(JSON.stringify(args))).toEqual(args);
+  });
+
+  test("omitted operation_id stays absent after CLI JSON parsing", async () => {
+    const { parseToolArgsJson } = await import("./tool-args");
+    expect("operation_id" in parseToolArgsJson(JSON.stringify({ title: "t" }))).toBe(false);
+    expect(parseToolArgsJson(undefined)).toEqual({});
+  });
+});

@@ -512,6 +512,10 @@ export const swarm_review_feedback = tool({
       .string()
       .optional()
       .describe("JSON array of ReviewIssue objects (for needs_changes)"),
+    operation_id: z
+      .string()
+      .optional()
+      .describe("Optional idempotency key forwarded unchanged"),
   },
   async execute(args, _ctx): Promise<string> {
     // Parse issues if provided

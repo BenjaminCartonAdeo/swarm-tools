@@ -110,6 +110,7 @@ import { detectRegressions } from "../src/regression-detection.js";
 
 // All tools (for tool command)
 import { allTools } from "../src/index.js";
+import { parseToolArgsJson } from "./tool-args.js";
 
 // Skills (for skill-reload command)
 import { invalidateSkillsCache, discoverSkills } from "../src/skills.js";
@@ -3741,7 +3742,7 @@ async function executeTool(toolName: string, argsJson?: string) {
   let args: Record<string, unknown> = {};
   if (argsJson) {
     try {
-      args = JSON.parse(argsJson);
+      args = parseToolArgsJson(argsJson);
     } catch (e) {
       console.log(
         JSON.stringify({

@@ -14,6 +14,7 @@ import { execFileSync } from "child_process";
 import { z } from "zod";
 import { randomBytes } from "crypto";
 import { SWARM_TOOLS } from "../index.js";
+import { buildToolCliArgs } from "./tool-cli-args.js";
 
 // Generate a persistent session ID for this MCP server instance
 // This ensures all tool calls within the same MCP connection share state
@@ -65,8 +66,7 @@ function jsonSchemaToZodShape(schema: Record<string, unknown>): Record<string, z
 
 function executeTool(name: string, args: Record<string, unknown>): string {
   try {
-    const argsJson = JSON.stringify(args);
-    return execFileSync("swarm", ["tool", name, "--json", argsJson], {
+    return execFileSync("swarm", buildToolCliArgs(name, args), {
       encoding: "utf-8",
       timeout: 300000,
       env: {

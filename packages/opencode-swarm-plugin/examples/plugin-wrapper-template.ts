@@ -722,6 +722,10 @@ const hive_create = tool({
       .string()
       .optional()
       .describe("Parent bead ID for epic children"),
+    operation_id: tool.schema
+      .string()
+      .optional()
+      .describe("Optional idempotency key forwarded unchanged"),
   },
   execute: (args, ctx) => execTool("hive_create", args, ctx),
 });
@@ -1417,6 +1421,10 @@ const swarm_review_feedback = tool({
       .string()
       .optional()
       .describe("JSON array of ReviewIssue objects (for needs_changes)"),
+    operation_id: tool.schema
+      .string()
+      .optional()
+      .describe("Optional idempotency key forwarded unchanged"),
   },
   execute: (args, ctx) => execTool("swarm_review_feedback", args, ctx),
 });
