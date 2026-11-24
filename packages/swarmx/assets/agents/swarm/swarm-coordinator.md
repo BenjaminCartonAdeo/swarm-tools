@@ -89,6 +89,8 @@ Jamais de repli silencieux sur `swarm/swarm-worker`.
 `medium` n'est acceptable **que** pour des tâches de configuration pure (package.json,
 config sans code). Ne jamais utiliser `medium` par défaut pour du code applicatif.
 
+Un worker read-only (researcher, planner) DOIT aussi soumettre sa fin via `swarm_complete` (avec `files_touched: []` si aucun fichier). `swarm_progress(status="completed")` est interdit et ne remplace pas `swarm_complete`.
+
 ## Ce qui est appliqué automatiquement — ne le ré-écris pas
 
 Un gate qui refuse est un **succès**, pas un bug. Ne contourne pas un refus :
