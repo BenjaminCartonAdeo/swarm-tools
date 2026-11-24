@@ -46,6 +46,7 @@ export const DISPATCH_TOOL_NAME = "subagent";
  */
 const CELL_MARKER_PATTERN = /<!-- swarmx:cell=([^\s;<>]+); epic=([^\s;<>]+) -->/g;
 const DISPATCH_TOKEN_PATTERN = /<!-- swarmx:dispatch=([a-f0-9-]+) -->/gi;
+const FOLLOWUP_MARKER_PATTERN = /<!--\s*swarmx:followup(?:=read-only)?\s*-->/i;
 
 /** Detects an attempted marker so malformed markers are not reported as absent. */
 const MARKER_NEAR_MISS = /<!--\s*swarmx/i;
@@ -416,7 +417,12 @@ export async function gateBefore(
   const agent = await requireDispatchableAgent(store, dispatchedAgentID);
   await requireAssignment(store, projectID, event.sessionID, marker, agent, dispatchedAgentID);
   const inputRecord = asRecord(event.input);
-  const countIteration = !(inputRecord?.purpose === "followup" || inputRecord?.read_only === true);
+  const prompt = typeof inputRecord?.prompt === "string" ? inputRecord.prompt : "";
+  const countIteration = !(
+    inputRecord?.purpose === "followup" ||
+    inputRecord?.read_only === true ||
+    FOLLOWUP_MARKER_PATTERN.test(prompt)
+  );
   const reservation = await reserveSpawn(store, projectID, event, marker, agent, mission, countIteration);
   if (reservation.status === "replay" || reservation.status === "reserved") {
     attachDispatchToken(event.input, reservation.dispatchToken, marker.cellID);

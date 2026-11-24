@@ -489,7 +489,8 @@ describe("mission gate → settle sequence", () => {
     const rig = await createRig({ agents: GATE_AGENTS });
     await dispatchWorker(rig, "cell-a", "call-dispatch-first");
     const followup = workerDispatchPayload("cell-a", "call-followup");
-    followup.input = { ...(followup.input as Record<string, unknown>), read_only: true };
+    const input = followup.input as { prompt: string };
+    input.prompt += "\n\n<!-- swarmx:followup=read-only -->";
     await rig.before(followup);
     const mission = await readMission(missionStore(rig.ctx), PROJECT, SESSION);
     expect(mission?.counts.spawns).toBe(2);
