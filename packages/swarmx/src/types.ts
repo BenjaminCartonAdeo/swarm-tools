@@ -397,6 +397,8 @@ export interface DispatchAttempt {
   dispatchToken?: string;
   /** V2 child session bound on its first scoped worker tool call. */
   workerSessionID?: string;
+  /** True for read-only follow-up dispatches that do not consume a cell iteration. */
+  followup?: boolean;
   /** Set after review feedback or finalization revokes this worker attempt. */
   revokedAt?: IsoTimestamp;
 }

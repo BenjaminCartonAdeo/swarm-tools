@@ -230,6 +230,7 @@ function isDispatchAttempt(value: unknown): value is DispatchAttempt {
     typeof value.agent === "string" &&
     (value.dispatchToken === undefined || typeof value.dispatchToken === "string") &&
     (value.workerSessionID === undefined || typeof value.workerSessionID === "string") &&
+    (value.followup === undefined || typeof value.followup === "boolean") &&
     (value.revokedAt === undefined || typeof value.revokedAt === "string") &&
     (value.status === "pending" ||
       value.status === "succeeded" ||
@@ -267,8 +268,10 @@ export function reconcileCountsFromAttempts(
   let workerSpawns = 0;
 
   for (const attempt of attempts) {
-    observedByCell[attempt.cellID] = (observedByCell[attempt.cellID] ?? 0) + 1;
-    cells.add(attempt.cellID);
+    if (attempt.followup !== true) {
+      observedByCell[attempt.cellID] = (observedByCell[attempt.cellID] ?? 0) + 1;
+      cells.add(attempt.cellID);
+    }
     if (isSwarmWorkerAgentID(attempt.agent)) workerSpawns += 1;
   }
   for (const [cellID, count] of Object.entries(observedByCell)) {

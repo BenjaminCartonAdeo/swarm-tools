@@ -130,7 +130,7 @@ function isSwarmCliToolCommand(command: string): boolean {
   });
 }
 
-type WorkerMutationDenial = "mission_inactive" | "pending_completion" | "token_missing" | "revoked" | "not_owner";
+type WorkerMutationDenial = "mission_inactive" | "pending_completion" | "token_missing" | "revoked" | "not_owner" | "read_only_followup";
 
 async function workerMutationDenial(
   runtime: SwarmxRuntime,
@@ -194,6 +194,7 @@ async function workerMutationDenial(
   );
   if (attempt === undefined) return "token_missing";
   if (attempt.revokedAt !== undefined) return "revoked";
+  if (attempt.followup === true) return "read_only_followup";
   if (attempt.workerSessionID !== sessionID) return "not_owner";
   if (attempt.status !== "pending" && attempt.status !== "succeeded") return "token_missing";
   const pending = await runtime.store.storage.get(pendingCompletionKey(runtime.projectID, marker.cellID));

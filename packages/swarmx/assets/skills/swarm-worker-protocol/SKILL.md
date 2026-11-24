@@ -47,7 +47,9 @@ and must be a non-empty array » + boucle de re-spawn à coût doublé) :
    (patterns, pièges, contraintes découvertes).
 9. **`swarm_complete(...)`** — PAS `hive_close`. `files_touched` peut être vide pour
      les tâches sans modification de fichier (recherche, analyse) ; `start_time` est
-     optionnel (auto-rempli avec l'heure de soumission si absent). Cela soumet le résultat à la
+     optionnel (auto-rempli avec l'heure de soumission si absent). Si tu dois corriger
+     la liste `files_touched` après soumission, utilise `swarm_amend_completion` avec
+     un motif. Cela soumet le résultat à la
      review, sans clore
      la cellule. Après l'approbation du coordinateur, swarmx exécute la Verification Gate et
      finalise la cellule. `skip_review` et `skip_verification` sont toujours refusés.

@@ -407,9 +407,9 @@ describe("swarmx plugin registration", () => {
     const editor = ctx.createEditor();
     const expected = listToolNames();
 
-    expect(expected).toHaveLength(86);
+    expect(expected).toHaveLength(88);
     expect(() => transform(editor)).not.toThrow();
-    expect(editor.list()).toHaveLength(86);
+    expect(editor.list()).toHaveLength(88);
     expect(editor.list().map((tool) => tool.name).sort()).toEqual(expected);
     // The editor derives ids from the effective name (the real SDK never
     // receives an id); a single `undefined` key would collapse the registry.
@@ -417,7 +417,7 @@ describe("swarmx plugin registration", () => {
 
     // Replaying the exact same transform on the same editor must not duplicate.
     expect(() => transform(editor)).not.toThrow();
-    expect(editor.list()).toHaveLength(86);
+    expect(editor.list()).toHaveLength(88);
     expect(editor.list().map((tool) => tool.name).sort()).toEqual(expected);
   });
 
@@ -485,6 +485,17 @@ describe("catalogue execution paths (fake runner, no model)", () => {
 });
 
 describe("mission gate → settle sequence", () => {
+  test("read-only follow-up dispatch does not consume a cell iteration", async () => {
+    const rig = await createRig({ agents: GATE_AGENTS });
+    await dispatchWorker(rig, "cell-a", "call-dispatch-first");
+    const followup = workerDispatchPayload("cell-a", "call-followup");
+    followup.input = { ...(followup.input as Record<string, unknown>), read_only: true };
+    await rig.before(followup);
+    const mission = await readMission(missionStore(rig.ctx), PROJECT, SESSION);
+    expect(mission?.counts.spawns).toBe(2);
+    expect(mission?.counts.attemptsByCell["cell-a"]).toBe(1);
+  });
+
   test("worker permissions block every denied local mission mutation", async () => {
     const cases = [
       { tool: "swarm_set_budget", input: { mode: "audit" } },
@@ -2633,6 +2644,99 @@ describe("mission gate → settle sequence", () => {
     expect(feedback?.output).toMatchObject({
       approval_evidence: { status: "unverifiable" },
       completion: { ok: true },
+    });
+  });
+
+  test("swarm_cancel_completion cancels pending and frees the cell for retry", async () => {
+    const projectPath = await realpath(process.cwd());
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-a", epicID: "epic-1" },
+    });
+    await dispatchWorker(rig, "cell-a", "call-dispatch-cancel");
+    await rig.tools.get("swarm_complete")?.execute(
+      {
+        project_key: projectPath,
+        agent_name: "swarm-worker",
+        bead_id: "cell-a",
+        summary: "Needs correction.",
+        start_time: 1,
+        files_touched: [],
+      },
+      workerToolContext("swarm/swarm-worker", "call-completion-cancel"),
+    );
+    const canceled = await rig.tools.get("swarm_cancel_completion")?.execute(
+      { bead_id: "cell-a", reason: "Wrong submission; retry required." },
+      toolContext("swarm/swarm-coordinator", "call-cancel"),
+    );
+    expect(canceled?.output).toMatchObject({ bead_id: "cell-a", canceled: true });
+    expect(await rig.ctx.storage.get(pendingCompletionKey(PROJECT, "cell-a"))).toMatchObject({
+      canceled: true,
+      finalized: true,
+      cancelReason: "Wrong submission; retry required.",
+    });
+    const marker = await dispatchWorker(rig, "cell-a", "call-dispatch-retry", "ses-worker-retry");
+    expect(marker.cellID).toBe("cell-a");
+  });
+
+  test("swarm_finish abandon force-closes with pending completions", async () => {
+    const projectPath = await realpath(process.cwd());
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-a", epicID: "epic-1" },
+    });
+    await dispatchWorker(rig, "cell-a", "call-dispatch-abandon");
+    await rig.tools.get("swarm_complete")?.execute(
+      {
+        project_key: projectPath,
+        agent_name: "swarm-worker",
+        bead_id: "cell-a",
+        summary: "Pending work.",
+        start_time: 1,
+        files_touched: [],
+      },
+      workerToolContext("swarm/swarm-worker", "call-completion-abandon"),
+    );
+    const finished = await rig.tools.get("swarm_finish")?.execute(
+      { reason: "Mission abandoned.", abandon: true },
+      toolContext("swarm/swarm-coordinator", "call-finish-abandon"),
+    );
+    expect(finished?.output).toMatchObject({ finished: true, active: false });
+    expect(await rig.ctx.storage.get(pendingCompletionKey(PROJECT, "cell-a"))).toMatchObject({
+      canceled: true,
+      finalized: true,
+    });
+  });
+
+  test("swarm_complete stores worker verification steps", async () => {
+    const projectPath = await realpath(process.cwd());
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-a", epicID: "epic-1" },
+    });
+    await dispatchWorker(rig, "cell-a", "call-dispatch-verify");
+    await rig.tools.get("swarm_complete")?.execute(
+      {
+        project_key: projectPath,
+        agent_name: "swarm-worker",
+        bead_id: "cell-a",
+        summary: "Tests pass.",
+        start_time: 1,
+        files_touched: [],
+        verification: [
+          { name: "targeted tests", command: "npm test -- --runInBand", exit_code: 0, output: "PASS" },
+        ],
+      },
+      workerToolContext("swarm/swarm-worker", "call-completion-verify"),
+    );
+    expect(await rig.ctx.storage.get(pendingCompletionKey(PROJECT, "cell-a"))).toMatchObject({
+      verification: {
+        passed: true,
+        steps: [{ name: "targeted tests", command: "npm test -- --runInBand", exitCode: 0, output: "PASS", passed: true }],
+      },
     });
   });
 

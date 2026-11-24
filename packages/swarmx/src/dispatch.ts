@@ -226,7 +226,12 @@ async function requireAssignment(
   }
 }
 
-function chargeBudget(mission: MissionState, marker: CellMarker, agent: DispatchAgentInfo): void {
+function chargeBudget(
+  mission: MissionState,
+  marker: CellMarker,
+  agent: DispatchAgentInfo,
+  countIteration: boolean,
+): void {
   const attemptsForCell = mission.counts.attemptsByCell[marker.cellID] ?? 0;
   if (mission.counts.spawns >= mission.budget.maxSpawns) {
     throw new DispatchGateError(
@@ -235,7 +240,7 @@ function chargeBudget(mission: MissionState, marker: CellMarker, agent: Dispatch
       `spawns ${mission.counts.spawns}/${mission.budget.maxSpawns}`,
     );
   }
-  if (attemptsForCell >= mission.budget.maxIterations) {
+  if (countIteration && attemptsForCell >= mission.budget.maxIterations) {
     throw new DispatchGateError(
       "cell_iterations_exhausted",
       marker.cellID,
@@ -268,6 +273,7 @@ async function reserveSpawn(
   marker: CellMarker,
   agent: DispatchAgentInfo,
   expectedMission: MissionState,
+  countIteration: boolean,
 ): Promise<
   | { readonly status: "reserved" | "replay"; readonly dispatchToken: string }
   | { readonly status: "mission_inactive" | "mission_changed" }
@@ -322,7 +328,7 @@ async function reserveSpawn(
         "a dispatch capability cannot be supplied or reused in a new tool call",
       );
     }
-    chargeBudget(mission, marker, agent);
+    chargeBudget(mission, marker, agent, countIteration);
     const attemptsForCell = mission.counts.attemptsByCell[marker.cellID] ?? 0;
     const ts = store.now();
     const dispatchToken = randomUUID();
@@ -336,13 +342,16 @@ async function reserveSpawn(
       status: "pending",
       ts,
       dispatchToken,
+      ...(countIteration ? {} : { followup: true }),
     };
     // Ledger first: a crash between the two writes leaves an orphan that
     // recovery aborts — the counters were never charged twice.
     await putAttempt(store, projectID, attempt);
     mission.counts.spawns += 1;
-    if (attemptsForCell === 0) mission.counts.cells += 1;
-    mission.counts.attemptsByCell[marker.cellID] = attemptsForCell + 1;
+    if (countIteration) {
+      if (attemptsForCell === 0) mission.counts.cells += 1;
+      mission.counts.attemptsByCell[marker.cellID] = attemptsForCell + 1;
+    }
     if (isSwarmWorkerAgentID(agent.id)) mission.counts.workerSpawns += 1;
     mission.updatedAt = ts;
     await store.save(mission);
@@ -406,7 +415,9 @@ export async function gateBefore(
   const dispatchedAgentID = targetAgentID;
   const agent = await requireDispatchableAgent(store, dispatchedAgentID);
   await requireAssignment(store, projectID, event.sessionID, marker, agent, dispatchedAgentID);
-  const reservation = await reserveSpawn(store, projectID, event, marker, agent, mission);
+  const inputRecord = asRecord(event.input);
+  const countIteration = !(inputRecord?.purpose === "followup" || inputRecord?.read_only === true);
+  const reservation = await reserveSpawn(store, projectID, event, marker, agent, mission, countIteration);
   if (reservation.status === "replay" || reservation.status === "reserved") {
     attachDispatchToken(event.input, reservation.dispatchToken, marker.cellID);
     return;

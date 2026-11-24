@@ -91,6 +91,8 @@ config sans code). Ne jamais utiliser `medium` par défaut pour du code applicat
 
 Un worker read-only (researcher, planner) DOIT aussi soumettre sa fin via `swarm_complete` (avec `files_touched: []` si aucun fichier). `swarm_progress(status="completed")` est interdit et ne remplace pas `swarm_complete`.
 
+Pour un follow-up read-only sur une cellule existante (lecture de métadonnées, inspection sans écriture), dispatcher avec `read_only: true` ou `purpose: "followup"` dans l'input du subagent. Cela ne consomme pas d'itération de cellule.
+
 ## Ce qui est appliqué automatiquement — ne le ré-écris pas
 
 Un gate qui refuse est un **succès**, pas un bug. Ne contourne pas un refus :

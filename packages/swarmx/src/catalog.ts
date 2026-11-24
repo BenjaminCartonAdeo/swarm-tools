@@ -508,6 +508,15 @@ const SWARM_SPECS: readonly ToolSpec[] = [
         "Optional task start timestamp in Unix milliseconds; defaults to the submission time",
         { integer: true, minimum: 0 },
       ),
+      verification: arr(
+        obj({
+          name: str("Verification step name"),
+          command: str("Command executed"),
+          exit_code: num("Process exit code", { integer: true }),
+          output: str("Command output"),
+        }, ["name", "command", "exit_code", "output"]),
+        "Optional verification commands/results; all steps must pass to produce a receipt",
+      ),
       skip_verification: bool("Legacy override; swarmx rejects true and always requires verification"),
       skip_review: bool("Legacy override; swarmx rejects true and always requires coordinator review"),
     },
@@ -933,6 +942,22 @@ const LOCAL_SPECS: readonly ToolSpec[] = [
     "swarm_finish",
     "Coordinator-only: finish the current swarmx mission, deactivate dispatch gates, and report the closing reason. Set abandon=true to revoke all pending/succeeded attempts and force-close.",
     { reason: str("Why the mission ends"), abandon: bool("Revoke all pending/succeeded attempts and force-close the mission") },
+  ),
+  local(
+    "swarm_cancel_completion",
+    "Coordinator-only: cancel a pending completion without a review receipt. Requires an explicit reason; preserves history and frees the cell for retry or blocked.",
+    { bead_id: str("Cell ID"), reason: str("Cancellation reason", { minLength: 1 }) },
+    ["bead_id", "reason"],
+  ),
+  local(
+    "swarm_amend_completion",
+    "Worker-only: amend files_touched on your own pending completion. Excludes untracked files and files without a diff; returns the effective list.",
+    {
+      bead_id: str("Cell ID"),
+      files_touched: arr(str(), "Requested file paths"),
+      reason: str("Amendment reason", { minLength: 1 }),
+    },
+    ["bead_id", "files_touched", "reason"],
   ),
   local(
     "swarm_probe",
@@ -1682,21 +1707,43 @@ async function runFinish(
       }
     }
     const missionID = reviewMissionID(current);
-    for (const cellID of new Set(attempts.map((attempt) => attempt.cellID))) {
-      const pending = await readPendingCompletion(store, projectID, cellID);
-      const review = await store.storage.get(reviewReceiptKey(projectID, sessionID, missionID, cellID));
-      const pendingForMission =
-        pending !== undefined &&
-        pending.parentSessionID === sessionID &&
-        pending.missionID === missionID;
-      if (review !== undefined && !(pendingForMission && pending.finalized === true)) {
-        throw new LocalToolError("swarm_finish", "conflict", "the mission has pending completion reviews");
+    if (abandon) {
+      // Force-close: cancel every pending completion and skip consolidation.
+      for (const cellID of new Set(attempts.map((attempt) => attempt.cellID))) {
+        const pending = await readPendingCompletion(store, projectID, cellID);
+        if (
+          pending !== undefined &&
+          pending.parentSessionID === sessionID &&
+          pending.missionID === missionID &&
+          pending.finalized !== true
+        ) {
+          await store.storage.set(pendingCompletionKey(projectID, cellID), {
+            ...pending,
+            canceled: true,
+            cancelReason: reason || "mission abandoned",
+            canceledAt: store.now(),
+            finalized: true,
+            finalizing: false,
+          });
+        }
       }
-      if (pendingForMission && pending.finalized !== true) {
-        throw new LocalToolError("swarm_finish", "conflict", "the mission has pending completion reviews");
+    } else {
+      for (const cellID of new Set(attempts.map((attempt) => attempt.cellID))) {
+        const pending = await readPendingCompletion(store, projectID, cellID);
+        const review = await store.storage.get(reviewReceiptKey(projectID, sessionID, missionID, cellID));
+        const pendingForMission =
+          pending !== undefined &&
+          pending.parentSessionID === sessionID &&
+          pending.missionID === missionID;
+        if (review !== undefined && !(pendingForMission && pending.finalized === true)) {
+          throw new LocalToolError("swarm_finish", "conflict", "the mission has pending completion reviews");
+        }
+        if (pendingForMission && pending.finalized !== true) {
+          throw new LocalToolError("swarm_finish", "conflict", "the mission has pending completion reviews");
+        }
       }
     }
-    if (current.active) {
+    if (current.active && !abandon) {
       await assertConsolidationComplete(runtime, sessionID, current, attempts);
     }
     let mission: MissionState | undefined;
@@ -1779,6 +1826,115 @@ async function runFinish(
       content: `Mission ${sessionID} finished (mode=${mission.mode}, spawns=${mission.counts.spawns}).`,
     };
   });
+}
+
+async function runCancelCompletion(
+  runtime: SwarmxRuntime,
+  context: ToolExecuteContextLike,
+  input: Record<string, unknown>,
+): Promise<ToolExecuteResult> {
+  const { store, projectID, sessionID } = await requireMissionScope("swarm_cancel_completion", runtime, context);
+  const beadID = requireStringInput("swarm_cancel_completion", input, "bead_id");
+  const reason = requireStringInput("swarm_cancel_completion", input, "reason");
+  const mission = await readMission(store, projectID, sessionID);
+  if (mission === undefined || !mission.active) {
+    throw new LocalToolError("swarm_cancel_completion", "not_found", "no active mission");
+  }
+  const pending = await readPendingCompletion(store, projectID, beadID);
+  if (pending === undefined || pending.parentSessionID !== sessionID || pending.missionID !== reviewMissionID(mission)) {
+    throw new LocalToolError("swarm_cancel_completion", "not_found", "no pending completion for this cell in the active mission");
+  }
+  const key = pendingCompletionKey(projectID, beadID);
+  await withMissionLock(projectID, sessionID, async () => {
+    const current = await readPendingCompletion(store, projectID, beadID);
+    if (current === undefined || current.finalized === true) {
+      throw new LocalToolError("swarm_cancel_completion", "conflict", "completion is already finalized");
+    }
+    await store.storage.set(key, {
+      ...current,
+      canceled: true,
+      cancelReason: reason,
+      canceledAt: store.now(),
+      finalized: true,
+      finalizing: false,
+    });
+    const attempt = await getAttempt(store, projectID, current.attemptCallID);
+    if (attempt !== undefined && attempt.revokedAt === undefined) {
+      await putAttempt(store, projectID, { ...attempt, revokedAt: store.now() });
+    }
+  });
+  return {
+    output: { bead_id: beadID, canceled: true, reason },
+    content: `Pending completion for ${beadID} canceled: ${reason}`,
+  };
+}
+
+async function runAmendCompletion(
+  runtime: SwarmxRuntime,
+  context: ToolExecuteContextLike,
+  input: Record<string, unknown>,
+): Promise<ToolExecuteResult> {
+  const beadID = requireStringInput("swarm_amend_completion", input, "bead_id");
+  const reason = requireStringInput("swarm_amend_completion", input, "reason");
+  const scope = await requireAssignedWorkerScope(runtime, context, "swarm_amend_completion");
+  const { store, projectID } = requireStoreProject("swarm_amend_completion", runtime);
+  const pending = await readPendingCompletion(store, projectID, beadID);
+  if (
+    pending === undefined ||
+    pending.workerSessionID !== context.sessionID ||
+    pending.workerAgentID !== scope.agent.id ||
+    pending.attemptCallID !== scope.attemptCallID ||
+    pending.finalized === true
+  ) {
+    throw new LocalToolError("swarm_amend_completion", "conflict", "no amendable pending completion for this worker");
+  }
+  const validated = await validateProjectFiles(
+    runtime,
+    "swarm_amend_completion",
+    { ...input, project_key: pending.projectPath },
+    pending.projectPath,
+  );
+  const requested = validated.files_touched as string[];
+  const effective: string[] = [];
+  const excluded: Array<{ file: string; reason: string }> = [];
+  for (const file of requested) {
+    const tracked = Bun.spawnSync(["git", "ls-files", "--error-unmatch", "--", file], {
+      cwd: pending.projectPath,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (tracked.exitCode !== 0) {
+      excluded.push({ file, reason: "untracked" });
+      continue;
+    }
+    const diff = Bun.spawnSync(["git", "diff", "HEAD", "--", file], {
+      cwd: pending.projectPath,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (diff.stdout.toString().trim().length === 0) {
+      excluded.push({ file, reason: "no diff" });
+      continue;
+    }
+    effective.push(file);
+  }
+  const key = pendingCompletionKey(projectID, beadID);
+  await withMissionLock(projectID, pending.parentSessionID, async () => {
+    const current = await readPendingCompletion(store, projectID, beadID);
+    if (current === undefined || current.finalized === true) {
+      throw new LocalToolError("swarm_amend_completion", "conflict", "completion changed before amendment");
+    }
+    await store.storage.set(key, {
+      ...current,
+      filesTouched: effective,
+      amendedAt: store.now(),
+      amendmentReason: reason,
+    });
+  });
+  return {
+    output: { bead_id: beadID, files_touched: effective, excluded, reason },
+    content: `Amended ${beadID}: effective files=${effective.length}, excluded=${excluded.length}`,
+  };
 }
 
 async function runReset(
@@ -1994,6 +2150,10 @@ async function executeLocal(
       return runSetBudget(runtime, context, args);
     case "swarm_finish":
       return runFinish(runtime, context, args);
+    case "swarm_cancel_completion":
+      return runCancelCompletion(runtime, context, args);
+    case "swarm_amend_completion":
+      return runAmendCompletion(runtime, context, args);
     case "swarm_reset":
       return runReset(runtime, context);
     case "swarm_repo_inventory":
@@ -2249,6 +2409,9 @@ interface VerificationGateStep {
   readonly passed: boolean;
   readonly skipped?: boolean;
   readonly skipReason?: string;
+  readonly command?: string;
+  readonly exitCode?: number;
+  readonly output?: string;
 }
 
 /**
@@ -2313,6 +2476,11 @@ interface PendingCompletionReceipt {
   readonly submittedAt: number;
   readonly finalizing?: boolean;
   readonly finalized?: boolean;
+  readonly canceled?: boolean;
+  readonly cancelReason?: string;
+  readonly canceledAt?: number;
+  readonly amendedAt?: number;
+  readonly amendmentReason?: string;
   /** Snapshot of the completion gate receipt, kept for recovery after a crash. */
   readonly verification?: VerificationGateReceipt;
 }
@@ -2350,7 +2518,10 @@ function isVerificationGateReceipt(value: unknown): value is VerificationGateRec
         typeof entry.name === "string" &&
         typeof entry.passed === "boolean" &&
         (entry.skipped === undefined || typeof entry.skipped === "boolean") &&
-        (entry.skipReason === undefined || typeof entry.skipReason === "string")
+        (entry.skipReason === undefined || typeof entry.skipReason === "string") &&
+        (entry.command === undefined || typeof entry.command === "string") &&
+        (entry.exitCode === undefined || typeof entry.exitCode === "number") &&
+        (entry.output === undefined || typeof entry.output === "string")
       );
     })
   );
@@ -2397,6 +2568,11 @@ function isPendingCompletion(value: unknown): value is PendingCompletionReceipt 
     typeof record.submittedAt === "number" &&
     (record.finalizing === undefined || typeof record.finalizing === "boolean") &&
     (record.finalized === undefined || typeof record.finalized === "boolean") &&
+    (record.canceled === undefined || typeof record.canceled === "boolean") &&
+    (record.cancelReason === undefined || typeof record.cancelReason === "string") &&
+    (record.canceledAt === undefined || typeof record.canceledAt === "number") &&
+    (record.amendedAt === undefined || typeof record.amendedAt === "number") &&
+    (record.amendmentReason === undefined || typeof record.amendmentReason === "string") &&
     (record.verification === undefined || isVerificationGateReceipt(record.verification))
   );
 }
@@ -2471,6 +2647,9 @@ function parseCompletionVerificationReceipt(output: unknown): VerificationGateRe
       passed: step.passed,
       ...(step.skipped === undefined ? {} : { skipped: step.skipped }),
       ...(step.skipReason === undefined ? {} : { skipReason: step.skipReason }),
+      ...(typeof step.command === "string" ? { command: step.command } : {}),
+      ...(typeof step.exitCode === "number" ? { exitCode: step.exitCode } : {}),
+      ...(typeof step.output === "string" ? { output: step.output } : {}),
     });
   }
   if (
@@ -2482,6 +2661,36 @@ function parseCompletionVerificationReceipt(output: unknown): VerificationGateRe
   return {
     passed: true,
     summary: typeof gate.summary === "string" ? gate.summary : "",
+    steps,
+    recordedAt: Date.now(),
+  };
+}
+
+function parseWorkerVerification(value: unknown): VerificationGateReceipt | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const steps: VerificationGateStep[] = [];
+  for (const raw of value) {
+    const step = asArguments(raw);
+    if (
+      typeof step.name !== "string" ||
+      typeof step.command !== "string" ||
+      typeof step.exit_code !== "number" ||
+      typeof step.output !== "string"
+    ) {
+      return undefined;
+    }
+    steps.push({
+      name: step.name,
+      command: step.command,
+      exitCode: step.exit_code,
+      output: step.output,
+      passed: step.exit_code === 0,
+    });
+  }
+  if (!steps.every((step) => step.passed)) return undefined;
+  return {
+    passed: true,
+    summary: `Worker reported ${steps.length} verification step(s) passed`,
     steps,
     recordedAt: Date.now(),
   };
@@ -3040,6 +3249,7 @@ async function submitPendingCompletion(
     throw new LocalToolError("swarm_complete", "runtime_unavailable", "pending completion storage is not available");
   }
   const parentMission = worker.parentMission;
+  const verification = parseWorkerVerification(args.verification);
   const receipt: PendingCompletionReceipt = {
     projectID,
     parentSessionID: parentMission.sessionID,
@@ -3056,6 +3266,7 @@ async function submitPendingCompletion(
     startTime: typeof args.start_time === "number" ? args.start_time : Date.now(),
     filesTouched: Array.isArray(args.files_touched) ? (args.files_touched as string[]) : [],
     submittedAt: Date.now(),
+    ...(verification === undefined ? {} : { verification }),
   };
   const key = pendingCompletionKey(projectID, receipt.taskID);
   await withMissionLock(projectID, parentMission.sessionID, async () => {
@@ -4089,6 +4300,7 @@ const COORDINATOR_ONLY_TOOL_NAMES = new Set([
   "hive_sync",
   "swarm_worktree_cleanup",
   "swarm_finish",
+  "swarm_cancel_completion",
   "swarmmail_release_agent",
   "swarmmail_release_all",
   "swarm_resolve_agent",
