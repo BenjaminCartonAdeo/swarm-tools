@@ -70,6 +70,34 @@ type AfterPayload = BeforePayload &
     | { status: "error"; error: unknown }
   );
 
+/**
+ * Extracting the real registration callback from OpenCode's plugin context
+ * pins the execute hook fields to the installed @opencode/plugin contract.
+ * The callback input is a union of before/after payloads, whose shared id
+ * type proves call-ID symmetry; `input` remains unknown until narrowed.
+ */
+type OpenCodeExecutePayload = Parameters<
+  Parameters<Plugin.Context["tool"]["hook"]>[1]
+>[0];
+
+type Assert<T extends true> = T;
+type OpenCodeExecutePayloadContract = Assert<
+  OpenCodeExecutePayload extends { readonly id: string; readonly input: unknown } ? true : false
+>;
+
+function readOpenCodeShellPayload<T extends { readonly id: string; readonly input: unknown }>(payload: T): {
+  readonly id: string;
+  readonly command?: string;
+} {
+  const input = payload.input;
+  const command =
+    typeof input === "object" && input !== null && "command" in input &&
+    typeof input.command === "string"
+      ? input.command
+      : undefined;
+  return { id: payload.id, ...(command === undefined ? {} : { command }) };
+}
+
 interface RigOptions {
   readonly agents?: readonly FakeAgentInfo[];
   readonly skills?: readonly FakeSkillInfo[];
@@ -383,6 +411,19 @@ const GATE_AGENTS: readonly FakeAgentInfo[] = [
 ];
 
 describe("swarmx plugin registration", () => {
+  test("real execute hook payload accepts its call ID and narrowed shell command", () => {
+    const payload = beforePayload({
+      tool: "shell",
+      id: "call-real-hook-shape",
+      input: { command: "bun run build" },
+    });
+
+    expect(readOpenCodeShellPayload(payload)).toEqual({
+      id: "call-real-hook-shape",
+      command: "bun run build",
+    });
+  });
+
   test("default export declares id 'swarmx'", () => {
     expect(swarmx.id).toBe("swarmx");
     expect(typeof swarmx.setup).toBe("function");
@@ -905,19 +946,13 @@ describe("mission gate → settle sequence", () => {
       tool: "shell",
       input: { command: "./mvnw test" },
     };
-    const assertion = (callID: string, sessionID = SESSION) =>
-      rig.ctx.permission.assert({
-        sessionID,
-        agent: "swarm/swarm-coordinator",
-        source: { type: "tool", messageID: "msg-build", id: callID },
-        action: "shell",
-        resources: ["./mvnw test"],
-      });
-
-    await expect(assertion("call-build-a")).resolves.toBeUndefined();
-    await expect(assertion("call-build-b", "ses-other-coordinator")).rejects.toThrow(/another build|build.*progress/);
+    await rig.before(first);
+    await expect(rig.before({ ...second, sessionID: "ses-other-coordinator" })).rejects.toThrow(
+      /another build|build.*progress/,
+    );
     await rig.after({ ...first, status: "completed", result: {} });
-    await expect(assertion("call-build-b", "ses-other-coordinator")).resolves.toBeUndefined();
+    await expect(rig.before({ ...second, sessionID: "ses-other-coordinator" })).resolves.toBeUndefined();
+    await rig.after({ ...second, sessionID: "ses-other-coordinator", status: "completed", result: {} });
   });
 
   test("root mode-all sessions keep native write access", async () => {

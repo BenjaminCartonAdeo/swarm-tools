@@ -305,22 +305,6 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
             event.message = `worker dispatch capability is revoked, unbound, or not owned by this session (${reason}).`;
             return;
           }
-          if (event.action === "shell") {
-            const command = event.resources.join(" ");
-            if (isBuildOrTestCommand(command)) {
-              const acquired = await acquireBuildLock(
-                store,
-                projectID,
-                event.sessionID,
-                command,
-              ).catch(() => false);
-              if (!acquired) {
-                event.effect = "deny";
-                event.message = "another build/test is already running in this project; wait for it to finish before compiling again.";
-                return;
-              }
-            }
-          }
         }
       });
 
@@ -346,12 +330,32 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
 
       await ctx.tool.hook("execute.before", async (event) => {
         activeSessionID = event.sessionID;
+        if (event.tool === "shell") {
+          const input = event.input;
+          if (typeof input === "object" && input !== null && "command" in input) {
+            const command = input.command;
+            if (typeof command === "string" && isBuildOrTestCommand(command)) {
+              const acquired = await acquireBuildLock(
+                store,
+                projectID,
+                event.sessionID,
+                event.id,
+                command,
+              ).catch(() => false);
+              if (!acquired) {
+                throw new Error(
+                  "another build/test is already running in this project; wait for it to finish before compiling again.",
+                );
+              }
+            }
+          }
+        }
         await gateBefore(store, before(event));
       });
 
       await ctx.tool.hook("execute.after", async (event) => {
         if (event.tool === "shell") {
-          await releaseBuildLock(store, projectID, event.sessionID).catch(() => undefined);
+          await releaseBuildLock(store, projectID, event.id).catch(() => undefined);
         }
         const base = before(event);
         const settled: DispatchAfterEvent =

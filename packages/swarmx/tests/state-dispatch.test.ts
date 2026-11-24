@@ -22,12 +22,14 @@ import {
 } from "../src/dispatch";
 import {
   assignmentKey,
+  acquireBuildLock,
   audit,
   createMissionStateStore,
   finishMission,
   listAttempts,
   putAttempt,
   readMission,
+  releaseBuildLock,
   resolveAssignment,
   resetMission,
   setAssignment,
@@ -1150,6 +1152,53 @@ describe("consolidation state", () => {
 });
 
 describe("plugin wiring", () => {
+  test("buildLockReleaseRequiresMatchingOwnerToken", async () => {
+    const ctx = createFakeContext({ agents: AGENTS, projectId: PROJECT });
+    await swarmx.setup(ctx as unknown as Plugin.Context);
+
+    const beforeHook = ctx.captures.toolHooks.get("execute.before")?.[0];
+    const afterHook = ctx.captures.toolHooks.get("execute.after")?.[0];
+    expect(beforeHook).toBeDefined();
+    expect(afterHook).toBeDefined();
+
+    const shellBefore = (id: string) => ({
+      tool: "shell",
+      sessionID: SESSION,
+      agent: "build",
+      messageID: `message-${id}`,
+      id,
+      input: { command: "bun run build" },
+    });
+    const shellAfter = (id: string) => ({
+      ...shellBefore(id),
+      status: "completed" as const,
+      result: { output: "Bundled" },
+    });
+
+    await beforeHook?.(shellBefore("call-a"));
+    await expect(beforeHook?.(shellBefore("call-b"))).rejects.toThrow();
+
+    // A shell call that did not acquire the lock must not release call A's lock.
+    await afterHook?.(shellAfter("call-b"));
+    await expect(beforeHook?.(shellBefore("call-b"))).rejects.toThrow();
+
+    await afterHook?.(shellAfter("call-a"));
+    await expect(beforeHook?.(shellBefore("call-b"))).resolves.toBeUndefined();
+    await afterHook?.(shellAfter("call-b"));
+  });
+
+  test("build lock helper refuses a release from a different call token", async () => {
+    const { store } = setup();
+
+    expect(await acquireBuildLock(store, PROJECT, SESSION, "call-a", "bun run build")).toBe(true);
+    expect(await acquireBuildLock(store, PROJECT, SESSION, "call-b", "bun run test")).toBe(false);
+    expect(await releaseBuildLock(store, PROJECT, "call-b")).toBe(false);
+    expect(await acquireBuildLock(store, PROJECT, SESSION, "call-b", "bun run test")).toBe(false);
+    expect(await releaseBuildLock(store, PROJECT, "call-a")).toBe(true);
+    expect(await acquireBuildLock(store, PROJECT, SESSION, "call-b", "bun run test")).toBe(true);
+    expect(await releaseBuildLock(store, PROJECT, "call-b")).toBe(true);
+  });
+
   test("setup wires execute.before/after to the mission store", async () => {
     const ctx = createFakeContext({ agents: AGENTS, projectId: PROJECT });
     await swarmx.setup(ctx as unknown as Plugin.Context);

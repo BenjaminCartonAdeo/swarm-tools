@@ -511,6 +511,7 @@ export async function acquireBuildLock(
   store: MissionStateStore,
   projectID: string,
   sessionID: string,
+  callID: string,
   command: string,
 ): Promise<boolean> {
   return withMissionLock(projectID, "__build__", async () => {
@@ -519,10 +520,11 @@ export async function acquireBuildLock(
     const record = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : undefined;
     const acquiredAt = typeof record?.acquiredAt === "string" ? Date.parse(record.acquiredAt) : 0;
     const active = Number.isFinite(acquiredAt) && Date.now() - acquiredAt < BUILD_LOCK_TTL_MS;
-    if (active && record?.sessionID !== sessionID) return false;
+    if (active && record?.callID !== callID) return false;
     await store.storage.set(key, {
       projectID,
       sessionID,
+      callID,
       command,
       acquiredAt: store.now(),
     });
@@ -534,13 +536,15 @@ export async function acquireBuildLock(
 export async function releaseBuildLock(
   store: MissionStateStore,
   projectID: string,
-  sessionID: string,
-): Promise<void> {
+  callID: string,
+): Promise<boolean> {
   return withMissionLock(projectID, "__build__", async () => {
     const key = buildLockKey(projectID);
     const raw = await store.storage.get(key);
     const record = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : undefined;
-    if (record?.sessionID === sessionID) await store.storage.remove(key);
+    if (record?.callID !== callID) return false;
+    await store.storage.remove(key);
+    return true;
   });
 }
 
