@@ -1665,12 +1665,21 @@ async function runFinish(
       );
     }
     const attempts = await listAttempts(store, projectID, sessionID, current);
-    if (!abandon && attempts.some(
-      (attempt) =>
-        attempt.revokedAt === undefined &&
-        (attempt.status === "pending" || attempt.status === "succeeded"),
-    )) {
-      throw new LocalToolError("swarm_finish", "conflict", "the mission has unrevoked worker attempts");
+    if (!abandon) {
+      // Only block on attempts that have a pending (unfinalized) completion.
+      // Succeeded/failed attempts without a pending completion do not block.
+      const pendingCellIDs = new Set(attempts.map((a) => a.cellID));
+      let hasPendingCompletion = false;
+      for (const cellID of pendingCellIDs) {
+        const pending = await readPendingCompletion(store, projectID, cellID);
+        if (pending !== undefined && pending.parentSessionID === sessionID && pending.missionID === reviewMissionID(current) && pending.finalized !== true) {
+          hasPendingCompletion = true;
+          break;
+        }
+      }
+      if (hasPendingCompletion) {
+        throw new LocalToolError("swarm_finish", "conflict", "the mission has pending completion reviews");
+      }
     }
     const missionID = reviewMissionID(current);
     for (const cellID of new Set(attempts.map((attempt) => attempt.cellID))) {

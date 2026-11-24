@@ -449,21 +449,11 @@ export async function settleAfter(
       if (attempt === undefined || attempt.status !== "pending") return;
       const status: DispatchAttemptStatus =
         event.status === "completed" ? "succeeded" : "failed";
-      // Auto-revoke attempts that finish without a swarm_complete submission,
-      // so the mission is not permanently blocked by orphaned dispatches.
-      let revokedAt = attempt.revokedAt;
-      if (revokedAt === undefined) {
-        const pendingKey = ["pending-completion:", projectID, attempt.cellID].map(encodeURIComponent).join(":");
-        const pending = await store.storage.get(pendingKey);
-        const hasPending =
-          typeof pending === "object" &&
-          pending !== null &&
-          (pending as Record<string, unknown>).taskID === attempt.cellID;
-        if (!hasPending) {
-          revokedAt = store.now();
-        }
-      }
-      await putAttempt(store, projectID, { ...attempt, status, ...(revokedAt === undefined ? {} : { revokedAt }) });
+      // Update status but do NOT auto-revoke: revoking on every tool call
+      // would break resolveParentMissionForWorker (swarmmail_init, etc.)
+      // which requires an unrevoked attempt. Revocation happens via
+      // swarm_complete (success) or swarm_finish with abandon=true (cleanup).
+      await putAttempt(store, projectID, { ...attempt, status });
     });
   } catch {
     // execute.after must never reject: a ledger write failure is not worth
