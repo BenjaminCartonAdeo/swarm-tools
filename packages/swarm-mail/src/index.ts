@@ -110,6 +110,7 @@ export { createEvent } from "./streams/events";
 export {
 	appendEvent,
 	clearAdapterCache,
+	getSwarmMailDatabaseAdapter,
 	getActiveReservations,
 	getAgent,
 	getEvalRecords,

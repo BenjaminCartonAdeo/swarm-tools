@@ -90,6 +90,18 @@ export async function getOrCreateAdapter(
   adapterCache.set(cacheKey, adapter);
   return adapter;
 }
+
+/**
+ * Get the cached adapter for the canonical global swarm-mail database.
+ *
+ * @param projectPath - Optional project path for legacy database migration
+ */
+export function getSwarmMailDatabaseAdapter(
+  projectPath?: string,
+): Promise<DatabaseAdapter> {
+  return getOrCreateAdapter(undefined, projectPath);
+}
+
 import {
   type AgentEvent,
   createEvent,

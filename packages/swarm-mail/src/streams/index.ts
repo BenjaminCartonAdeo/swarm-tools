@@ -169,8 +169,8 @@ export {
 	getMessage,
 	getThreadMessages,
 } from "./projections-drizzle";
-// Export adapter cache management
-export { clearAdapterCache } from "./store";
+// Export adapter access and cache management
+export { clearAdapterCache, getSwarmMailDatabaseAdapter } from "./store";
 
 // Export Drizzle wrapper functions (they match old signatures)
 export {
