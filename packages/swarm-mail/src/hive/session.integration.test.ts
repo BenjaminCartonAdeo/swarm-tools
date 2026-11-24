@@ -18,7 +18,7 @@ import { convertPlaceholders, type DatabaseAdapter } from "../libsql.js";
 import { createHiveAdapter } from "./adapter.js";
 import { FlushManager } from "./flush-manager.js";
 import { parseJSONL } from "./jsonl.js";
-import { beadsMigrationLibSQL, cellsViewMigrationLibSQL, beadsResultColumnsMigrationLibSQL } from "./migrations.js";
+import { beadsMigrationLibSQL, cellsViewMigrationLibSQL, beadsResultColumnsMigrationLibSQL, beadsOperationIdMigrationLibSQL } from "./migrations.js";
 
 /**
  * Wrap libSQL client with DatabaseAdapter interface
@@ -88,6 +88,7 @@ describe("Full Hive Session Flow", () => {
 		await db.exec(beadsMigrationLibSQL.up);
 		await db.exec(cellsViewMigrationLibSQL.up);
 		await db.exec(beadsResultColumnsMigrationLibSQL.up);
+		await db.exec(beadsOperationIdMigrationLibSQL.up);
 
 		adapter = createHiveAdapter(db, projectKey);
 	});

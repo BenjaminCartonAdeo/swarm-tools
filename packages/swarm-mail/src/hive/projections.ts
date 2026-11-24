@@ -174,6 +174,11 @@ export async function queryCells(
     params.push(options.assignee);
   }
 
+  if (options.operation_id) {
+    conditions.push(`operation_id = $${paramIndex++}`);
+    params.push(options.operation_id);
+  }
+
   let query = `SELECT * FROM beads WHERE ${conditions.join(" AND ")} ORDER BY priority DESC, created_at ASC`;
 
   if (options.limit) {

@@ -37,6 +37,7 @@ export interface CreateCellOptions {
   parent_id?: string;
   assignee?: string;
   created_by?: string;
+  operation_id?: string;
 }
 
 export interface UpdateCellOptions {

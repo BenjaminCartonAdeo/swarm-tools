@@ -67,6 +67,8 @@ export interface CellCreatedEvent extends BaseCellEvent {
   priority: number;
   parent_id?: string;
   created_by?: string;
+  /** Idempotency key: one operation_id never creates two cells */
+  operation_id?: string;
   metadata?: Record<string, unknown>;
 }
 

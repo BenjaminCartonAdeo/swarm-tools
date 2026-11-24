@@ -75,6 +75,20 @@ export function createHiveAdapter(
     // ============================================================================
 
     async createCell(projectKeyParam, options, projectPath?) {
+      const findByOperationId = async () => {
+        if (!options.operation_id) return null;
+        const [found] = await queryCells(db, projectKeyParam, {
+          operation_id: options.operation_id,
+          include_deleted: true,
+          limit: 1,
+        });
+        return found ?? null;
+      };
+
+      // Idempotency: a known operation_id returns the existing cell
+      const existing = await findByOperationId();
+      if (existing) return existing;
+
       // Create bead_created event
       const event: CellEvent = {
         type: "cell_created",
@@ -87,10 +101,18 @@ export function createHiveAdapter(
         priority: options.priority ?? 2,
         parent_id: options.parent_id || null,
         created_by: options.created_by || null,
+        ...(options.operation_id ? { operation_id: options.operation_id } : {}),
         metadata: options.metadata || null,
       } as any;
 
-      await appendCellEvent(event, projectPath, db);
+      try {
+        await appendCellEvent(event, projectPath, db);
+      } catch (error) {
+        // Lost a concurrent race on idx_beads_operation_id: return the winner
+        const winner = await findByOperationId();
+        if (winner) return winner;
+        throw error;
+      }
 
       // If assignee provided, emit bead_assigned event
       if (options.assignee) {

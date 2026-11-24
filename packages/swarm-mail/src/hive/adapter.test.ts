@@ -38,6 +38,29 @@ describe("Beads Adapter", () => {
   // Factory and Interface Tests
   // ============================================================================
 
+  test("adapterDuplicateOperationIdReturnsExistingCell", async () => {
+    const first = await adapter.createCell(projectKey, { title: "Op", type: "task", operation_id: "op-1" });
+    const second = await adapter.createCell(projectKey, { title: "Op again", type: "task", operation_id: "op-1" });
+    expect(second.id).toBe(first.id);
+    expect(second.operation_id).toBe("op-1");
+    const found = await adapter.queryCells(projectKey, { operation_id: "op-1" });
+    expect(found.map((c) => c.id)).toEqual([first.id]);
+  });
+
+  test("concurrent creates with same operation_id converge on one cell", async () => {
+    const results = await Promise.all(
+      [1, 2, 3].map((n) => adapter.createCell(projectKey, { title: `Race ${n}`, type: "task", operation_id: "op-race" })),
+    );
+    expect(new Set(results.map((c) => c.id)).size).toBe(1);
+    expect(await adapter.queryCells(projectKey, { operation_id: "op-race" })).toHaveLength(1);
+  });
+
+  test("createCell without operation_id still creates distinct cells", async () => {
+    const a = await adapter.createCell(projectKey, { title: "A", type: "task" });
+    const b = await adapter.createCell(projectKey, { title: "B", type: "task" });
+    expect(a.id).not.toBe(b.id);
+  });
+
   test("createHiveAdapter - returns valid adapter", () => {
     expect(adapter).toBeDefined();
     expect(adapter.createCell).toBeFunction();

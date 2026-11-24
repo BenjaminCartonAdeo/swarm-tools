@@ -34,6 +34,7 @@ describe("Hive Schema", () => {
     expect(schema.beads.deleted_by).toBeDefined();
     expect(schema.beads.delete_reason).toBeDefined();
     expect(schema.beads.created_by).toBeDefined();
+    expect(schema.beads.operation_id).toBeDefined();
   });
 
   test("cells is an alias for beads", () => {
@@ -132,7 +133,8 @@ describe("Hive Schema", () => {
         delete_reason TEXT,
         created_by TEXT,
         result TEXT,
-        result_at INTEGER
+        result_at INTEGER,
+        operation_id TEXT
       )
     `);
 
@@ -198,7 +200,8 @@ describe("Hive Schema", () => {
         delete_reason TEXT,
         created_by TEXT,
         result TEXT,
-        result_at INTEGER
+        result_at INTEGER,
+        operation_id TEXT
       )
     `);
 

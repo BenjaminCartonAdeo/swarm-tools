@@ -14,7 +14,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createClient, type Client } from "@libsql/client";
 import { convertPlaceholders, type DatabaseAdapter } from "../libsql.js";
 import { createHiveAdapter } from "./adapter.js";
-import { beadsMigrationLibSQL, cellsViewMigrationLibSQL, sessionsMigrationLibSQL, beadsResultColumnsMigrationLibSQL } from "./migrations.js";
+import { beadsMigrationLibSQL, cellsViewMigrationLibSQL, sessionsMigrationLibSQL, beadsResultColumnsMigrationLibSQL, beadsOperationIdMigrationLibSQL } from "./migrations.js";
 
 /**
  * Wrap libSQL client with DatabaseAdapter interface
@@ -76,6 +76,7 @@ describe("Session Handoff Notes", () => {
 		await db.exec(cellsViewMigrationLibSQL.up);
 		await db.exec(sessionsMigrationLibSQL.up);
 		await db.exec(beadsResultColumnsMigrationLibSQL.up);
+		await db.exec(beadsOperationIdMigrationLibSQL.up);
 
 		adapter = createHiveAdapter(db, projectKey);
 	});

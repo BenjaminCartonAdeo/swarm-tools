@@ -145,6 +145,7 @@ async function handleBeadCreatedDrizzle(
     deleted_by: null,
     delete_reason: null,
     created_by: (event.created_by as string | null | undefined) ?? null,
+    operation_id: (event.operation_id as string | null | undefined) ?? null,
   });
 }
 
