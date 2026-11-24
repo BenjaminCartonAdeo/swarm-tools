@@ -67,7 +67,9 @@ and must be a non-empty array » + boucle de re-spawn à coût doublé) :
 
 ## Non négociables
 
-- Étape 1 OBLIGATOIRE — \`swarm_complete\` échoue sans init.
+- Étape 1 obligatoire pour utiliser Swarm Mail. La gate V2 peut aussi lier
+  automatiquement la session au premier appel de mutation si \`swarmmail_init\`
+  n'a pas encore eu lieu ; ne pas en abuser pour contourner le protocole.
 - Étape 2 fait gagner du temps — ne pas la sauter.
 - Étape 4 prévient les conflits d'édition — workers réservent, pas le coordinateur.
 - Étape 6 prévient l'échec silencieux — un worker muet est supposé mort.

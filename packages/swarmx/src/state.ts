@@ -20,6 +20,7 @@ import type {
   ConsolidationStatus,
   DispatchAgentLister,
   DispatchAttempt,
+  CellMarker,
   IsoTimestamp,
   JsonValue,
   MissionAudit,
@@ -485,6 +486,58 @@ export async function putAttempt(
   attempt: DispatchAttempt,
 ): Promise<void> {
   await store.storage.set(attemptKey(projectID, attempt.callID), attempt as unknown as JsonValue);
+}
+
+export type WorkerAttemptBindingResult =
+  | {
+      readonly status: "bound" | "already_bound";
+      readonly attempt: DispatchAttempt;
+      readonly missionID: string;
+    }
+  | {
+      readonly status: "not_owner" | "not_found" | "revoked" | "inactive" | "invalid_status";
+    };
+
+/**
+ * Atomically binds a dispatched attempt to its worker session on first use.
+ *
+ * The dispatch token is the capability: cell, epic, agent and token must all
+ * match an active, unrevoked attempt. An unbound attempt is claimed by exactly
+ * one worker session; a different session can never reuse it.
+ */
+export async function bindWorkerAttemptSession(
+  store: MissionStateStore,
+  projectID: string,
+  parentSessionID: string,
+  workerSessionID: string,
+  marker: CellMarker,
+  agentID: string,
+): Promise<WorkerAttemptBindingResult> {
+  return withMissionLock(projectID, parentSessionID, async () => {
+    const mission = await readMission(store, projectID, parentSessionID);
+    if (mission === undefined || !mission.active) return { status: "inactive" };
+    const attempts = await listAttempts(store, projectID, parentSessionID, mission);
+    const attempt = attempts.find(
+      (candidate) =>
+        candidate.dispatchToken === marker.dispatchToken &&
+        candidate.cellID === marker.cellID &&
+        candidate.epicID === marker.epicID &&
+        candidate.agent === agentID,
+    );
+    if (attempt === undefined) return { status: "not_found" };
+    if (attempt.revokedAt !== undefined) return { status: "revoked" };
+    if (attempt.status !== "pending" && attempt.status !== "succeeded") {
+      return { status: "invalid_status" };
+    }
+    const missionID = mission.missionID ?? `legacy:${mission.createdAt}`;
+    if (attempt.workerSessionID === undefined) {
+      const bound = { ...attempt, workerSessionID };
+      await putAttempt(store, projectID, bound);
+      return { status: "bound", attempt: bound, missionID };
+    }
+    if (attempt.workerSessionID !== workerSessionID) return { status: "not_owner" };
+    return { status: "already_bound", attempt, missionID };
+  });
 }
 
 /**

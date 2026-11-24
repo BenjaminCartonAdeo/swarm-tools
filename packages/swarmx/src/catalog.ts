@@ -44,6 +44,7 @@ import {
 } from "./history";
 import {
   audit,
+  bindWorkerAttemptSession,
   completeConsolidation,
   getAttempt,
   finishMission,
@@ -4196,50 +4197,31 @@ async function resolveParentMissionForWorker(
   if (mission === undefined || !mission.active) {
     throw new LocalToolError(tool, "conflict", "the worker session's parent has no active swarmx mission");
   }
-  const attempts = await listAttempts(store, projectID, parentSessionID, mission);
-  const attempt = attempts.find(
-    (attempt) =>
-      attempt.cellID === worker.marker.cellID &&
-      attempt.epicID === worker.marker.epicID &&
-      attempt.agent === worker.agent.id &&
-      attempt.dispatchToken === worker.marker.dispatchToken &&
-      attempt.revokedAt === undefined &&
-      (attempt.status === "pending" || attempt.status === "succeeded"),
+  const binding = await bindWorkerAttemptSession(
+    store,
+    projectID,
+    parentSessionID,
+    workerSessionID,
+    worker.marker,
+    worker.agent.id,
   );
-  if (attempt === undefined) {
-    const detail = `cell=${worker.marker.cellID} epic=${worker.marker.epicID} agent=${worker.agent.id} token=${worker.marker.dispatchToken ?? "none"} attempts=${attempts.length} (revoked=${attempts.filter((a) => a.revokedAt !== undefined).length})`;
-    throw new LocalToolError(tool, "conflict", `the worker prompt is not bound to a dispatched cell in its parent mission (${detail})`);
+  if (binding.status === "not_owner") {
+    throw new LocalToolError(
+      tool,
+      "conflict",
+      "the dispatch capability is already bound to another worker session",
+    );
   }
-
-  const boundAttempt = await withMissionLock(projectID, parentSessionID, async () => {
-    const currentMission = await readMission(store, projectID, parentSessionID);
-    const currentAttempt = await getAttempt(store, projectID, attempt.callID);
-    if (
-      currentMission === undefined ||
-      !currentMission.active ||
-      !sameMissionGeneration(currentMission, mission) ||
-      currentAttempt === undefined ||
-      currentAttempt.dispatchToken !== worker.marker.dispatchToken ||
-      currentAttempt.revokedAt !== undefined ||
-      (currentAttempt.status !== "pending" && currentAttempt.status !== "succeeded")
-    ) {
-      throw new LocalToolError(tool, "conflict", "the dispatch capability is no longer active");
-    }
-    if (currentAttempt.workerSessionID !== undefined && currentAttempt.workerSessionID !== workerSessionID) {
-      throw new LocalToolError(
-        tool,
-        "conflict",
-        "the dispatch capability is already bound to another worker session",
-      );
-    }
-    if (currentAttempt.workerSessionID === undefined) {
-      const bound = { ...currentAttempt, workerSessionID };
-      await putAttempt(store, projectID, bound);
-      return bound;
-    }
-    return currentAttempt;
-  });
-  return { parentMission: mission, attemptCallID: boundAttempt.callID };
+  if (binding.status === "revoked" || binding.status === "inactive" || binding.status === "invalid_status") {
+    throw new LocalToolError(tool, "conflict", "the dispatch capability is no longer active");
+  }
+  if (binding.status === "not_found") {
+    throw new LocalToolError(tool, "conflict", "the worker prompt is not bound to a dispatched cell in its parent mission");
+  }
+  if (binding.status !== "bound" && binding.status !== "already_bound") {
+    throw new LocalToolError(tool, "conflict", "the dispatch capability is no longer active");
+  }
+  return { parentMission: mission, attemptCallID: binding.attempt.callID };
 }
 
 function requireAssignedAgentName(tool: string, value: unknown, agent: RosterAgent): void {

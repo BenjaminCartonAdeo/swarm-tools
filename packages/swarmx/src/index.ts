@@ -27,6 +27,7 @@ import {
   type DispatchBeforeEvent,
 } from "./dispatch";
 import {
+  bindWorkerAttemptSession,
   createMissionStateStore,
   listAssignments,
   listAttempts,
@@ -179,30 +180,31 @@ async function workerMutationDenial(
   if (mission === undefined) return undefined;
   if (!mission.active) return marker !== undefined ? "mission_inactive" : undefined;
   if (marker?.dispatchToken === undefined || agentID === undefined) return "token_missing";
-  let attempts;
+  let binding;
   try {
-    attempts = await listAttempts(runtime.store, runtime.projectID, parentSessionID, mission);
+    binding = await bindWorkerAttemptSession(
+      runtime.store,
+      runtime.projectID,
+      parentSessionID,
+      sessionID,
+      marker,
+      agentID,
+    );
   } catch {
     return "token_missing";
   }
-  const attempt = attempts.find(
-    (candidate) =>
-      candidate.dispatchToken === marker.dispatchToken &&
-      candidate.cellID === marker.cellID &&
-      candidate.epicID === marker.epicID &&
-      candidate.agent === agentID,
-  );
-  if (attempt === undefined) return "token_missing";
-  if (attempt.revokedAt !== undefined) return "revoked";
+  if (binding.status === "not_owner") return "not_owner";
+  if (binding.status === "revoked") return "revoked";
+  if (binding.status === "inactive") return "mission_inactive";
+  if (binding.status !== "bound" && binding.status !== "already_bound") return "token_missing";
+  const attempt = binding.attempt;
   if (attempt.followup === true) return "read_only_followup";
-  if (attempt.workerSessionID !== sessionID) return "not_owner";
-  if (attempt.status !== "pending" && attempt.status !== "succeeded") return "token_missing";
   const pending = await runtime.store.storage.get(pendingCompletionKey(runtime.projectID, marker.cellID));
   const pendingRecord =
     typeof pending === "object" && pending !== null ? (pending as Record<string, unknown>) : undefined;
   return pendingRecord?.projectID === runtime.projectID &&
     pendingRecord.parentSessionID === parentSessionID &&
-    pendingRecord.missionID === (mission.missionID ?? `legacy:${mission.createdAt}`) &&
+    pendingRecord.missionID === binding.missionID &&
     pendingRecord.taskID === marker.cellID
     ? "pending_completion"
     : undefined;

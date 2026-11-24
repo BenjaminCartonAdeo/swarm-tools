@@ -813,6 +813,86 @@ describe("mission gate → settle sequence", () => {
     ).rejects.toThrow(/worker dispatch capability is revoked, unbound, or not owned by this session/);
   });
 
+  test("first worker mutation binds the dispatch capability before swarmmail_init", async () => {
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      workerCell: { cellID: "cell-a", epicID: "epic-1" },
+    });
+    await dispatchWorker(rig, "cell-a", "call-dispatch-first-mutation");
+
+    await expect(
+      rig.ctx.permission.assert({
+        sessionID: "ses-worker",
+        agent: "swarm/swarm-worker",
+        source: { type: "tool", messageID: "msg-first-mutation", id: "call-first-shell" },
+        action: "shell",
+        resources: ["git status --short"],
+      }),
+    ).resolves.toBeUndefined();
+
+    const attempt = await getAttempt(missionStore(rig.ctx), PROJECT, "call-dispatch-first-mutation");
+    expect(attempt?.workerSessionID).toBe("ses-worker");
+  });
+
+  test("a sibling session cannot steal a capability bound by first mutation", async () => {
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      workerCell: { cellID: "cell-a", epicID: "epic-1" },
+    });
+    const marker = await dispatchWorker(rig, "cell-a", "call-dispatch-lazy-owner");
+    await rig.ctx.permission.assert({
+      sessionID: "ses-worker",
+      agent: "swarm/swarm-worker",
+      source: { type: "tool", messageID: "msg-lazy-owner", id: "call-lazy-owner-shell" },
+      action: "shell",
+      resources: ["git status --short"],
+    });
+    rig.bindWorkerSession("ses-sibling", marker, SESSION);
+
+    await expect(
+      rig.ctx.permission.assert({
+        sessionID: "ses-sibling",
+        agent: "swarm/swarm-worker",
+        source: { type: "tool", messageID: "msg-sibling", id: "call-sibling-edit" },
+        action: "edit",
+        resources: ["src/handler.ts"],
+      }),
+    ).rejects.toThrow(/not_owner/);
+    const attempt = await getAttempt(missionStore(rig.ctx), PROJECT, "call-dispatch-lazy-owner");
+    expect(attempt?.workerSessionID).toBe("ses-worker");
+  });
+
+  test("concurrent first mutations bind the capability to exactly one session", async () => {
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      workerCell: { cellID: "cell-a", epicID: "epic-1" },
+    });
+    const marker = await dispatchWorker(rig, "cell-a", "call-dispatch-race");
+    rig.bindWorkerSession("ses-worker-a", marker, SESSION);
+    rig.bindWorkerSession("ses-worker-b", marker, SESSION);
+    const results = await Promise.allSettled([
+      rig.ctx.permission.assert({
+        sessionID: "ses-worker-a",
+        agent: "swarm/swarm-worker",
+        source: { type: "tool", messageID: "msg-race-a", id: "call-race-a" },
+        action: "shell",
+        resources: ["git status --short"],
+      }),
+      rig.ctx.permission.assert({
+        sessionID: "ses-worker-b",
+        agent: "swarm/swarm-worker",
+        source: { type: "tool", messageID: "msg-race-b", id: "call-race-b" },
+        action: "shell",
+        resources: ["git status --short"],
+      }),
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    const winner = results[0]?.status === "fulfilled" ? "ses-worker-a" : "ses-worker-b";
+    const attempt = await getAttempt(missionStore(rig.ctx), PROJECT, "call-dispatch-race");
+    expect(attempt?.workerSessionID).toBe(winner);
+  });
+
   test("root mode-all sessions keep native write access", async () => {
     const agents = [
       ...GATE_AGENTS,
@@ -1074,7 +1154,7 @@ describe("mission gate → settle sequence", () => {
         },
         workerToolContext("swarm/swarm-worker", "call-stale-completion", "ses-worker-old"),
       ),
-    ).rejects.toThrow(/not bound to a dispatched cell/);
+    ).rejects.toThrow(/dispatch capability is no longer active/);
     const retry = await rig.tools.get("swarm_complete")?.execute(
       {
         project_key: projectPath,
