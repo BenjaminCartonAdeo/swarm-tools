@@ -2874,8 +2874,7 @@ async function readScopedReview(
       value.missionID !== missionID ||
       value.projectPath !== projectPath ||
       value.taskID !== taskID ||
-      (workerID !== value.assignedAgentID && workerID !== value.assignedAgentName) ||
-      value.filesTouched.length === 0
+      (workerID !== value.assignedAgentID && workerID !== value.assignedAgentName)
     ) {
       throw new LocalToolError(
         "swarm_review_feedback",
@@ -4373,13 +4372,23 @@ async function executeSpec(
     const slowBackend = isReview || spec.name === "swarm_complete";
     let output: unknown;
     try {
-      output = await runToolForSession(
-        runtime,
-        backendName,
-        args,
-        sessionID,
-        slowBackend ? 120_000 : undefined,
-      );
+      if (isReview && files.length === 0) {
+        // No-file tasks (research, analysis) have no diff to review. Skip the
+        // backend entirely and create a synthetic empty review so the plugin
+        // can still persist a scoped review receipt and finalize the cell.
+        output = {
+          review_prompt: "## Files Modified\n\n## Code Changes\n```diff\n\n```\n\n## Review Criteria",
+          context: { files_touched: [] },
+        };
+      } else {
+        output = await runToolForSession(
+          runtime,
+          backendName,
+          args,
+          sessionID,
+          slowBackend ? 120_000 : undefined,
+        );
+      }
       if (isReview) {
         await recordScopedReview(runtime, context, args, output);
       }

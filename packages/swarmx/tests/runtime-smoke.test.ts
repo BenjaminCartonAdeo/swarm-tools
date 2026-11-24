@@ -2594,6 +2594,48 @@ describe("mission gate → settle sequence", () => {
     expect(reviewReceiptStorageKey(rig)).toBeUndefined();
   });
 
+  test("swarm_review creates a receipt for a no-file task without calling the backend", async () => {
+    const projectPath = await realpath(process.cwd());
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-a", epicID: "epic-1" },
+    });
+    await dispatchWorker(rig, "cell-a", "call-dispatch-no-file");
+    await rig.tools.get("swarm_complete")?.execute(
+      {
+        project_key: projectPath,
+        agent_name: "swarm-worker",
+        bead_id: "cell-a",
+        summary: "Research only, no files.",
+        start_time: 1,
+        files_touched: [],
+      },
+      workerToolContext("swarm/swarm-worker", "call-completion-no-file"),
+    );
+    const review = await rig.tools.get("swarm_review")?.execute(
+      { project_key: projectPath, epic_id: "epic-1", task_id: "cell-a", files_touched: [] },
+      toolContext("swarm/swarm-coordinator", "call-review-no-file"),
+    );
+    expect(review).toBeDefined();
+    expect(rig.runCalls.some((call) => call.name === "swarm_review")).toBe(false);
+
+    const feedback = await rig.tools.get("swarm_review_feedback")?.execute(
+      {
+        project_key: projectPath,
+        task_id: "cell-a",
+        worker_id: "swarm-worker",
+        status: "approved",
+        summary: "Research accepted.",
+      },
+      toolContext("swarm/swarm-coordinator", "call-feedback-no-file"),
+    );
+    expect(feedback?.output).toMatchObject({
+      approval_evidence: { status: "unverifiable" },
+      completion: { ok: true },
+    });
+  });
+
   test("approval requires a completion verification receipt", async () => {
     const projectPath = await realpath(process.cwd());
     const file = SWARMX_FILE;
