@@ -119,8 +119,16 @@ export async function appendCellEventDrizzle(
     sequence = seqResult[0]?.sequence ?? id; // Fallback to id if still null
   }
 
-  // Update materialized views based on event type
-  await updateProjectionsDrizzle(db, { ...event, id, sequence } as any);
+  // Update materialized views based on event type.
+  // Event insert + projection must be atomic: if the projection fails
+  // (e.g. losing a unique operation_id race), compensate by removing the
+  // event row so the log never holds an event without its projection.
+  try {
+    await updateProjectionsDrizzle(db, { ...event, id, sequence } as any);
+  } catch (error) {
+    await db.delete(eventsTable).where(eq(eventsTable.id, id));
+    throw error;
+  }
 
   return { ...event, id, sequence };
 }

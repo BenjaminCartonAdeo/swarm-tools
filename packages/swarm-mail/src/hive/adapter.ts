@@ -59,6 +59,25 @@ import {
 import type { CellEvent } from "./events.js";
 
 /**
+ * True when an error (or any error in its cause chain) is a unique-constraint
+ * violation on beads.operation_id.
+ */
+function isOperationIdConflict(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; current && depth < 5; depth++) {
+    const message = String((current as { message?: unknown }).message ?? "");
+    if (
+      /UNIQUE constraint failed|duplicate key value|SQLITE_CONSTRAINT/i.test(message) &&
+      /operation_id/.test(message)
+    ) {
+      return true;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
  * Create a HiveAdapter instance
  *
  * @param db - DatabaseAdapter instance (libSQL, SQLite, etc.)
@@ -108,7 +127,8 @@ export function createHiveAdapter(
       try {
         await appendCellEvent(event, projectPath, db);
       } catch (error) {
-        // Lost a concurrent race on idx_beads_operation_id: return the winner
+        // Only a lost race on idx_beads_operation_id is an idempotent duplicate
+        if (!isOperationIdConflict(error)) throw error;
         const winner = await findByOperationId();
         if (winner) return winner;
         throw error;

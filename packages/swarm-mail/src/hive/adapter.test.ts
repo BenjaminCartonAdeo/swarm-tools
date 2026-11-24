@@ -53,6 +53,18 @@ describe("Beads Adapter", () => {
     );
     expect(new Set(results.map((c) => c.id)).size).toBe(1);
     expect(await adapter.queryCells(projectKey, { operation_id: "op-race" })).toHaveLength(1);
+    const events = await db.query<{ data: string }>(
+      "SELECT data FROM events WHERE type = 'cell_created'",
+    );
+    const raced = events.rows.filter((row) => JSON.parse(row.data).operation_id === "op-race");
+    expect(raced).toHaveLength(1);
+  });
+
+  test("createCell rethrows non-operation_id errors", async () => {
+    await expect(
+      adapter.createCell(projectKey, { title: "Bad parent", type: "task", parent_id: "missing-parent", operation_id: "op-bad" }),
+    ).rejects.toThrow();
+    expect(await adapter.queryCells(projectKey, { operation_id: "op-bad" })).toHaveLength(0);
   });
 
   test("createCell without operation_id still creates distinct cells", async () => {
