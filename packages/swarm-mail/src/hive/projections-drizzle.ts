@@ -117,6 +117,30 @@ async function handleBeadCreatedDrizzle(
   db: SwarmDb,
   event: CellEvent,
 ): Promise<void> {
+  await buildBeadCreatedInsert(db, event);
+}
+
+/**
+ * Statements materialising a cell_created event (beads row + dirty marker).
+ *
+ * Returned as unexecuted Drizzle builders so the event store can run them in
+ * the same atomic `db.batch()` as the event insert.
+ */
+export function buildCellCreatedProjectionStatements(db: SwarmDb, event: CellEvent) {
+  return [
+    buildBeadCreatedInsert(db, event),
+    buildMarkDirtyStatement(db, event.cell_id),
+  ] as const;
+}
+
+function buildMarkDirtyStatement(db: SwarmDb, cellId: string) {
+  return db
+    .insert(dirtyBeads)
+    .values({ cell_id: cellId, marked_at: Date.now() })
+    .onConflictDoUpdate({ target: dirtyBeads.cell_id, set: { marked_at: Date.now() } });
+}
+
+function buildBeadCreatedInsert(db: SwarmDb, event: CellEvent) {
   // GUARD: Validate bead ID is not null/empty
   // This prevents the root cause of NULL ID records from migration failures
   if (!event.cell_id || event.cell_id.trim() === "") {
@@ -127,7 +151,7 @@ async function handleBeadCreatedDrizzle(
     );
   }
 
-  await db.insert(beads).values({
+  return db.insert(beads).values({
     id: event.cell_id,
     project_key: event.project_key,
     type: event.issue_type as string,

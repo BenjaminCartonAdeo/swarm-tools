@@ -23,8 +23,53 @@ import type { SwarmDb } from "../db/client.js";
 import { eventsTable } from "../db/schema/streams.js";
 import { withTiming } from "../streams/index.js";
 import type { DatabaseAdapter } from "../types/database.js";
-import { updateProjectionsDrizzle } from "./projections-drizzle.js";
+import { buildCellCreatedProjectionStatements, updateProjectionsDrizzle } from "./projections-drizzle.js";
 import type { CellEvent } from "./events.js";
+
+/**
+ * Typed conflict: a cell_created lost the unique race on beads.operation_id.
+ * The whole batch (event + projection) was rolled back.
+ */
+export class OperationIdConflictError extends Error {
+  readonly operationId: string;
+  constructor(operationId: string, cause: unknown) {
+    super(`[BeadsStore] operation_id already used: ${operationId}`, { cause });
+    this.name = "OperationIdConflictError";
+    this.operationId = operationId;
+  }
+}
+
+/** SQLite extended result code SQLITE_CONSTRAINT_UNIQUE */
+const SQLITE_CONSTRAINT_UNIQUE = 2067;
+
+/**
+ * Driver-level identification: extended code must be SQLITE_CONSTRAINT_UNIQUE
+ * and the violated constraint must be exactly beads.operation_id (SQLite names
+ * the constrained column(s) as `UNIQUE constraint failed: <table>.<col>`).
+ */
+function isOperationIdUniqueViolation(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; current && depth < 5; depth++) {
+    const e = current as { code?: unknown; rawCode?: unknown; message?: unknown };
+    const isUnique = e.rawCode === SQLITE_CONSTRAINT_UNIQUE || e.code === "SQLITE_CONSTRAINT_UNIQUE";
+    if (isUnique) {
+      const detail = String(e.message ?? "").split("UNIQUE constraint failed:")[1]?.trim();
+      return detail === "beads.operation_id";
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+async function resolveSequence(db: SwarmDb, id: number, sequence: number | null): Promise<number> {
+  if (sequence != null) return sequence;
+  // LibSQL workaround: RETURNING gives pre-trigger value
+  const seqResult = await db
+    .select({ sequence: eventsTable.sequence })
+    .from(eventsTable)
+    .where(eq(eventsTable.id, id));
+  return seqResult[0]?.sequence ?? id;
+}
 
 // No type guards needed - CellEvent type is already defined
 
@@ -90,8 +135,7 @@ export async function appendCellEventDrizzle(
 ): Promise<CellEvent & { id: number; sequence: number }> {
   const { type, project_key, timestamp, ...rest } = event;
 
-  // Insert event
-  const result = await db
+  const insertEvent = db
     .insert(eventsTable)
     .values({
       type,
@@ -101,6 +145,35 @@ export async function appendCellEventDrizzle(
       // sequence omitted - auto-assigned by database (SERIAL in PGlite, trigger in LibSQL)
     })
     .returning({ id: eventsTable.id, sequence: eventsTable.sequence });
+
+  if (type === "cell_created") {
+    // Atomic path: event insert + beads row + dirty marker run in ONE
+    // db.batch() (single BEGIN/COMMIT on the same connection). If the beads
+    // insert fails (e.g. idx_beads_operation_id) the event insert rolls back,
+    // so no orphan cell_created event can exist.
+    const [beadInsert, dirtyInsert] = buildCellCreatedProjectionStatements(db, event as any);
+    let batchResult: Array<{ id: number; sequence: number | null }>;
+    try {
+      [batchResult] = await db.batch([insertEvent, beadInsert, dirtyInsert]);
+    } catch (error) {
+      if (isOperationIdUniqueViolation(error)) {
+        throw new OperationIdConflictError(
+          (event as { operation_id?: string }).operation_id ?? "",
+          error,
+        );
+      }
+      throw error;
+    }
+    const created = batchResult[0];
+    if (!created) {
+      throw new Error("[BeadsStore] Failed to insert event - no row returned");
+    }
+    const sequence = await resolveSequence(db, created.id, created.sequence);
+    return { ...event, id: created.id, sequence };
+  }
+
+  // Insert event
+  const result = await insertEvent;
 
   const row = result[0];
   if (!row) {
@@ -119,16 +192,8 @@ export async function appendCellEventDrizzle(
     sequence = seqResult[0]?.sequence ?? id; // Fallback to id if still null
   }
 
-  // Update materialized views based on event type.
-  // Event insert + projection must be atomic: if the projection fails
-  // (e.g. losing a unique operation_id race), compensate by removing the
-  // event row so the log never holds an event without its projection.
-  try {
-    await updateProjectionsDrizzle(db, { ...event, id, sequence } as any);
-  } catch (error) {
-    await db.delete(eventsTable).where(eq(eventsTable.id, id));
-    throw error;
-  }
+  // Update materialized views based on event type
+  await updateProjectionsDrizzle(db, { ...event, id, sequence } as any);
 
   return { ...event, id, sequence };
 }

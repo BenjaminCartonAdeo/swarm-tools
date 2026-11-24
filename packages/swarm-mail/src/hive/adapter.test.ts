@@ -60,6 +60,40 @@ describe("Beads Adapter", () => {
     expect(raced).toHaveLength(1);
   });
 
+  test("forced projection failure rolls back the cell_created event", async () => {
+    await db.exec(`CREATE TRIGGER force_bead_fail BEFORE INSERT ON beads
+      BEGIN SELECT RAISE(ABORT, 'forced projection failure'); END;`);
+    await expect(
+      adapter.createCell(projectKey, { title: "Doomed", type: "task", operation_id: "op-doomed" }),
+    ).rejects.toThrow(/forced projection failure/);
+    const events = await db.query<{ n: number }>(
+      "SELECT COUNT(id) AS n FROM events WHERE type = 'cell_created'",
+    );
+    expect(Number(events.rows[0]?.n)).toBe(0);
+  });
+
+  test("store classifies only a real beads.operation_id UNIQUE violation as conflict", async () => {
+    const { appendCellEvent, OperationIdConflictError } = await import("./store.js");
+    const created = (id: string, op: string) =>
+      ({
+        type: "cell_created", project_key: projectKey, cell_id: id, timestamp: Date.now(),
+        title: id, issue_type: "task", priority: 2, operation_id: op,
+      }) as any;
+
+    await appendCellEvent(created("store-seed", "op-seed"), undefined, db);
+    const dup = await appendCellEvent(created("store-dup", "op-seed"), undefined, db).catch((e: unknown) => e);
+    expect(dup).toBeInstanceOf(OperationIdConflictError);
+
+    await db.exec(`CREATE TRIGGER force_constraint BEFORE INSERT ON beads
+      BEGIN SELECT RAISE(ABORT, 'UNIQUE constraint failed: beads.operation_id'); END;`);
+    const other = await appendCellEvent(created("store-other", "op-other"), undefined, db).catch((e: unknown) => e);
+    expect(other).toBeInstanceOf(Error);
+    expect(other).not.toBeInstanceOf(OperationIdConflictError);
+
+    const events = await db.query<{ data: string }>("SELECT data FROM events WHERE type = 'cell_created'");
+    expect(events.rows.map((r) => JSON.parse(r.data).cell_id)).toEqual(["store-seed"]);
+  });
+
   test("createCell rethrows non-operation_id errors", async () => {
     await expect(
       adapter.createCell(projectKey, { title: "Bad parent", type: "task", parent_id: "missing-parent", operation_id: "op-bad" }),
