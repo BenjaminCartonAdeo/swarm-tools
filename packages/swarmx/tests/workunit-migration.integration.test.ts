@@ -2,12 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { createLibSQLAdapter, type DatabaseAdapter } from "swarm-mail";
 import { ensureWorkUnitSchema } from "../src/workunit/schema.js";
-import { migrateLegacyLifecycle, type LegacyLifecycleStore } from "../src/workunit/migrate.js";
+import { migrateLegacyLifecycle, LegacyMissionConflictError, type LegacyLifecycleStore } from "../src/workunit/migrate.js";
 import { reserveWorkUnit } from "../src/workunit/store.js";
 import {
   acquireBuildLock,
   createLegacyLifecycleStore,
   createMissionStateStore,
+  createTombstoneGuardedStorage,
+  legacyTombstoneKey,
   LegacyLifecycleTombstonedError,
   putAttempt,
   readMission,
@@ -347,6 +349,7 @@ describe("legacy lifecycle import", () => {
     const calls: string[] = [];
     let unitsAtTombstone = -1;
     const spy: LegacyLifecycleStore = {
+      listMissions: (p) => (calls.push("listMissions"), legacyStore.listMissions(p)),
       getMission: (p, s) => (calls.push("getMission"), legacyStore.getMission(p, s)),
       listAttempts: (p, s) => (calls.push("listAttempts"), legacyStore.listAttempts(p, s)),
       listAssignments: (p) => (calls.push("listAssignments"), legacyStore.listAssignments(p)),
@@ -420,6 +423,98 @@ describe("legacy lifecycle import", () => {
     const ids = async (d: DatabaseAdapter) =>
       (await d.query<{ id: string; state: string }>("SELECT id, state FROM swarmx_work_units ORDER BY id")).rows;
     expect(await ids(fresh.db)).toEqual(await ids(db));
+  });
+});
+
+describe("round-1 fixes", () => {
+  test("standalone mission with no other records is imported", async () => {
+    const map = seedLegacy();
+    map.set(`mission:${P}:s3`, {
+      missionID: "m3",
+      projectID: P,
+      sessionID: "s3",
+      active: true,
+      mode: "dev",
+      budget: { maxSpawns: 2, maxIterations: 1 },
+      counts: { spawns: 0, cells: 0, attemptsByCell: {}, workerSpawns: 0 },
+      createdAt: T0,
+      updatedAt: T0,
+    });
+    map.set(`mission:other:s9`, { ...(map.get(`mission:${P}:s3`) as object), projectID: "other", sessionID: "s9" });
+    const { db, legacyStore } = await setup(map);
+    await migrateLegacyLifecycle(db, { project: P, legacyStore });
+    const rows = (await db.query<Record<string, unknown>>("SELECT session_id, mission_id, state FROM swarmx_missions ORDER BY session_id")).rows;
+    expect(rows).toEqual([
+      { session_id: "s1", mission_id: "m1", state: "OPEN" },
+      { session_id: "s2", mission_id: `legacy:${T0}`, state: "FINISHED" },
+      { session_id: "s3", mission_id: "m3", state: "OPEN" },
+    ]);
+  });
+
+  test("live native mission on the same session aborts import without attempts or tombstone", async () => {
+    const { db, legacyStore, storage } = await setup();
+    await db.query(
+      "INSERT INTO swarmx_missions (id, project, session_id, mission_id, state, fence, created_at, updated_at) VALUES ('native', 'p', 's1', 'native-m', 'OPEN', 1, 0, 0)",
+    );
+    await expect(migrateLegacyLifecycle(db, { project: P, legacyStore })).rejects.toBeInstanceOf(LegacyMissionConflictError);
+    expect(await count(db, "swarmx_work_units")).toBe(0);
+    expect(await count(db, "swarmx_missions")).toBe(1);
+    expect([...storage.map.keys()].some((k) => k.startsWith("legacy-tombstone:"))).toBe(false);
+  });
+
+  test("guarded storage refuses set/remove on every lifecycle prefix after tombstone and keeps KV byte-identical", async () => {
+    const { db, legacyStore, storage } = await setup();
+    await migrateLegacyLifecycle(db, { project: P, legacyStore });
+    const guarded = createTombstoneGuardedStorage(storage);
+    const keys = [
+      `mission:${P}:s1`,
+      `budget:${P}:s1`,
+      `attempt:${P}:a-live`,
+      `assignment:${P}:c1`,
+      `build-lock:${P}`,
+      `cleanup-claim:${P}`,
+      enc(["pending-completion:", P, "c8"]),
+      enc(["review-receipt:", P, "s1", "m1", "c9"]),
+    ];
+    const before = JSON.stringify([...storage.map.entries()]);
+    for (const key of keys) {
+      await expect(guarded.set(key, { x: 1 })).rejects.toBeInstanceOf(LegacyLifecycleTombstonedError);
+      await expect(guarded.remove(key)).rejects.toBeInstanceOf(LegacyLifecycleTombstonedError);
+      expect(JSON.stringify([...storage.map.entries()])).toBe(before);
+    }
+    expect(await guarded.get(`mission:${P}:s1`)).toBeDefined();
+    await guarded.set(`mission:other:s1`, { y: 1 });
+    expect(storage.map.has(`mission:other:s1`)).toBe(true);
+  });
+
+  test("per-session tombstone blocks only that session; project tombstone uses session *", async () => {
+    const storage = memoryStorage();
+    const guarded = createTombstoneGuardedStorage(storage);
+    storage.map.set(legacyTombstoneKey(P, "s1"), { at: 1 });
+    await expect(guarded.set(`mission:${P}:s1`, {})).rejects.toBeInstanceOf(LegacyLifecycleTombstonedError);
+    await guarded.set(`mission:${P}:s2`, {});
+    expect(storage.map.has(`mission:${P}:s2`)).toBe(true);
+    storage.map.set(legacyTombstoneKey(P, "*"), { at: 1 });
+    await expect(guarded.set(`mission:${P}:s2`, {})).rejects.toBeInstanceOf(LegacyLifecycleTombstonedError);
+  });
+
+  test("tombstoned load with count drift returns the legacy projection without writing", async () => {
+    const { db, legacyStore, storage } = await setup();
+    await migrateLegacyLifecycle(db, { project: P, legacyStore });
+    const missions = createMissionStateStore(createTombstoneGuardedStorage(storage), { projectID: P });
+    const before = JSON.stringify([...storage.map.entries()]);
+    const loaded = await missions.load(P, "s1");
+    expect(loaded?.counts.spawns).toBe(0);
+    expect(JSON.stringify([...storage.map.entries()])).toBe(before);
+  });
+
+  test("assignment ledger lookup is mission-scoped", async () => {
+    const map = seedLegacy();
+    map.set(`assignment:${P}:c20`, { cellID: "c20", agent: "coder", updatedAt: at(1), sessionID: "s1" });
+    const { db, legacyStore } = await setup(map);
+    await migrateLegacyLifecycle(db, { project: P, legacyStore });
+    const row = (await db.query<Record<string, unknown>>("SELECT state FROM swarmx_legacy_assignments WHERE cell_id = 'c20'")).rows[0];
+    expect(row?.state).toBe("legacy_ambiguous");
   });
 });
 

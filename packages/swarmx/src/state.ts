@@ -435,6 +435,8 @@ export function createMissionStateStore(
     async load(projectID, sessionID) {
       const mission = await readMission(store, projectID, sessionID);
       if (mission === undefined) return undefined;
+      // Tombstoned KV is a read-only fallback: return the legacy projection without repair writes.
+      if (await isLegacyLifecycleTombstoned(storage, projectID, sessionID)) return mission;
       await recoverPendingOrphans(store, projectID, sessionID);
       await reconcileMissionCounts(store, projectID, sessionID);
       return readMission(store, projectID, sessionID);
@@ -1160,11 +1162,90 @@ async function assertLegacyLifecycleWritable(
   projectID: string,
   sessionID: string | undefined,
 ): Promise<void> {
+  if (await isLegacyLifecycleTombstoned(store.storage, projectID, sessionID)) {
+    throw new LegacyLifecycleTombstonedError(projectID);
+  }
+}
+
+/** True when the project-wide (`*`) or the session tombstone exists. */
+export async function isLegacyLifecycleTombstoned(
+  storage: Pick<MissionStorageLike, "get">,
+  projectID: string,
+  sessionID: string | undefined,
+): Promise<boolean> {
   const keys = [legacyTombstoneKey(projectID, LEGACY_TOMBSTONE_PROJECT_SESSION)];
   if (sessionID !== undefined) keys.push(legacyTombstoneKey(projectID, sessionID));
   for (const key of keys) {
-    if ((await store.storage.get(key)) !== undefined) throw new LegacyLifecycleTombstonedError(projectID);
+    if ((await storage.get(key)) !== undefined) return true;
   }
+  return false;
+}
+
+/** Plain-prefix lifecycle keys: `<prefix><project>:<session|id>` or `<prefix><project>`. */
+const PLAIN_LIFECYCLE_PREFIXES = [
+  { prefix: MISSION_KEY_PREFIX, sessionScoped: true },
+  { prefix: BUDGET_KEY_PREFIX, sessionScoped: true },
+  { prefix: ATTEMPT_KEY_PREFIX, sessionScoped: false },
+  { prefix: ASSIGNMENT_KEY_PREFIX, sessionScoped: false },
+  { prefix: "build-lock:", sessionScoped: false },
+  { prefix: "cleanup-claim:", sessionScoped: false },
+] as const;
+/** URI-encoded lifecycle keys written by catalog.ts: `enc(prefix):enc(project):...`. */
+const ENCODED_LIFECYCLE_PREFIXES = [
+  { prefix: `${encodeURIComponent("pending-completion:")}:`, sessionScoped: false },
+  { prefix: `${encodeURIComponent("review-receipt:")}:`, sessionScoped: true },
+] as const;
+
+/** Project/session targeted by a lifecycle key; `undefined` for non-lifecycle keys. */
+export function lifecycleKeyScope(key: string): { projectID: string; sessionID?: string } | undefined {
+  for (const { prefix, sessionScoped } of PLAIN_LIFECYCLE_PREFIXES) {
+    if (!key.startsWith(prefix)) continue;
+    const rest = key.slice(prefix.length);
+    const cut = rest.indexOf(":");
+    if (cut < 0) return { projectID: rest };
+    const projectID = rest.slice(0, cut);
+    return sessionScoped ? { projectID, sessionID: rest.slice(cut + 1) } : { projectID };
+  }
+  for (const { prefix, sessionScoped } of ENCODED_LIFECYCLE_PREFIXES) {
+    if (!key.startsWith(prefix)) continue;
+    const [project, session] = key.slice(prefix.length).split(":");
+    const projectID = decodeURIComponent(project ?? "");
+    return sessionScoped && session !== undefined
+      ? { projectID, sessionID: decodeURIComponent(session) }
+      : { projectID };
+  }
+  return undefined;
+}
+
+/**
+ * Wraps plugin storage so every lifecycle `set`/`remove` is refused once the
+ * project (or session) is tombstoned. Reads and scans pass through untouched.
+ */
+export function createTombstoneGuardedStorage<S extends MissionStorageLike>(storage: S): S {
+  const guard = async (key: string): Promise<void> => {
+    const scope = lifecycleKeyScope(key);
+    if (scope !== undefined && (await isLegacyLifecycleTombstoned(storage, scope.projectID, scope.sessionID))) {
+      throw new LegacyLifecycleTombstonedError(scope.projectID);
+    }
+  };
+  return new Proxy(storage, {
+    get(target, property, receiver) {
+      if (property === "set") {
+        return async (key: string, value: unknown) => {
+          await guard(key);
+          return target.set(key, value);
+        };
+      }
+      if (property === "remove") {
+        return async (key: string) => {
+          await guard(key);
+          return target.remove(key);
+        };
+      }
+      const value: unknown = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
 
 export interface LegacyAssignment {
@@ -1223,6 +1304,7 @@ export interface LegacyCleanupClaim {
 
 /** Read-only view over the legacy KV lifecycle documents. */
 export interface LegacyLifecycleReader {
+  listMissions(project: string): Promise<MissionState[]>;
   getMission(project: string, session: string): Promise<MissionState | undefined>;
   listAttempts(project: string, session?: string): Promise<DispatchAttempt[]>;
   listAssignments(project: string): Promise<LegacyAssignment[]>;
@@ -1281,6 +1363,13 @@ export function createLegacyLifecycleStore(store: MissionStateStore): LegacyLife
   const scanValues = async (prefix: string): Promise<unknown[]> =>
     (await scanAll(store.storage, prefix)).map((entry) => entry.value);
   return {
+    async listMissions(project) {
+      const values = await scanValues(`${MISSION_KEY_PREFIX}${project}:`);
+      return values
+        .filter(isMissionState)
+        .filter((mission) => mission.projectID === project)
+        .sort((left, right) => left.sessionID.localeCompare(right.sessionID));
+    },
     getMission: (project, session) => readMission(store, project, session),
     async listAttempts(project, session) {
       const values = await scanValues(`${ATTEMPT_KEY_PREFIX}${project}:`);

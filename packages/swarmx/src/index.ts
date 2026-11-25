@@ -30,6 +30,7 @@ import {
   acquireBuildLock,
   bindWorkerAttemptSession,
   createMissionStateStore,
+  createTombstoneGuardedStorage,
   listAssignments,
   listAttempts,
   readMission,
@@ -244,10 +245,13 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
 
     async setup(ctx: Plugin.Context) {
       const projectID = ctx.location.project.id;
-      const store = createMissionStateStore(ctx.storage as unknown as MissionStorageLike, {
-        projectID,
-        listAgents: () => ctx.agent.list() as unknown as Promise<DispatchAgentList>,
-      });
+      const store = createMissionStateStore(
+        createTombstoneGuardedStorage(ctx.storage as unknown as MissionStorageLike),
+        {
+          projectID,
+          listAgents: () => ctx.agent.list() as unknown as Promise<DispatchAgentList>,
+        },
+      );
       const skills = await ctx.skill.list().catch(() => undefined);
       const catalogProtocol = skills?.data.find((skill) => skill.id === "swarm-worker-protocol")?.content;
       // Fall back to the bundled protocol so workers always receive the survival

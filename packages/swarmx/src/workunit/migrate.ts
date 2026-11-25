@@ -27,6 +27,20 @@ export interface LegacyImportResult {
   tombstoned: boolean;
 }
 
+/** A native live mission already owns the session; importing would orphan legacy attempts. */
+export class LegacyMissionConflictError extends Error {
+  readonly project: string;
+  readonly sessionId: string;
+  readonly existingMissionPk: string;
+  constructor(project: string, sessionId: string, existingMissionPk: string) {
+    super(`Legacy mission for ${project}/${sessionId} conflicts with live mission ${existingMissionPk}`);
+    this.name = "LegacyMissionConflictError";
+    this.project = project;
+    this.sessionId = sessionId;
+    this.existingMissionPk = existingMissionPk;
+  }
+}
+
 interface ImportedMission {
   pk: string;
   missionID: string;
@@ -61,6 +75,8 @@ function mapAttempt(
   receipt: LegacyReviewReceipt | undefined,
 ): Mapped {
   const identified = attempt.workerSessionID !== undefined && attempt.dispatchToken !== undefined;
+  // Completion overlays are later evidence than revokedAt: legacy finalization
+  // and cancellation themselves set revokedAt, so they must win over REVOKED.
   if (completion?.canceled === true) return { state: "CANCELLED", ambiguous: false };
   if (completion?.finalized === true) return { state: "DONE", ambiguous: false };
   if (attempt.revokedAt !== undefined) return { state: "REVOKED", ambiguous: false };
@@ -107,12 +123,33 @@ export async function migrateLegacyLifecycle(
   if (buildLock !== undefined) sessions.add(buildLock.sessionID);
 
   const missions: ImportedMission[] = [];
+  const listed = await legacyStore.listMissions(project);
+  for (const mission of listed) sessions.add(mission.sessionID);
+  const candidates: ImportedMission[] = [];
   for (const session of [...sessions].sort()) {
-    const mission = await legacyStore.getMission(project, session);
+    const mission = listed.find((m) => m.sessionID === session) ?? (await legacyStore.getMission(project, session));
     if (mission === undefined) continue;
     const missionID = missionIdOf(mission);
-    const pk = `mission:${project}:${session}:${missionID}`;
-    missions.push({ pk, missionID, mission });
+    candidates.push({ pk: `mission:${project}:${session}:${missionID}`, missionID, mission });
+  }
+  // Pre-flight: a different native live mission on the same session would make the
+  // legacy mission insert a no-op while its attempts still import. Abort before any write.
+  for (const candidate of candidates) {
+    if (!candidate.mission.active) continue;
+    const live = await db.query(
+      "SELECT id FROM swarmx_missions WHERE project = ? AND session_id = ? AND state IN ('OPEN', 'CLOSING') AND id <> ?",
+      [project, candidate.mission.sessionID, candidate.pk],
+    );
+    const row: unknown = live.rows[0];
+    if (row !== undefined) {
+      const existing = typeof row === "object" && row !== null ? String(Reflect.get(row, "id")) : "unknown";
+      throw new LegacyMissionConflictError(project, candidate.mission.sessionID, existing);
+    }
+  }
+  for (const candidate of candidates) {
+    const { pk, missionID, mission } = candidate;
+    const session = mission.sessionID;
+    missions.push(candidate);
     const workerShare = mission.budget.workerShare ?? DEFAULT_WORKER_SHARE;
     const legacySource = JSON.stringify({
       kind: "legacy_mission",
@@ -154,6 +191,7 @@ export async function migrateLegacyLifecycle(
   const receiptByCall = new Map(receipts.map((r) => [r.attemptCallID, r]));
   const previousByCell = new Map<string, { id: string; attemptNo: number }>();
   const cellsWithUnits = new Set<string>();
+  const projectCellsWithUnits = new Set<string>();
 
   for (const attempt of attempts) {
     const owner = missions.find((m) => belongsTo(attempt, m));
@@ -223,7 +261,8 @@ export async function migrateLegacyLifecycle(
       const existing = await db.query("SELECT id FROM swarmx_work_units WHERE id = ?", [id]);
       if (existing.rows.length === 0) skipped += 1;
     }
-    cellsWithUnits.add(attempt.cellID);
+    cellsWithUnits.add(`${owner.pk}|${attempt.cellID}`);
+    projectCellsWithUnits.add(attempt.cellID);
   }
 
   for (const assignment of assignments) {
@@ -231,7 +270,10 @@ export async function migrateLegacyLifecycle(
       assignment.sessionID === undefined
         ? undefined
         : missions.find((m) => m.mission.sessionID === assignment.sessionID);
-    const hasUnit = cellsWithUnits.has(assignment.cellID);
+    const hasUnit =
+      owner === undefined
+        ? projectCellsWithUnits.has(assignment.cellID)
+        : cellsWithUnits.has(`${owner.pk}|${assignment.cellID}`);
     const result = await db.query(
       `INSERT INTO swarmx_legacy_assignments (project, cell_id, owner, raw_json, created_at, mission_pk, agent, state, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
