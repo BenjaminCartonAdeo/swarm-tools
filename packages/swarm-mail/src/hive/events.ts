@@ -100,6 +100,8 @@ export interface CellClosedEvent extends BaseCellEvent {
   result?: string;
   /** Idempotent completion identity persisted on the cell (migration v12) */
   completion_operation_id?: string;
+  /** Unique internal token of this close event (guards the atomic close batch); not a cell identity */
+  event_token?: string;
 }
 
 export interface CellReopenedEvent extends BaseCellEvent {

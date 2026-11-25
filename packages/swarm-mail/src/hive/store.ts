@@ -18,6 +18,7 @@
  * @module beads/store
  */
 
+import { randomUUID } from "node:crypto";
 import { and, eq, gte, gt, inArray, lte, sql } from "drizzle-orm";
 import type { SwarmDb } from "../db/client.js";
 import { eventsTable } from "../db/schema/streams.js";
@@ -175,24 +176,40 @@ export async function appendCellEventDrizzle(
 }
 
 /**
- * Thrown when a cell_closed event targets a cell that is already closed.
- * The whole batch was a no-op: no event, no projection change.
+ * Thrown by the guarded close when its event insert lost the guard (cell not
+ * open, or identity already set, or cell missing). The whole batch was a no-op.
+ * The adapter re-reads the cell to classify the outcome.
  */
-export class CellAlreadyClosedError extends Error {
+export class CellCloseRejectedError extends Error {
   readonly cellId: string;
   constructor(cellId: string) {
-    super(`[BeadsStore] cell already closed: ${cellId}`);
-    this.name = "CellAlreadyClosedError";
+    super(`[BeadsStore] close rejected by guard: ${cellId}`);
+    this.name = "CellCloseRejectedError";
+    this.cellId = cellId;
+  }
+}
+
+/** Thrown when an operation targets a cell that does not exist. */
+export class CellNotFoundError extends Error {
+  readonly cellId: string;
+  constructor(cellId: string) {
+    super(`[HiveAdapter] Bead not found: ${cellId}`);
+    this.name = "CellNotFoundError";
     this.cellId = cellId;
   }
 }
 
 /**
- * Atomic, conflict-safe close. One db.batch (single BEGIN/COMMIT) holds the
- * guarded event insert, the guarded beads update, blocked-cache bookkeeping
- * and the dirty marker. Guard: cell is open (`status <> 'closed'`) and, for an
- * identity close, `completion_operation_id IS NULL`. A losing concurrent close
- * inserts no event and changes nothing.
+ * Atomic, conflict-safe close. One db.batch (single BEGIN/COMMIT):
+ *   1. guarded event insert (cell open and, for identity closes, identity unset),
+ *      carrying a unique internal `event_token`;
+ *   2. beads update;
+ *   3-4. blocked-cache rebuild for the closed cell and its direct dependents
+ *      (same semantics as invalidateBlockedCacheDrizzle);
+ *   5. dirty marker.
+ * Statements 2-5 are gated on the existence of this exact event_token, so a
+ * losing insert makes the whole batch a no-op. Replay/rebuild still uses the
+ * shared projection path (handleBeadClosedDrizzle), which ignores event_token.
  */
 async function appendGuardedCellClosed(
   db: SwarmDb,
@@ -203,11 +220,21 @@ async function appendGuardedCellClosed(
   const cellId = event.cell_id;
   const rawIdentity = (event as { completion_operation_id?: unknown }).completion_operation_id;
   const identity = typeof rawIdentity === "string" && rawIdentity.length > 0 ? rawIdentity : null;
-  const data = JSON.stringify(rest);
+  const eventToken = typeof rest.event_token === "string" ? rest.event_token : randomUUID();
+  const data = JSON.stringify({ ...rest, event_token: eventToken });
   const reason = (event as { reason?: string | null }).reason ?? null;
-  const result = (event as { result?: string | null }).result ?? null;
+  const rawResult = (event as { result?: unknown }).result;
+  // Truthy-result semantics, as in handleBeadClosedDrizzle (`if (result)`).
+  const result = typeof rawResult === "string" && rawResult.length > 0 ? rawResult : null;
   const identityGuard = identity === null ? sql`` : sql` AND completion_operation_id IS NULL`;
-  const closedByThisEvent = sql`EXISTS (SELECT 1 FROM beads WHERE id = ${cellId} AND status = 'closed' AND closed_at = ${timestamp})`;
+  const thisEvent = sql`EXISTS (
+    SELECT 1 FROM events WHERE type = 'cell_closed' AND json_extract(data, '$.event_token') = ${eventToken}
+  )`;
+  const targets = sql`targets(id) AS (
+    SELECT ${cellId}
+    UNION
+    SELECT cell_id FROM bead_dependencies WHERE depends_on_id = ${cellId}
+  )`;
 
   const statements = [
     db.run(sql`
@@ -218,23 +245,38 @@ async function appendGuardedCellClosed(
     db.run(sql`
       UPDATE beads SET status = 'closed', closed_at = ${timestamp}, closed_reason = ${reason},
         updated_at = ${timestamp}, completion_operation_id = COALESCE(${identity}, completion_operation_id),
-        result = COALESCE(${result}, result),
+        result = CASE WHEN ${result} IS NULL THEN result ELSE ${result} END,
         result_at = CASE WHEN ${result} IS NULL THEN result_at ELSE ${timestamp} END
-      WHERE id = ${cellId} AND status <> 'closed'${identityGuard}
+      WHERE id = ${cellId} AND ${thisEvent}
     `),
-    // Blocked cache: a cell closed by this event is no longer an open blocker.
     db.run(sql`
-      UPDATE blocked_beads_cache
-      SET blocker_ids = (
-            SELECT json_group_array(value) FROM json_each(blocked_beads_cache.blocker_ids) WHERE value <> ${cellId}
-          ),
-          updated_at = ${timestamp}
-      WHERE EXISTS (SELECT 1 FROM json_each(blocked_beads_cache.blocker_ids) WHERE value = ${cellId})
-        AND ${closedByThisEvent}
+      WITH RECURSIVE ${targets}
+      DELETE FROM blocked_beads_cache WHERE cell_id IN (SELECT id FROM targets) AND ${thisEvent}
     `),
-    db.run(sql`DELETE FROM blocked_beads_cache WHERE blocker_ids = '[]' AND ${closedByThisEvent}`),
     db.run(sql`
-      INSERT INTO dirty_beads (cell_id, marked_at) SELECT ${cellId}, ${Date.now()} WHERE ${closedByThisEvent}
+      WITH RECURSIVE ${targets},
+      blockers(target, blocker_id, depth) AS (
+        SELECT t.id, bd.depends_on_id, 1
+        FROM targets t JOIN bead_dependencies bd ON bd.cell_id = t.id
+        WHERE bd.relationship = 'blocks'
+        UNION
+        SELECT b.target, bd.depends_on_id, b.depth + 1
+        FROM bead_dependencies bd JOIN blockers b ON bd.cell_id = b.blocker_id
+        WHERE bd.relationship = 'blocks' AND b.depth < ${MAX_CLOSE_DEPENDENCY_DEPTH}
+      ),
+      open_blockers AS (
+        SELECT DISTINCT b.target, b.blocker_id
+        FROM blockers b JOIN beads bead ON b.blocker_id = bead.id
+        WHERE bead.project_key = ${project_key} AND bead.status != 'closed' AND bead.deleted_at IS NULL
+      )
+      INSERT INTO blocked_beads_cache (cell_id, blocker_ids, updated_at)
+      SELECT target, json_group_array(blocker_id), ${timestamp}
+      FROM open_blockers
+      WHERE ${thisEvent}
+      GROUP BY target
+    `),
+    db.run(sql`
+      INSERT INTO dirty_beads (cell_id, marked_at) SELECT ${cellId}, ${Date.now()} WHERE ${thisEvent}
       ON CONFLICT (cell_id) DO UPDATE SET marked_at = excluded.marked_at
     `),
   ];
@@ -249,18 +291,14 @@ async function appendGuardedCellClosed(
     throw error;
   }
   const inserted = batchResult[0];
-  if (!inserted || inserted.rowsAffected === 0) {
-    if (identity === null) throw new CellAlreadyClosedError(cellId);
-    throw new OperationIdConflictError(
-      identity,
-      new Error(`cell ${cellId} already closed or already has a completion identity`),
-      "beads.completion",
-    );
-  }
+  if (!inserted || inserted.rowsAffected === 0) throw new CellCloseRejectedError(cellId);
   const id = Number(inserted.lastInsertRowid);
   const sequence = await resolveSequence(db, id, null);
-  return { ...event, id, sequence };
+  return { ...event, event_token: eventToken, id, sequence } as CellEvent & { id: number; sequence: number };
 }
+
+/** Same bound as dependencies-drizzle MAX_DEPENDENCY_DEPTH. */
+const MAX_CLOSE_DEPENDENCY_DEPTH = 100;
 
 /**
  * Read cell events with optional filters using Drizzle

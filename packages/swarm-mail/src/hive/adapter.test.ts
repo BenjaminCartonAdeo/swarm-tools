@@ -81,8 +81,8 @@ describe("Beads Adapter", () => {
       const final = await adapter.getCell(projectKey, cell.id);
       const events = await db.query<{ data: string }>("SELECT data FROM events WHERE type = 'cell_closed'");
       expect(events.rows.filter((row) => JSON.parse(row.data).cell_id === cell.id)).toHaveLength(1);
-      expect(manual.status).toBe("fulfilled");
       if (final?.completion_operation_id === null || final?.completion_operation_id === undefined) {
+        expect(manual.status).toBe("fulfilled");
         expect(final?.closed_reason).toBe("manual");
         expect(identityClose.status).toBe("rejected");
         expect((identityClose as PromiseRejectedResult).reason).toMatchObject({ name: "OperationIdConflictError" });
@@ -90,6 +90,8 @@ describe("Beads Adapter", () => {
         expect(final.completion_operation_id).toBe(identity);
         expect(final.closed_reason).toBe("identity");
         expect(identityClose.status).toBe("fulfilled");
+        expect(manual.status).toBe("rejected");
+        expect((manual as PromiseRejectedResult).reason).toMatchObject({ name: "OperationIdConflictError" });
       }
     }
   });
@@ -110,6 +112,68 @@ describe("Beads Adapter", () => {
     expect(after.rows).toHaveLength(0);
     const dirty = await db.query("SELECT cell_id FROM dirty_beads WHERE cell_id = ?", [blocker.id]);
     expect(dirty.rows).toHaveLength(1);
+  });
+
+  test("guarded close on an already-closed cell with the same timestamp changes nothing", async () => {
+    const { appendCellEvent } = await import("./store.js");
+    const blocker = await adapter.createCell(projectKey, { title: "TS blocker", type: "task" });
+    const blocked = await adapter.createCell(projectKey, { title: "TS blocked", type: "task" });
+    await adapter.addDependency(projectKey, blocked.id, blocker.id, "blocks");
+    await db.query("UPDATE beads SET status = 'closed', closed_at = 4242, closed_reason = 'pre' WHERE id = ?", [blocker.id]);
+    await db.query("UPDATE blocked_beads_cache SET blocker_ids = '[\"stale\"]', updated_at = 1 WHERE cell_id = ?", [blocked.id]);
+    await db.query("DELETE FROM dirty_beads");
+    const snapshot = async () => ({
+      events: (await db.query("SELECT id FROM events WHERE type = 'cell_closed'")).rows,
+      cache: (await db.query("SELECT * FROM blocked_beads_cache ORDER BY cell_id")).rows,
+      dirty: (await db.query("SELECT * FROM dirty_beads")).rows,
+      bead: (await db.query("SELECT status, closed_at, closed_reason, result FROM beads WHERE id = ?", [blocker.id])).rows,
+    });
+    const before = await snapshot();
+    await expect(
+      appendCellEvent({ type: "cell_closed", project_key: projectKey, cell_id: blocker.id, timestamp: 4242, reason: "again", result: "r" } as any, undefined, db),
+    ).rejects.toMatchObject({ name: "CellCloseRejectedError" });
+    expect(await snapshot()).toEqual(before);
+  });
+
+  test("closing a missing cell reports CellNotFoundError", async () => {
+    await expect(adapter.closeCell(projectKey, "no-such-cell", "x")).rejects.toMatchObject({ name: "CellNotFoundError" });
+  });
+
+  test("empty result keeps the previous result (truthy-result semantics)", async () => {
+    const cell = await adapter.createCell(projectKey, { title: "Result", type: "task" });
+    await db.query("UPDATE beads SET result = 'earlier', result_at = 7 WHERE id = ?", [cell.id]);
+    const closed = await adapter.closeCell(projectKey, cell.id, "done", { result: "" });
+    expect(closed).toMatchObject({ result: "earlier", result_at: 7 });
+  });
+
+  test("close rebuilds blocked cache for the closed cell and dependents (multi-blocker, stale, missing)", async () => {
+    const a = await adapter.createCell(projectKey, { title: "A", type: "task" });
+    const b = await adapter.createCell(projectKey, { title: "B", type: "task" });
+    const upstream = await adapter.createCell(projectKey, { title: "Up", type: "task" });
+    const d1 = await adapter.createCell(projectKey, { title: "D1", type: "task" });
+    const d2 = await adapter.createCell(projectKey, { title: "D2", type: "task" });
+    await adapter.addDependency(projectKey, a.id, upstream.id, "blocks");
+    await adapter.addDependency(projectKey, d1.id, a.id, "blocks");
+    await adapter.addDependency(projectKey, d1.id, b.id, "blocks");
+    await adapter.addDependency(projectKey, d2.id, a.id, "blocks");
+    // Corrupt cache: stale row for d1, missing row for d2, stale row for the closing cell.
+    await db.query("UPDATE blocked_beads_cache SET blocker_ids = '[\"ghost\"]' WHERE cell_id = ?", [d1.id]);
+    await db.query("DELETE FROM blocked_beads_cache WHERE cell_id = ?", [d2.id]);
+    await db.query("UPDATE blocked_beads_cache SET blocker_ids = '[\"ghost\"]' WHERE cell_id = ?", [a.id]);
+
+    await adapter.closeCell(projectKey, a.id, "done", { completion_operation_id: "rebuild-op" });
+
+    const cache = async (id: string) => {
+      const rows = (await db.query<{ blocker_ids: string }>("SELECT blocker_ids FROM blocked_beads_cache WHERE cell_id = ?", [id])).rows;
+      return rows.length === 0 ? null : (JSON.parse(rows[0].blocker_ids) as string[]).sort();
+    };
+    expect(await cache(a.id)).toEqual([upstream.id]);
+    expect(await cache(d1.id)).toEqual([upstream.id, b.id].sort());
+    expect(await cache(d2.id)).toEqual([upstream.id]);
+    const token = (await db.query<{ data: string }>("SELECT data FROM events WHERE type = 'cell_closed'")).rows
+      .map((row) => JSON.parse(row.data)).find((data) => data.cell_id === a.id);
+    expect(typeof token.event_token).toBe("string");
+    expect((await adapter.getCell(projectKey, a.id))?.completion_operation_id).toBe("rebuild-op");
   });
 
   test("concurrent different-identity closes: one event, one winner, loser conflicts", async () => {
