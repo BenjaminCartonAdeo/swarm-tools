@@ -13,7 +13,7 @@
  * @module hive/projections-drizzle
  */
 
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull, or } from "drizzle-orm";
 import type { SwarmDb } from "../db/client.js";
 import {
   beadComments,
@@ -252,14 +252,22 @@ async function handleBeadClosedDrizzle(
   }
 
   const completionOperationId = (event as { completion_operation_id?: unknown }).completion_operation_id;
-  if (typeof completionOperationId === "string" && completionOperationId.length > 0) {
+  const hasIdentity = typeof completionOperationId === "string" && completionOperationId.length > 0;
+  if (hasIdentity) {
     setFields.completion_operation_id = completionOperationId;
   }
 
   await db
     .update(beads)
     .set(setFields)
-    .where(eq(beads.id, event.cell_id));
+    .where(
+      hasIdentity
+        ? and(
+            eq(beads.id, event.cell_id),
+            or(isNull(beads.completion_operation_id), eq(beads.completion_operation_id, completionOperationId)),
+          )
+        : eq(beads.id, event.cell_id),
+    );
 
   // Invalidate blocked cache for dependents (beads that were blocked by this one)
   const { invalidateBlockedCacheDrizzle } = await import(
@@ -278,6 +286,7 @@ async function handleBeadReopenedDrizzle(
       status: "open",
       closed_at: null,
       closed_reason: null,
+      completion_operation_id: null,
       updated_at: event.timestamp,
     })
     .where(eq(beads.id, event.cell_id));

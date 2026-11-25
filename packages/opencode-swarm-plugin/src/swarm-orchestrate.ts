@@ -1152,6 +1152,26 @@ export const swarm_complete = tool({
 
       // 2. Check if bead is already closed
       if (cell.status === "closed") {
+        if (args.operation_id) {
+          const existingIdentity = (cell as { completion_operation_id?: string | null }).completion_operation_id ?? null;
+          if (existingIdentity === args.operation_id) {
+            // Idempotent replay of the same completion identity.
+            return JSON.stringify({
+              success: true,
+              idempotent_replay: true,
+              bead_id: args.bead_id,
+              completion_operation_id: existingIdentity,
+            });
+          }
+          return JSON.stringify({
+            success: false,
+            conflict: true,
+            error_type: "operation_id_conflict",
+            error: `Bead already closed with a different completion identity: ${args.bead_id}`,
+            expected_operation_id: args.operation_id,
+            actual_operation_id: existingIdentity,
+          });
+        }
         return JSON.stringify({
           success: false,
           error: `Bead already closed: ${args.bead_id}`,

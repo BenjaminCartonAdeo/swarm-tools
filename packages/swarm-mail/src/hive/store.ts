@@ -144,6 +144,50 @@ export async function appendCellEventDrizzle(
     return { ...event, id: created.id, sequence };
   }
 
+  const completionOperationId = (event as { completion_operation_id?: unknown }).completion_operation_id;
+  if (type === "cell_closed" && typeof completionOperationId === "string" && completionOperationId.length > 0) {
+    // Atomic, conflict-safe identity close: the event insert and the beads
+    // update share one batch (single BEGIN/COMMIT) and the same guard
+    // `completion_operation_id IS NULL`. A losing concurrent close inserts no
+    // event and updates no row, so no orphan cell_closed event can exist.
+    const cellId = event.cell_id;
+    const data = JSON.stringify(rest);
+    const guardedEvent = db.run(sql`
+      INSERT INTO events (type, project_key, timestamp, data)
+      SELECT ${type}, ${project_key}, ${timestamp}, ${data}
+      WHERE EXISTS (SELECT 1 FROM beads WHERE id = ${cellId} AND completion_operation_id IS NULL)
+    `);
+    const result = (event as { result?: string | null }).result ?? null;
+    const guardedUpdate = db.run(sql`
+      UPDATE beads SET status = 'closed', closed_at = ${timestamp}, closed_reason = ${(event as { reason?: string }).reason ?? null},
+        updated_at = ${timestamp}, completion_operation_id = ${completionOperationId},
+        result = COALESCE(${result}, result), result_at = CASE WHEN ${result} IS NULL THEN result_at ELSE ${timestamp} END
+      WHERE id = ${cellId} AND completion_operation_id IS NULL
+    `);
+    let batchResult: Array<{ rowsAffected: number; lastInsertRowid?: bigint | number }>;
+    try {
+      batchResult = (await db.batch([guardedEvent, guardedUpdate])) as unknown as typeof batchResult;
+    } catch (error) {
+      if (isOperationIdUniqueViolation(error, "beads", "completion_operation_id")) {
+        throw new OperationIdConflictError(completionOperationId, error, "beads.completion");
+      }
+      throw error;
+    }
+    const inserted = batchResult[0];
+    if (!inserted || inserted.rowsAffected === 0) {
+      throw new OperationIdConflictError(
+        completionOperationId,
+        new Error(`cell ${cellId} already has a completion identity`),
+        "beads.completion",
+      );
+    }
+    const id = Number(inserted.lastInsertRowid);
+    const sequence = await resolveSequence(db, id, null);
+    // Remaining side effects (blocked cache, dirty marker); the identity guard keeps this idempotent.
+    await updateProjectionsDrizzle(db, { ...event, id, sequence } as any);
+    return { ...event, id, sequence };
+  }
+
   // Insert event
   const result = await insertEvent;
 

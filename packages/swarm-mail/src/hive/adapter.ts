@@ -246,7 +246,13 @@ export function createHiveAdapter(
         ...(completionOperationId ? { completion_operation_id: completionOperationId } : {}),
       } as any;
 
-      await appendCellEvent(event, projectPath, db);
+      await appendCellEvent(event, projectPath, db).catch(async (error: unknown) => {
+        if (!completionOperationId || !(error instanceof OperationIdConflictError)) throw error;
+        // Lost a concurrent close: same identity is an idempotent success, otherwise a definite conflict.
+        const current = await getCell(db, projectKeyParam, cellId);
+        if (current?.completion_operation_id === completionOperationId) return;
+        throw error;
+      });
 
       const updated = await getCell(db, projectKeyParam, cellId);
       if (!updated) {

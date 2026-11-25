@@ -183,6 +183,7 @@ describe("captureSubtaskOutcome integration", () => {
 
     const first = await complete("effect-complete-A");
     expect(first).toMatchObject({ success: true });
+    expect(await complete("effect-complete-A")).toMatchObject({ success: true, idempotent_replay: true });
     const { getHiveAdapter } = await import("./hive");
     const adapter = await getHiveAdapter(testProjectPath);
     expect(await adapter.getCell(testProjectPath, beadId)).toMatchObject({
@@ -191,6 +192,7 @@ describe("captureSubtaskOutcome integration", () => {
     });
     const conflict = await complete("effect-complete-B");
     expect(conflict.success).toBe(false);
+    expect(conflict).toMatchObject({ conflict: true, error_type: "operation_id_conflict" });
     expect((await adapter.getCell(testProjectPath, beadId))?.completion_operation_id).toBe(`effect-complete-A-${runId}`);
   });
 

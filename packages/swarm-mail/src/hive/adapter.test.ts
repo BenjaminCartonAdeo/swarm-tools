@@ -66,6 +66,37 @@ describe("Beads Adapter", () => {
     ).rejects.toMatchObject({ name: "OperationIdConflictError" });
   });
 
+  test("concurrent different-identity closes: one event, one winner, loser conflicts", async () => {
+    const cell = await adapter.createCell(projectKey, { title: "Race close", type: "task" });
+    const results = await Promise.allSettled(
+      ["race-A", "race-B", "race-C"].map((id) =>
+        adapter.closeCell(projectKey, cell.id, `close ${id}`, { completion_operation_id: id }),
+      ),
+    );
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(2);
+    for (const r of rejected) expect(r.reason).toMatchObject({ name: "OperationIdConflictError" });
+    const winner = (fulfilled[0] as PromiseFulfilledResult<{ completion_operation_id?: string | null }>).value
+      .completion_operation_id;
+    expect(["race-A", "race-B", "race-C"]).toContain(winner as string);
+    expect((await adapter.getCell(projectKey, cell.id))?.completion_operation_id).toBe(winner);
+    const events = await db.query<{ data: string }>(
+      "SELECT data FROM events WHERE type = 'cell_closed'",
+    );
+    expect(events.rows.filter((row) => JSON.parse(row.data).cell_id === cell.id)).toHaveLength(1);
+  });
+
+  test("reopen clears completion identity so a later manual close has none", async () => {
+    const cell = await adapter.createCell(projectKey, { title: "Reopen me", type: "task" });
+    await adapter.closeCell(projectKey, cell.id, "done", { completion_operation_id: "reopen-A" });
+    await adapter.reopenCell(projectKey, cell.id);
+    expect((await adapter.getCell(projectKey, cell.id))?.completion_operation_id).toBeNull();
+    const closed = await adapter.closeCell(projectKey, cell.id, "manual");
+    expect(closed.completion_operation_id).toBeNull();
+  });
+
   test("concurrent creates with same operation_id converge on one cell", async () => {
     const results = await Promise.all(
       [1, 2, 3].map((n) => adapter.createCell(projectKey, { title: `Race ${n}`, type: "task", operation_id: "op-race" })),
