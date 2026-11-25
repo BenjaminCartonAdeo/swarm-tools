@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createLibSQLAdapter } from "../../swarm-mail/src/index.js";
+import { createLibSQLAdapter } from "swarm-mail";
 import { ensureWorkUnitSchema } from "../src/workunit/schema.js";
 
 function rowValue(row: unknown, key: string): unknown {

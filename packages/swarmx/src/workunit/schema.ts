@@ -1,4 +1,4 @@
-import type { DatabaseAdapter } from "../../../swarm-mail/src/index.js";
+import type { DatabaseAdapter } from "swarm-mail";
 
 export type WorkUnitState =
   | "RESERVED"
