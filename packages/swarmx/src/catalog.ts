@@ -5338,8 +5338,13 @@ async function requireNativeHiveCloseAllowed(
   for (const { units } of active) {
     const cellUnits = units.filter((unit) => unit.cell_id === cellID);
     if (cellUnits.length === 0) continue;
-    // Approved-completion exception: an approved/publishing/done unit for the cell.
-    if (cellUnits.some((unit) => APPROVED_UNIT_STATES.has(unit.state))) return;
+    // Approved-completion exception judged on the LATEST unit only: an older DONE
+    // must not authorize closing over newer live work (DONE leaves the live index).
+    const latest = cellUnits.reduce((left, right) =>
+      right.created_at > left.created_at || (right.created_at === left.created_at && right.attempt_no >= left.attempt_no)
+        ? right
+        : left);
+    if (APPROVED_UNIT_STATES.has(latest.state)) return;
     throw new LocalToolError(
       "hive_close",
       "conflict",
