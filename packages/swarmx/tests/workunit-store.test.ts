@@ -28,6 +28,9 @@ import {
   finishMissionClose,
   MissionFenceConflictError,
   MissionNotDrainedError,
+  amendWorkUnitCompletion,
+  AmendmentConflictError,
+  effectiveCompletionFiles,
 } from "../src/workunit/store.js";
 import { LEGAL_WORK_UNIT_TRANSITIONS, type WorkUnitState } from "../src/workunit/schema.js";
 
@@ -883,6 +886,77 @@ describe("mission close barrier", () => {
       await transitionWorkUnit(db, { unitId: "ret", expectedState: "RETURNING", unitFence: 3, nextState: "CHANGES_REQUESTED", patch: { kind: "finalize_return" } });
       expect(await finishMissionClose(db, { ...owner, expectedFence: 2 })).toMatchObject({ state: "CANCELLED" });
       expect(await terminalMissionsWithLiveUnits(db)).toBe(0);
+    });
+  });
+});
+
+async function seedSubmitted(db: DatabaseAdapter, evidence: string): Promise<void> {
+  await db.query(
+    "INSERT INTO swarmx_missions (id, project, session_id, mission_id, state, fence, created_at, updated_at) VALUES ('m-am', 'p', 'coord', 'mission-am', 'OPEN', 1, 0, 0)",
+  );
+  await db.query(
+    `INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, cell_id, idem_key, attempt_no, state, fence,
+       worker_session, worker_agent, evidence_json, evidence_hash, diff_hash, created_at, updated_at)
+     VALUES ('u-am', 'p', 'm-am', 'call-am', 'cell-am', 'idem-am', 1, 'SUBMITTED', 3, 'ses-w', 'agent-w', ?, 'ev-hash', 'diff-hash', 0, 0)`,
+    [evidence],
+  );
+}
+
+function amendment(files: string[], reason: string, amendedAt = 10, worker = "ses-w"): string {
+  return JSON.stringify({ version: 1, filesTouched: files, reason, amendedAt, workerSessionId: worker, workerAgentId: "agent-w" });
+}
+
+describe("WorkUnit completion amendment", () => {
+  const evidence = JSON.stringify({ filesTouched: ["src/a.ts", "src/b.ts"] });
+  const base = { unitId: "u-am", expectedFence: 3, workerSessionId: "ses-w", workerAgentId: "agent-w" };
+
+  test("amendment stores the latest file list, bumps the fence and keeps evidence immutable", async () => {
+    await withWorkUnitDb(async (db) => {
+      await seedSubmitted(db, evidence);
+      const unit = await amendWorkUnitCompletion(db, { ...base, amendmentJson: amendment(["src/a.ts"], "drop b") });
+      expect(unit).toMatchObject({
+        state: "SUBMITTED", fence: 4, evidence_json: evidence, evidence_hash: "ev-hash", diff_hash: "diff-hash",
+      });
+      expect(effectiveCompletionFiles(unit)).toEqual(["src/a.ts"]);
+    });
+  });
+
+  test("effective files fall back to evidence when no valid amendment exists", () => {
+    const unit = { evidence_json: evidence, completion_amendment_json: "{bad" } as Parameters<typeof effectiveCompletionFiles>[0];
+    expect(effectiveCompletionFiles(unit)).toEqual(["src/a.ts", "src/b.ts"]);
+    expect(effectiveCompletionFiles({ evidence_json: null, completion_amendment_json: null } as typeof unit)).toEqual([]);
+  });
+
+  test("a stale fence or a different worker is a typed conflict", async () => {
+    await withWorkUnitDb(async (db) => {
+      await seedSubmitted(db, evidence);
+      await expect(amendWorkUnitCompletion(db, { ...base, expectedFence: 2, amendmentJson: amendment(["src/a.ts"], "r") }))
+        .rejects.toBeInstanceOf(AmendmentConflictError);
+      await expect(amendWorkUnitCompletion(db, { ...base, workerSessionId: "ses-x", amendmentJson: amendment(["src/a.ts"], "r", 10, "ses-x") }))
+        .rejects.toBeInstanceOf(AmendmentConflictError);
+      expect((await getWorkUnit(db, "u-am"))?.completion_amendment_json).toBeNull();
+    });
+  });
+
+  test("same-worker same-files same-reason replay is idempotent; different content conflicts", async () => {
+    await withWorkUnitDb(async (db) => {
+      await seedSubmitted(db, evidence);
+      await amendWorkUnitCompletion(db, { ...base, amendmentJson: amendment(["src/a.ts"], "drop b", 10) });
+      const replay = await amendWorkUnitCompletion(db, { ...base, amendmentJson: amendment(["src/a.ts"], "drop b", 99) });
+      expect(replay.fence).toBe(4);
+      await expect(amendWorkUnitCompletion(db, { ...base, amendmentJson: amendment(["src/b.ts"], "drop b") }))
+        .rejects.toBeInstanceOf(AmendmentConflictError);
+      await expect(amendWorkUnitCompletion(db, { ...base, amendmentJson: amendment(["src/a.ts"], "other") }))
+        .rejects.toBeInstanceOf(AmendmentConflictError);
+    });
+  });
+
+  test("amendment is refused outside SUBMITTED", async () => {
+    await withWorkUnitDb(async (db) => {
+      await seedSubmitted(db, evidence);
+      await db.query("UPDATE swarmx_work_units SET state = 'IN_REVIEW' WHERE id = 'u-am'");
+      await expect(amendWorkUnitCompletion(db, { ...base, amendmentJson: amendment(["src/a.ts"], "r") }))
+        .rejects.toBeInstanceOf(AmendmentConflictError);
     });
   });
 });

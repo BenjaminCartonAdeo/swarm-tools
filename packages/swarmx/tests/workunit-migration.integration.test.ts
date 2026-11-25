@@ -547,8 +547,23 @@ describe("schema upgrade", () => {
     const fresh = await createLibSQLAdapter({ url: ":memory:" });
     await ensureWorkUnitSchema(fresh);
     await ensureWorkUnitSchema(fresh);
+    expect((await fresh.query<{ name: string }>("PRAGMA table_info(swarmx_work_units)")).rows.map((r) => r.name))
+      .toContain("completion_amendment_json");
     expect(await (async () => (await fresh.query<{ name: string }>("PRAGMA table_info(swarmx_legacy_assignments)")).rows.map((r) => r.name))()).toEqual(
       expect.arrayContaining(["mission_pk", "agent", "state", "updated_at"]),
     );
+  });
+
+  test("workUnitAmendmentColumnUpgradesIdempotently", async () => {
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    await db.exec(`CREATE TABLE swarmx_work_units (
+      id TEXT PRIMARY KEY, project TEXT NOT NULL, mission_pk TEXT NOT NULL, call_id TEXT NOT NULL, cell_id TEXT,
+      idem_key TEXT NOT NULL, attempt_no INTEGER NOT NULL, state TEXT NOT NULL, fence INTEGER NOT NULL DEFAULT 0,
+      evidence_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+    await db.query("INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, idem_key, attempt_no, state, evidence_json, created_at, updated_at) VALUES ('u', 'p', 'm', 'c', 'i', 1, 'SUBMITTED', '{}', 1, 1)");
+    await ensureWorkUnitSchema(db);
+    await ensureWorkUnitSchema(db);
+    expect((await db.query("SELECT id, evidence_json, completion_amendment_json FROM swarmx_work_units")).rows)
+      .toEqual([{ id: "u", evidence_json: "{}", completion_amendment_json: null }]);
   });
 });

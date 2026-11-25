@@ -935,3 +935,128 @@ export function finalizePublish(db: DatabaseAdapter, input: { unitId: string; un
 export function finalizeReturn(db: DatabaseAdapter, input: { unitId: string; unitFence: number }): Promise<WorkUnit> {
   return finalizeAfterEffect(db, input, "RETURNING", "CHANGES_REQUESTED", "backend_feedback");
 }
+
+// ---------------------------------------------------------------------------
+// Completion amendment, unit cancel and consolidation (Task 13d2).
+// ---------------------------------------------------------------------------
+
+export class AmendmentConflictError extends Error {
+  constructor(unitId: string) {
+    super(`WorkUnit ${unitId} completion amendment conflicts with its state, fence, worker or saved amendment`);
+    this.name = "AmendmentConflictError";
+  }
+}
+
+export interface CompletionAmendment {
+  version: 1;
+  filesTouched: string[];
+  reason: string;
+  amendedAt: number;
+  workerSessionId: string;
+  workerAgentId: string;
+}
+
+function stringArray(value: unknown): string[] | null {
+  return Array.isArray(value) && value.every((item) => typeof item === "string") ? [...value] : null;
+}
+
+export function parseCompletionAmendment(json: string | null | undefined): CompletionAmendment | null {
+  if (json === null || json === undefined) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed) || parsed.version !== 1) return null;
+  const files = stringArray(parsed.filesTouched);
+  if (files === null || typeof parsed.reason !== "string" || typeof parsed.amendedAt !== "number"
+    || typeof parsed.workerSessionId !== "string" || typeof parsed.workerAgentId !== "string") {
+    return null;
+  }
+  return {
+    version: 1, filesTouched: files, reason: parsed.reason, amendedAt: parsed.amendedAt,
+    workerSessionId: parsed.workerSessionId, workerAgentId: parsed.workerAgentId,
+  };
+}
+
+/** Valid amendment files first, otherwise the immutable submitted evidence files. */
+export function effectiveCompletionFiles(unit: Pick<WorkUnit, "evidence_json" | "completion_amendment_json">): string[] {
+  const amendment = parseCompletionAmendment(unit.completion_amendment_json);
+  if (amendment !== null) return amendment.filesTouched;
+  if (unit.evidence_json === null) return [];
+  try {
+    const evidence: unknown = JSON.parse(unit.evidence_json);
+    return (isRecord(evidence) ? stringArray(evidence.filesTouched) : null) ?? [];
+  } catch {
+    return [];
+  }
+}
+
+const sameFiles = (left: readonly string[], right: readonly string[]): boolean =>
+  left.length === right.length && left.every((file, index) => file === right[index]);
+
+/**
+ * SUBMITTED-only amendment by the bound worker at the exact fence. Evidence columns are never
+ * rewritten. A miss is idempotent only for a same-worker/same-files/same-reason replay.
+ */
+export async function amendWorkUnitCompletion(
+  db: DatabaseAdapter,
+  input: { unitId: string; expectedFence: number; workerSessionId: string; workerAgentId: string; amendmentJson: string },
+): Promise<WorkUnit> {
+  const requested = parseCompletionAmendment(input.amendmentJson);
+  if (requested === null || requested.workerSessionId !== input.workerSessionId
+    || requested.workerAgentId !== input.workerAgentId) {
+    throw new AmendmentConflictError(input.unitId);
+  }
+  const result = await db.query(
+    `UPDATE swarmx_work_units SET completion_amendment_json = ?, fence = fence + 1, updated_at = ?
+     WHERE id = ? AND state = 'SUBMITTED' AND fence = ? AND worker_session = ? AND worker_agent = ? RETURNING *`,
+    [input.amendmentJson, Date.now(), input.unitId, input.expectedFence, input.workerSessionId, input.workerAgentId],
+  );
+  const row: unknown = result.rows[0];
+  if (isRecord(row)) return row as unknown as WorkUnit;
+  const current = await getWorkUnit(db, input.unitId);
+  const saved = current === null ? null : parseCompletionAmendment(current.completion_amendment_json);
+  if (current !== null && saved !== null && current.state === "SUBMITTED"
+    && current.worker_session === input.workerSessionId && current.worker_agent === input.workerAgentId
+    && saved.workerSessionId === input.workerSessionId && saved.reason === requested.reason
+    && sameFiles(saved.filesTouched, requested.filesTouched)) {
+    return current;
+  }
+  throw new AmendmentConflictError(input.unitId);
+}
+
+/** Fenced SUBMITTED -> CANCELLED with a reason; a same-reason replay returns the cancelled row. */
+export async function cancelSubmittedWorkUnit(
+  db: DatabaseAdapter,
+  input: { unitId: string; unitFence: number; reason: string },
+): Promise<WorkUnit> {
+  try {
+    return await transitionWorkUnit(db, {
+      unitId: input.unitId, expectedState: "SUBMITTED", unitFence: input.unitFence,
+      nextState: "CANCELLED", patch: { kind: "cancel", reason: input.reason },
+    });
+  } catch (error) {
+    const current = await getWorkUnit(db, input.unitId);
+    if (current?.state === "CANCELLED" && current.reason === input.reason && current.fence === input.unitFence + 1) {
+      return current;
+    }
+    throw error;
+  }
+}
+
+/** Owner/fence guarded consolidation write, OPEN missions only. */
+export async function setMissionConsolidation(
+  db: DatabaseAdapter,
+  input: MissionCloseFence & { consolidationJson: string | null },
+): Promise<Mission> {
+  const result = await db.query(
+    `UPDATE swarmx_missions SET consolidation_json = ?, fence = fence + 1, updated_at = ?
+     WHERE id = ? AND session_id = ? AND fence = ? AND state = 'OPEN' RETURNING *`,
+    [input.consolidationJson, Date.now(), input.missionPk, input.ownerSessionId, input.expectedFence],
+  );
+  const row: unknown = result.rows[0];
+  if (isRecord(row)) return row as unknown as Mission;
+  throw new MissionFenceConflictError(input.missionPk, input.expectedFence);
+}

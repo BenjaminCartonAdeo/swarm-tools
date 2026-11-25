@@ -67,7 +67,8 @@ import {
 } from "./state";
 import type { MissionStateStore } from "./state";
 import { getMission, listUnits } from "./workunit/mission";
-import type { Mission } from "./workunit/schema";
+import type { Mission, WorkUnit } from "./workunit/schema";
+import { effectiveCompletionFiles, MissionNotDrainedError } from "./workunit/store";
 import { emitDecision, emitViolation } from "./session-events";
 import {
   LocalToolError,
@@ -1716,16 +1717,16 @@ async function runSetBudget(
 async function assertConsolidationComplete(
   runtime: SwarmxRuntime,
   sessionID: string,
-  mission: MissionState,
-  attempts: readonly DispatchAttempt[],
+  consolidationState: ConsolidationState | undefined,
+  attemptEpicIDs: Iterable<string | undefined>,
 ): Promise<void> {
   const epicIDs = new Set<string>();
-  if (mission.consolidation !== undefined) epicIDs.add(mission.consolidation.epicID);
-  for (const attempt of attempts) {
-    if (attempt.epicID !== undefined && attempt.epicID.length > 0) epicIDs.add(attempt.epicID);
+  if (consolidationState !== undefined) epicIDs.add(consolidationState.epicID);
+  for (const attemptEpicID of attemptEpicIDs) {
+    if (attemptEpicID !== undefined && attemptEpicID.length > 0) epicIDs.add(attemptEpicID);
   }
   for (const epicID of epicIDs) {
-    const consolidation = mission.consolidation?.epicID === epicID ? mission.consolidation : undefined;
+    const consolidation = consolidationState?.epicID === epicID ? consolidationState : undefined;
     if (consolidation?.status === "completed") continue;
     let children: readonly EpicChildCell[];
     try {
@@ -1858,6 +1859,7 @@ async function runFinish(
 ): Promise<ToolExecuteResult> {
   const reason = optionalStringInput("swarm_finish", input, "reason") ?? "";
   const abandon = input.abandon === true;
+  if (runtime.workUnit !== undefined) return runNativeFinish(runtime, context, input, reason, abandon);
   const { store, projectID, sessionID, projectRoot } = await requireMissionScope("swarm_finish", runtime, context);
   const targetSessionID = optionalStringInput("swarm_finish", input, "session_id");
   const allSessions = input.all_sessions === true;
@@ -1951,7 +1953,7 @@ async function runFinish(
       }
     }
     if (current.active && !abandon) {
-      await assertConsolidationComplete(runtime, sessionID, current, attempts);
+      await assertConsolidationComplete(runtime, sessionID, current.consolidation, attempts.map((attempt) => attempt.epicID));
     }
     let mission: MissionState | undefined;
     try {
@@ -2040,6 +2042,7 @@ async function runCancelCompletion(
   context: ToolExecuteContextLike,
   input: Record<string, unknown>,
 ): Promise<ToolExecuteResult> {
+  if (runtime.workUnit !== undefined) return runNativeCancelCompletion(runtime, context, input);
   const { store, projectID, sessionID } = await requireMissionScope("swarm_cancel_completion", runtime, context);
   const beadID = requireStringInput("swarm_cancel_completion", input, "bead_id");
   const reason = requireStringInput("swarm_cancel_completion", input, "reason");
@@ -2084,6 +2087,7 @@ async function runAmendCompletion(
   const beadID = requireStringInput("swarm_amend_completion", input, "bead_id");
   const reason = requireStringInput("swarm_amend_completion", input, "reason");
   const scope = await requireAssignedWorkerScope(runtime, context, "swarm_amend_completion");
+  if (runtime.workUnit !== undefined) return runNativeAmendCompletion(runtime, context, input, scope, beadID, reason);
   const { store, projectID } = requireStoreProject("swarm_amend_completion", runtime);
   const pending = await readPendingCompletion(store, projectID, beadID);
   if (
@@ -3692,6 +3696,11 @@ async function executeReviewFeedback(
   args: Record<string, unknown>,
   backendName: string,
 ): Promise<ToolExecuteResult> {
+  if (runtime.workUnit !== undefined) {
+    const native = await requireOpenNativeMission(runtime, context, "swarm_review_feedback");
+    const nativeKey = [native.projectID, native.sessionID].map(encodeURIComponent).join(":");
+    return withReviewDecisionLock(nativeKey, () => executeNativeReviewFeedback(runtime, context, args));
+  }
   const scope = await requireMissionScope("swarm_review_feedback", runtime, context);
   const taskID = requireStringInput("swarm_review_feedback", args, "task_id");
   const key = [scope.projectID, scope.sessionID].map(encodeURIComponent).join(":");
@@ -3888,7 +3897,7 @@ export function consolidationCreateArgs(input: {
  */
 async function prepareConsolidationCell(
   runtime: SwarmxRuntime,
-  store: MissionStateStore,
+  assign: (cellID: string) => Promise<unknown>,
   scope: {
     readonly projectID: string;
     readonly sessionID: string;
@@ -3926,9 +3935,7 @@ async function prepareConsolidationCell(
       "hive_create returned no consolidation cell id",
     );
   }
-  await setAssignment(store, scope.projectID, cellID, SWARM_WORKER_AGENT_ID, {
-    sessionID: scope.sessionID,
-  });
+  await assign(cellID);
   try {
     await runToolForSession(runtime, "hive_start", { id: cellID }, scope.sessionID, 60_000);
   } catch {
@@ -4173,7 +4180,9 @@ async function executeReviewFeedbackLocked(
         prepareCell: (cells) =>
           prepareConsolidationCell(
             runtime,
-            store,
+            (cellID) => setAssignment(store, receipt.projectID, cellID, SWARM_WORKER_AGENT_ID, {
+              sessionID: receipt.sessionID,
+            }),
             {
               projectID: receipt.projectID,
               sessionID: receipt.sessionID,
@@ -4248,6 +4257,596 @@ async function executeReviewFeedbackLocked(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Native WorkUnit completion / review / cancel / finish routing (Task 13d2).
+// Writes go through actor-checked MissionCommands only; reads use listUnits/getMission.
+// ---------------------------------------------------------------------------
+
+const NATIVE_TERMINAL_STATES: ReadonlySet<WorkUnit["state"]> = new Set([
+  "DONE", "CHANGES_REQUESTED", "REJECTED", "CANCELLED", "ABANDONED", "REVOKED", "FAILED",
+]);
+const NATIVE_PENDING_COMPLETION_STATES: ReadonlySet<WorkUnit["state"]> = new Set([
+  "SUBMITTED", "IN_REVIEW", "APPROVED", "PUBLISHING", "RETURNING",
+]);
+
+interface NativeEvidence {
+  readonly filesTouched: string[];
+  readonly summary: string;
+  readonly startTime: number;
+  readonly projectPath: string;
+  readonly epicID: string;
+  readonly workerAgentName: string;
+  readonly verification?: VerificationGateReceipt;
+}
+
+function nativeEvidence(unit: WorkUnit): NativeEvidence | undefined {
+  if (unit.evidence_json === null) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(unit.evidence_json);
+  } catch {
+    return undefined;
+  }
+  const record = asArguments(parsed);
+  if (
+    !Array.isArray(record.filesTouched) ||
+    typeof record.summary !== "string" ||
+    typeof record.startTime !== "number" ||
+    typeof record.projectPath !== "string" ||
+    typeof record.epicID !== "string" ||
+    typeof record.workerAgentName !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    filesTouched: record.filesTouched.filter((file): file is string => typeof file === "string"),
+    summary: record.summary,
+    startTime: record.startTime,
+    projectPath: record.projectPath,
+    epicID: record.epicID,
+    workerAgentName: record.workerAgentName,
+    ...(isVerificationGateReceipt(record.verification) ? { verification: record.verification } : {}),
+  };
+}
+
+function nativeConflict(tool: string, error: unknown): LocalToolError {
+  if (error instanceof LocalToolError) return error;
+  return new LocalToolError(tool, "conflict", error instanceof Error ? error.message : String(error));
+}
+
+async function requireOpenNativeMission(
+  runtime: SwarmxRuntime,
+  context: ToolExecuteContextLike,
+  tool: string,
+): Promise<WorkUnitMissionScope> {
+  const scope = await requireWorkUnitMissionScope(tool, runtime, context);
+  if (scope.mission.state !== "OPEN") {
+    throw new LocalToolError(tool, "not_found", "an active swarmx mission is required");
+  }
+  return scope;
+}
+
+/** Latest (highest attempt) unit of a cell in the mission. */
+function latestCellUnit(units: readonly WorkUnit[], cellID: string): WorkUnit | undefined {
+  return units
+    .filter((unit) => unit.cell_id === cellID)
+    .sort((left, right) => right.attempt_no - left.attempt_no)[0];
+}
+
+async function nativeWorkerUnit(
+  runtime: SwarmxRuntime,
+  worker: AssignedWorkerScope,
+  tool: string,
+): Promise<{ readonly unit: WorkUnit; readonly workUnit: NonNullable<SwarmxRuntime["workUnit"]> }> {
+  const workUnit = runtime.workUnit;
+  const projectID = resolveProjectID(runtime);
+  if (workUnit === undefined || projectID === undefined) {
+    throw new LocalToolError(tool, "runtime_unavailable", "WorkUnit runtime is not wired");
+  }
+  const mission = await getMission(workUnit.db, projectID, worker.parentMission.sessionID);
+  const unit = mission === null
+    ? undefined
+    : (await listUnits(workUnit.db, mission.id)).find((candidate) => candidate.call_id === worker.attemptCallID);
+  if (unit === undefined) {
+    throw new LocalToolError(tool, "conflict", "the worker dispatch has no WorkUnit in its parent mission");
+  }
+  return { unit, workUnit };
+}
+
+async function submitNativeCompletion(
+  runtime: SwarmxRuntime,
+  context: ToolExecuteContextLike,
+  args: Record<string, unknown>,
+  worker: AssignedWorkerScope,
+): Promise<ToolExecuteResult> {
+  if (context.sessionID === undefined) {
+    throw new LocalToolError("swarm_complete", "runtime_unavailable", "worker session is not available");
+  }
+  const { unit, workUnit } = await nativeWorkerUnit(runtime, worker, "swarm_complete");
+  const startTime = typeof args.start_time === "number" ? args.start_time : Date.now();
+  const verification = parseWorkerVerification(args.verification);
+  const filesTouched = Array.isArray(args.files_touched) ? (args.files_touched as string[]) : [];
+  const evidence = {
+    filesTouched,
+    summary: args.summary as string,
+    startTime,
+    projectPath: typeof args.project_key === "string" ? args.project_key : await canonicalProjectRoot("swarm_complete", runtime),
+    epicID: worker.marker.epicID,
+    workerAgentName: worker.agent.name,
+    // recordedAt is pinned so an identical replay hashes to the same evidence.
+    ...(verification === undefined ? {} : { verification: { ...verification, recordedAt: startTime } }),
+  };
+  try {
+    await workUnit.commands.submit({ kind: "worker", sessionId: context.sessionID }, { unitId: unit.id, evidence });
+  } catch (error) {
+    throw nativeConflict("swarm_complete", error);
+  }
+  return {
+    output: {
+      success: true,
+      status: "pending_review",
+      bead_id: worker.marker.cellID,
+      files_touched: filesTouched,
+      message: "Completion submitted; the coordinator must review the scoped diff before finalization.",
+    },
+    content: `Completion for ${worker.marker.cellID} submitted; awaiting coordinator review.`,
+  };
+}
+
+function amendableFiles(
+  projectPath: string,
+  requested: readonly string[],
+): { effective: string[]; excluded: Array<{ file: string; reason: string }> } {
+  const effective: string[] = [];
+  const excluded: Array<{ file: string; reason: string }> = [];
+  for (const file of requested) {
+    const tracked = Bun.spawnSync(["git", "ls-files", "--error-unmatch", "--", file], {
+      cwd: projectPath,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (tracked.exitCode !== 0) {
+      excluded.push({ file, reason: "untracked" });
+      continue;
+    }
+    const diff = Bun.spawnSync(["git", "diff", "HEAD", "--", file], {
+      cwd: projectPath,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (diff.stdout.toString().trim().length === 0) {
+      excluded.push({ file, reason: "no diff" });
+      continue;
+    }
+    effective.push(file);
+  }
+  return { effective, excluded };
+}
+
+async function runNativeAmendCompletion(
+  runtime: SwarmxRuntime,
+  context: ToolExecuteContextLike,
+  input: Record<string, unknown>,
+  worker: AssignedWorkerScope,
+  beadID: string,
+  reason: string,
+): Promise<ToolExecuteResult> {
+  const { unit, workUnit } = await nativeWorkerUnit(runtime, worker, "swarm_amend_completion");
+  const evidence = nativeEvidence(unit);
+  if (
+    context.sessionID === undefined ||
+    unit.cell_id !== beadID ||
+    unit.state !== "SUBMITTED" ||
+    unit.worker_session !== context.sessionID ||
+    evidence === undefined
+  ) {
+    throw new LocalToolError("swarm_amend_completion", "conflict", "no amendable pending completion for this worker");
+  }
+  const validated = await validateProjectFiles(
+    runtime,
+    "swarm_amend_completion",
+    { ...input, project_key: evidence.projectPath },
+    evidence.projectPath,
+  );
+  const { effective, excluded } = amendableFiles(evidence.projectPath, validated.files_touched as string[]);
+  try {
+    await workUnit.commands.amendCompletion(
+      { kind: "worker", sessionId: context.sessionID },
+      { unitId: unit.id, filesTouched: effective, reason },
+    );
+  } catch (error) {
+    throw nativeConflict("swarm_amend_completion", error);
+  }
+  return {
+    output: { bead_id: beadID, files_touched: effective, excluded, reason },
+    content: `Amended ${beadID}: effective files=${effective.length}, excluded=${excluded.length}`,
+  };
+}
+
+async function runNativeCancelCompletion(
+  runtime: SwarmxRuntime,
+  context: ToolExecuteContextLike,
+  input: Record<string, unknown>,
+): Promise<ToolExecuteResult> {
+  const scope = await requireWorkUnitMissionScope("swarm_cancel_completion", runtime, context);
+  const beadID = requireStringInput("swarm_cancel_completion", input, "bead_id");
+  const reason = requireStringInput("swarm_cancel_completion", input, "reason");
+  if (scope.mission.state !== "OPEN") {
+    throw new LocalToolError("swarm_cancel_completion", "not_found", "no active mission");
+  }
+  const unit = latestCellUnit(await listUnits(scope.runtime.db, scope.mission.id), beadID);
+  if (unit === undefined || !(unit.state === "SUBMITTED" || (unit.state === "CANCELLED" && unit.reason === reason))) {
+    throw new LocalToolError("swarm_cancel_completion", "not_found", "no pending completion for this cell in the active mission");
+  }
+  try {
+    await scope.runtime.commands.cancelCompletion(
+      { kind: "coordinator", sessionId: scope.sessionID },
+      { unitId: unit.id, reason },
+    );
+  } catch (error) {
+    throw nativeConflict("swarm_cancel_completion", error);
+  }
+  return {
+    output: { bead_id: beadID, canceled: true, reason },
+    content: `Pending completion for ${beadID} canceled: ${reason}`,
+  };
+}
+
+async function recordNativeScopedReview(
+  runtime: SwarmxRuntime,
+  context: ToolExecuteContextLike,
+  args: Record<string, unknown>,
+  output: unknown,
+): Promise<void> {
+  const scope = await requireOpenNativeMission(runtime, context, "swarm_review");
+  const projectRoot = await resolveProjectRoot("swarm_review", runtime);
+  if (projectRoot === undefined) {
+    throw new LocalToolError("swarm_review", "runtime_unavailable", "active project root is not wired");
+  }
+  const taskID = requireStringInput("swarm_review", args, "task_id");
+  const epicID = requireStringInput("swarm_review", args, "epic_id");
+  const filesTouched = args.files_touched as string[];
+  const check = checkScopedReviewDiff(output, filesTouched, projectRoot);
+  if (!check.ok) {
+    throw new LocalToolError("swarm_review", "conflict", `${scopedDiffFailureMessage(check.missing)} (${check.missing})`);
+  }
+  if (filesTouched.length > 0 && check.diff.trim().length === 0) {
+    throw new LocalToolError("swarm_review", "conflict", "scoped review diff is empty for the touched files");
+  }
+  const unit = latestCellUnit(await listUnits(scope.runtime.db, scope.mission.id), taskID);
+  const evidence = unit === undefined ? undefined : nativeEvidence(unit);
+  if (
+    unit === undefined ||
+    evidence === undefined ||
+    (unit.state !== "SUBMITTED" && unit.state !== "IN_REVIEW") ||
+    evidence.epicID !== epicID ||
+    !samePaths(effectiveCompletionFiles(unit), filesTouched)
+  ) {
+    throw new LocalToolError(
+      "swarm_review",
+      "conflict",
+      "review requires the assigned worker's matching completion submission and file list",
+    );
+  }
+  try {
+    await scope.runtime.commands.beginReview({ kind: "coordinator", sessionId: scope.sessionID }, { unitId: unit.id });
+  } catch (error) {
+    throw nativeConflict("swarm_review", error);
+  }
+}
+
+function parseNativeConsolidation(json: string | null): ConsolidationState | undefined {
+  if (json === null) return undefined;
+  try {
+    const record = asArguments(JSON.parse(json));
+    if (
+      typeof record.epicID === "string" &&
+      typeof record.cellID === "string" &&
+      (record.status === "ready" || record.status === "completed") &&
+      typeof record.createdAt === "number"
+    ) {
+      return record as unknown as ConsolidationState;
+    }
+  } catch {
+    // Malformed consolidation is treated as absent.
+  }
+  return undefined;
+}
+
+/** Native consolidation: prepare once all epic cells are finished, complete when its own cell is approved. */
+async function nativeConsolidation(
+  runtime: SwarmxRuntime,
+  scope: WorkUnitMissionScope,
+  input: { readonly taskID: string; readonly epicID: string; readonly files: readonly string[]; readonly agentID: string },
+): Promise<ConsolidationState | undefined> {
+  const actor = { kind: "coordinator" as const, sessionId: scope.sessionID };
+  const mission = await getMission(scope.runtime.db, scope.projectID, scope.sessionID);
+  if (mission === null || mission.state !== "OPEN") return undefined;
+  const current = parseNativeConsolidation(mission.consolidation_json);
+  if (current !== undefined) {
+    if (current.cellID !== input.taskID || current.status === "completed") return current;
+    const completed: ConsolidationState = { ...current, status: "completed" };
+    await scope.runtime.commands.setConsolidation(actor, {
+      missionPk: mission.id, expectedFence: Number(mission.fence), consolidation: completed,
+    });
+    return completed;
+  }
+  const cells = (await listEpicChildCells(runtime, scope.sessionID, input.epicID))
+    .filter((cell) => cell.id !== input.epicID);
+  if (cells.length === 0 || cells.some((cell) => !isConsolidationCellFinished(cell.status))) return undefined;
+  const prepared = await prepareConsolidationCell(
+    runtime,
+    (cellID) => scope.runtime.commands.assignCell(actor, { missionPk: mission.id, cellId: cellID, agent: input.agentID }),
+    { projectID: scope.projectID, sessionID: scope.sessionID, epicID: input.epicID, files: input.files },
+    cells,
+  );
+  const consolidation: ConsolidationState = {
+    epicID: input.epicID,
+    cellID: prepared.cellID,
+    status: "ready",
+    prompt: prepared.prompt,
+    createdAt: Date.now(),
+  };
+  const fresh = await getMission(scope.runtime.db, scope.projectID, scope.sessionID);
+  if (fresh === null) return undefined;
+  await scope.runtime.commands.setConsolidation(actor, {
+    missionPk: fresh.id, expectedFence: Number(fresh.fence), consolidation,
+  });
+  return consolidation;
+}
+
+async function executeNativeReviewFeedback(
+  runtime: SwarmxRuntime,
+  context: ToolExecuteContextLike,
+  args: Record<string, unknown>,
+): Promise<ToolExecuteResult> {
+  const tool = "swarm_review_feedback";
+  const scope = await requireOpenNativeMission(runtime, context, tool);
+  await validateProjectRoot(runtime, tool, args.project_key);
+  const taskID = requireStringInput(tool, args, "task_id");
+  const workerID = requireStringInput(tool, args, "worker_id");
+  const status = requireStringInput(tool, args, "status");
+  const unit = latestCellUnit(await listUnits(scope.runtime.db, scope.mission.id), taskID);
+  const evidence = unit === undefined ? undefined : nativeEvidence(unit);
+  if (
+    unit === undefined ||
+    evidence === undefined ||
+    unit.state !== "IN_REVIEW" ||
+    unit.review_by !== scope.sessionID ||
+    (workerID !== unit.worker_agent && workerID !== evidence.workerAgentName)
+  ) {
+    throw new LocalToolError(tool, "conflict", "a complete scoped review receipt is required before feedback");
+  }
+  const files = effectiveCompletionFiles(unit);
+  let diff = "";
+  if (files.length > 0) {
+    const currentDiff = await runToolForSession(
+      runtime,
+      "swarm_review",
+      { project_key: evidence.projectPath, epic_id: evidence.epicID, task_id: taskID, files_touched: files },
+      scope.sessionID,
+      120_000,
+    );
+    const check = checkScopedReviewDiff(currentDiff, files);
+    if (!check.ok) throw new LocalToolError(tool, "conflict", scopedDiffFailureMessage(check.missing));
+    diff = check.diff;
+  }
+  const diffHash = createHash("sha256").update(diff).digest("hex");
+  const docOnly = files.every(isDocOnlyPath);
+  const approval = status === "approved" || status === "unverifiable";
+  let verification = evidence.verification;
+  if (approval && verification === undefined && !docOnly) {
+    const local = runLocalVerification(evidence.projectPath, files);
+    if (local.passed) {
+      verification = { passed: true, summary: local.summary, steps: local.steps, recordedAt: Date.now() } as unknown as VerificationGateReceipt;
+    }
+  }
+  if (approval && verification === undefined && !docOnly) {
+    throw new LocalToolError(tool, "conflict", "a completion verification receipt is required before review approval");
+  }
+  const unverifiable = approval && verification === undefined;
+  const reviewStatus = unverifiable ? "unverifiable" : (status as "approved" | "unverifiable" | "needs_changes" | "rejected");
+  const workerSessionID = unit.worker_session ?? undefined;
+  scope.runtime.createEffectPorts({
+    runTool: (name, toolArgs) =>
+      name === "swarm_complete" && workerSessionID !== undefined
+        ? runToolForSession(runtime, name, toolArgs, workerSessionID, 120_000, evidence.projectPath)
+        : runToolForSession(runtime, name, toolArgs, scope.sessionID, 120_000),
+  } as Pick<SwarmxRuntime, "runTool">);
+  let result;
+  try {
+    result = await scope.runtime.commands.review({ kind: "coordinator", sessionId: scope.sessionID }, {
+      unitId: unit.id,
+      status: reviewStatus,
+      ...(approval && verification !== undefined
+        ? { receipt: { verification, diff_hash: diffHash, files_touched: files } }
+        : {}),
+      ...(status === "needs_changes" && args.issues !== undefined ? { feedback: args.issues } : {}),
+      ...(typeof args.reason === "string" ? { reason: args.reason } : {}),
+      summary: evidence.summary,
+      completionArgs: {
+        project_key: evidence.projectPath,
+        start_time: evidence.startTime,
+        files_touched: files,
+        skip_review: true,
+      },
+    });
+  } catch (error) {
+    throw nativeConflict(tool, error);
+  }
+  const effect = result.effects.find((candidate) =>
+    candidate.kind === (approval ? "backend_complete" : "backend_feedback"));
+  const approvalWarning = unverifiable
+    ? "Verification receipt unavailable; approved as unverifiable (documentation/assets only)."
+    : undefined;
+  let consolidation: ConsolidationState | undefined;
+  let consolidationError: string | undefined;
+  if (approval) {
+    emitDecision(runtime.sessionEvents, {
+      sessionID: scope.sessionID,
+      epicID: evidence.epicID,
+      decisionType: "review_approved",
+      payload: { task_id: taskID, status: reviewStatus, unverifiable, diff_hash: diffHash },
+    });
+    if (result.unit.state === "DONE") {
+      try {
+        // Native assignments hold the canonical roster id the dispatch gate binds against.
+        const consolidationAgent = (await loadRosterEntries(tool, runtime, context)).find(
+          (agent) => agent.id === SWARM_WORKER_AGENT_ID || agent.name === SWARM_WORKER_AGENT_ID,
+        )?.id ?? SWARM_WORKER_AGENT_ID;
+        consolidation = await nativeConsolidation(runtime, scope, {
+          taskID, epicID: evidence.epicID, files, agentID: consolidationAgent,
+        });
+      } catch (error) {
+        consolidationError = error instanceof Error ? error.message : String(error);
+      }
+      if (consolidation !== undefined) {
+        emitDecision(runtime.sessionEvents, {
+          sessionID: scope.sessionID,
+          epicID: consolidation.epicID,
+          decisionType: consolidation.status === "completed" ? "consolidation_completed" : "consolidation_ready",
+          payload: { cell_id: consolidation.cellID, status: consolidation.status },
+        });
+      }
+    }
+  }
+  return {
+    output: {
+      unit_state: result.unit.state,
+      ...(effect === undefined ? {} : { effect: { kind: effect.kind, state: effect.state, operation_id: effect.operation_id } }),
+      ...(approval
+        ? {
+            approval_evidence: {
+              diff_hash: diffHash,
+              ...(verification === undefined ? {} : { verification }),
+              status: reviewStatus,
+              ...(approvalWarning === undefined ? {} : { warning: approvalWarning }),
+            },
+          }
+        : {}),
+      ...(consolidation === undefined
+        ? {}
+        : {
+            consolidation: {
+              status: consolidation.status,
+              cell_id: consolidation.cellID,
+              ...(consolidation.prompt === undefined ? {} : { prompt: consolidation.prompt }),
+            },
+          }),
+      ...(consolidationError === undefined ? {} : { consolidation_error: consolidationError }),
+      ...(unverifiable ? { status: "unverifiable", warning: approvalWarning } : {}),
+    },
+    content: approval
+      ? result.unit.state === "DONE"
+        ? `Cell ${taskID} approved and finalized.${unverifiable ? " Warning: verification receipt unavailable; marked unverifiable." : ""}`
+        : `Cell ${taskID} approved; completion effect is ${effect?.state ?? "pending"}.`
+      : `Review feedback recorded for ${taskID}.`,
+  };
+}
+
+async function cleanupMissionWorktrees(
+  runtime: SwarmxRuntime,
+  projectRoot: string | undefined,
+  cellIDs: Iterable<string>,
+  sessionID: string,
+): Promise<Array<{ readonly type: "warning"; readonly code: "worktree_cleanup_failed" | "worktree_cleanup_skipped"; readonly taskID: string; readonly message: string }>> {
+  const warnings: Array<{ readonly type: "warning"; readonly code: "worktree_cleanup_failed" | "worktree_cleanup_skipped"; readonly taskID: string; readonly message: string }> = [];
+  for (const cellID of cellIDs) {
+    if (projectRoot === undefined) {
+      warnings.push({ type: "warning", code: "worktree_cleanup_skipped", taskID: cellID, message: "canonical project root is not wired" });
+      continue;
+    }
+    try {
+      const result = parseBackendObject(
+        await runToolForSession(runtime, "swarm_worktree_cleanup", { project_path: projectRoot, task_id: cellID }, sessionID, 120_000),
+      );
+      const nestedOutput = parseBackendObject(result.output);
+      const failure = [result, nestedOutput].find(
+        (candidate) =>
+          candidate.success === false || candidate.ok === false || candidate.isError === true || typeof candidate.error === "string",
+      );
+      if (failure !== undefined) {
+        throw new Error(typeof failure.error === "string" ? failure.error : "backend reported cleanup failure");
+      }
+    } catch (error) {
+      warnings.push({
+        type: "warning",
+        code: "worktree_cleanup_failed",
+        taskID: cellID,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return warnings;
+}
+
+async function runNativeFinish(
+  runtime: SwarmxRuntime,
+  context: ToolExecuteContextLike,
+  input: Record<string, unknown>,
+  reason: string,
+  abandon: boolean,
+): Promise<ToolExecuteResult> {
+  const tool = "swarm_finish";
+  const targetSessionID = optionalStringInput(tool, input, "session_id");
+  const sessionID = resolveSessionID(runtime, context);
+  if (input.all_sessions === true || (targetSessionID !== undefined && targetSessionID !== sessionID)) {
+    throw new LocalToolError(tool, "conflict", "native missions can only be closed by their owner session");
+  }
+  const scope = await requireWorkUnitMissionScope(tool, runtime, context);
+  const lockKey = [scope.projectID, scope.sessionID].map(encodeURIComponent).join(":");
+  return withReviewDecisionLock(lockKey, async () => {
+    const units = await listUnits(scope.runtime.db, scope.mission.id);
+    if (!abandon) {
+      if (units.some((unit) => NATIVE_PENDING_COMPLETION_STATES.has(unit.state))) {
+        throw new LocalToolError(tool, "conflict", "the mission has pending completion reviews");
+      }
+      if (units.some((unit) => !NATIVE_TERMINAL_STATES.has(unit.state))) {
+        throw new LocalToolError(tool, "conflict", "mission has unrevoked worker attempts");
+      }
+      if (scope.mission.state === "OPEN") {
+        await assertConsolidationComplete(
+          runtime,
+          scope.sessionID,
+          parseNativeConsolidation(scope.mission.consolidation_json),
+          units.map((unit) => (unit.evidence_json === null ? undefined : nativeEvidence(unit)?.epicID)),
+        );
+      }
+    }
+    const actor = { kind: "coordinator" as const, sessionId: scope.sessionID };
+    let mission: Mission;
+    try {
+      mission = abandon
+        ? await scope.runtime.commands.cancel(actor, { missionPk: scope.mission.id })
+        : await scope.runtime.commands.finish(actor, { missionPk: scope.mission.id });
+    } catch (error) {
+      if (error instanceof MissionNotDrainedError) {
+        throw new LocalToolError(tool, "conflict", "mission has unrevoked worker attempts");
+      }
+      throw nativeConflict(tool, error);
+    }
+    const cellIDs = new Set(units.flatMap((unit) => (unit.cell_id === null ? [] : [unit.cell_id])));
+    const warnings = await cleanupMissionWorktrees(
+      runtime,
+      await resolveProjectRoot(tool, runtime),
+      cellIDs,
+      scope.sessionID,
+    );
+    return {
+      output: {
+        sessionID: scope.sessionID,
+        finished: true,
+        active: mission.state === "OPEN" || mission.state === "CLOSING",
+        state: mission.state,
+        mode: mission.mode,
+        reason,
+        ...(warnings.length === 0 ? {} : { warnings }),
+      },
+      content: `Mission ${scope.sessionID} ${mission.state.toLowerCase()} (mode=${String(mission.mode)}).`,
+    };
+  });
+}
+
 async function resolveCallerMode(
   runtime: SwarmxRuntime,
   context: ToolExecuteContextLike,
@@ -4318,10 +4917,17 @@ async function requireAssignedWorkerScope(
     throw new LocalToolError(tool, "conflict", "the worker session is not bound to this dispatched worker session");
   }
 
-  const { store, projectID } = requireStoreProject(tool, runtime);
-  const assignment = await resolveAssignment(store, projectID, marker.cellID, undefined, {
-    sessionID: parentSessionID,
-  });
+  let assignment: string | undefined;
+  if (runtime.workUnit !== undefined) {
+    // Native path: the WorkUnit's bound worker_agent is authoritative and is
+    // checked by resolveParentMissionForWorker against this caller.
+    assignment = context.agent;
+  } else {
+    const { store, projectID } = requireStoreProject(tool, runtime);
+    assignment = await resolveAssignment(store, projectID, marker.cellID, undefined, {
+      sessionID: parentSessionID,
+    });
+  }
   if (assignment === undefined) {
     throw new LocalToolError(tool, "conflict", "the dispatched cell has no persisted agent assignment");
   }
@@ -4370,7 +4976,7 @@ async function resolveParentMissionForWorker(
     if (unit === undefined) {
       throw new LocalToolError(tool, "conflict", "the worker prompt is not bound to a dispatched cell in its parent mission");
     }
-    if (unit.state === "BOUND") {
+    if (unit.state === "BOUND" || unit.state === "SUBMITTED") {
       if (unit.worker_session !== workerSessionID) {
         throw new LocalToolError(tool, "conflict", "the dispatch capability is already bound to another worker session");
       }
@@ -4889,7 +5495,9 @@ async function executeSpec(
       args,
       await validateProjectRoot(runtime, "swarm_complete", args.project_key),
     );
-    return submitPendingCompletion(runtime, context, args, scope);
+    return runtime.workUnit !== undefined
+      ? submitNativeCompletion(runtime, context, args, scope)
+      : submitPendingCompletion(runtime, context, args, scope);
   }
   if (spec.name === "swarmmail_init") {
     args = await bindSwarmMailIdentity(runtime, context, args);
@@ -4908,7 +5516,11 @@ async function executeSpec(
   }
   if (spec.name === "swarm_review") {
     args = await validateReviewScope(runtime, args);
-    await activeMissionScope(runtime, context, "swarm_review");
+    if (runtime.workUnit !== undefined) {
+      await requireOpenNativeMission(runtime, context, "swarm_review");
+    } else {
+      await activeMissionScope(runtime, context, "swarm_review");
+    }
   }
   if (spec.name === "swarm_review_feedback") {
     const backendName = spec.backendName;
@@ -4982,7 +5594,9 @@ async function executeSpec(
       }
       if (isReview) {
         output = enrichReviewOutputWithNewFiles(output, files, runtime.projectPath ?? projectRoot);
-        await recordScopedReview(runtime, context, args, output);
+        await (runtime.workUnit !== undefined
+          ? recordNativeScopedReview(runtime, context, args, output)
+          : recordScopedReview(runtime, context, args, output));
       }
     } finally {
       // No-op: no git staging was performed, so nothing to reset.

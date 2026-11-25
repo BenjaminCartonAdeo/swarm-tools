@@ -93,6 +93,8 @@ export interface WorkUnit {
   review_by: string | null;
   review_feedback_json: string | null;
   verification_receipt_json: string | null;
+  /** Latest worker amendment of the submitted file list; evidence columns stay immutable. */
+  completion_amendment_json: string | null;
   reason: string | null;
   error_json: string | null;
   legacy_source: string | null;
@@ -164,6 +166,7 @@ const schemaStatements = [
     review_by TEXT,
     review_feedback_json TEXT,
     verification_receipt_json TEXT,
+    completion_amendment_json TEXT,
     reason TEXT,
     error_json TEXT,
     legacy_source TEXT,
@@ -224,6 +227,7 @@ type UpgradableColumn =
       ddl: "TEXT";
     }
   | { table: "swarmx_effects"; column: "request_json"; ddl: "TEXT" }
+  | { table: "swarmx_work_units"; column: "completion_amendment_json"; ddl: "TEXT" }
   | { table: "swarmx_legacy_assignments"; column: "mission_pk" | "agent" | "state"; ddl: "TEXT" }
   | { table: "swarmx_legacy_assignments"; column: "updated_at"; ddl: "INTEGER" };
 
@@ -234,6 +238,7 @@ const upgradableColumns: readonly UpgradableColumn[] = [
   { table: "swarmx_missions", column: "consolidation_json", ddl: "TEXT" },
   { table: "swarmx_missions", column: "retry_causes_json", ddl: "TEXT" },
   { table: "swarmx_effects", column: "request_json", ddl: "TEXT" },
+  { table: "swarmx_work_units", column: "completion_amendment_json", ddl: "TEXT" },
   { table: "swarmx_legacy_assignments", column: "mission_pk", ddl: "TEXT" },
   { table: "swarmx_legacy_assignments", column: "agent", ddl: "TEXT" },
   { table: "swarmx_legacy_assignments", column: "state", ddl: "TEXT" },

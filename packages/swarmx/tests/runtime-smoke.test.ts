@@ -37,9 +37,9 @@ import {
   type MissionStorageLike,
 } from "../src/state";
 import { UnsupportedToolError, type CellMarker } from "../src/types";
-import { createMission, listUnits } from "../src/workunit/mission";
+import { createMission, getMission, listUnits } from "../src/workunit/mission";
 import type { MissionActor } from "../src/workunit/commands";
-import { AssignmentMismatchError, BudgetGateError } from "../src/workunit/store";
+import { AssignmentMismatchError, BudgetGateError, getWorkUnit } from "../src/workunit/store";
 import {
   createFakeContext,
   type FakeAgentInfo,
@@ -3875,5 +3875,345 @@ describe("WorkUnit runtime setup (additive)", () => {
     } finally {
       await db.close?.();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 13d2: native WorkUnit completion / review / cancel / finish routing.
+// ---------------------------------------------------------------------------
+
+interface NativeProject {
+  readonly path: string;
+  readonly cleanup: () => Promise<void>;
+}
+
+function git(cwd: string, ...args: string[]): void {
+  const result = Bun.spawnSync(["git", "-c", "user.email=t@example.com", "-c", "user.name=t", ...args], {
+    cwd, stdout: "pipe", stderr: "pipe",
+  });
+  if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString()}`);
+}
+
+/** Temp git repo with one code file and one doc file, both modified after the initial commit. */
+async function createNativeProject(): Promise<NativeProject> {
+  const path = await realpath(await mkdtemp(join(tmpdir(), "swarmx-native-")));
+  Bun.spawnSync(["mkdir", "-p", join(path, "src"), join(path, "docs")]);
+  await writeFile(join(path, "src/a.ts"), "export const a = 1;\n");
+  await writeFile(join(path, "docs/guide.md"), "# Guide\n");
+  git(path, "init", "-q");
+  git(path, "add", ".");
+  git(path, "commit", "-q", "-m", "init");
+  await writeFile(join(path, "src/a.ts"), "export const a = 2;\n");
+  await writeFile(join(path, "docs/guide.md"), "# Guide v2\n");
+  return { path, cleanup: () => rm(path, { recursive: true, force: true }) };
+}
+
+function fileDiff(file: string): string {
+  return [`diff --git a/${file} b/${file}`, "@@ -1 +1 @@", "-old", "+new"].join("\n");
+}
+
+interface NativeRig {
+  readonly rig: Rig;
+  readonly native: { readonly runtime: WorkUnitRuntime; readonly missionPk: string };
+  readonly project: NativeProject;
+  readonly hive: Map<string, { status: string; completion_operation_id?: string }>;
+}
+
+async function createNativeRig(options: { readonly feedbackSucceeds?: boolean } = {}): Promise<NativeRig> {
+  const native = await createNativeMission();
+  const project = await createNativeProject();
+  const hive = new Map<string, { status: string; completion_operation_id?: string }>();
+  const rig = await createRig({
+    agents: GATE_AGENTS,
+    projectPath: project.path,
+    workUnit: native.runtime,
+    payloadFor: (name, args) => {
+      if (name === "swarm_review") {
+        const files = (args.files_touched as string[]) ?? [];
+        return scopedReviewPayload(files, files.map(fileDiff).join("\n"));
+      }
+      if (name === "swarm_complete") {
+        const cell = String(args.bead_id);
+        hive.set(cell, { status: "closed", completion_operation_id: String(args.operation_id) });
+        return { success: true };
+      }
+      if (name === "hive_cells") {
+        const id = typeof args.id === "string" ? args.id : undefined;
+        if (id !== undefined) return [{ id, ...(hive.get(id) ?? { status: "in_progress" }) }];
+        return [...hive.entries()].map(([cellID, cell]) => ({ id: cellID, ...cell }));
+      }
+      if (name === "hive_create") return { id: "cell-consolidate" };
+      if (name === "swarm_review_feedback") {
+        return options.feedbackSucceeds === false ? { success: false, error: "rejected" } : { success: true };
+      }
+      return { ok: true };
+    },
+  });
+  return { rig, native, project, hive };
+}
+
+async function nativeDispatch(n: NativeRig, cellID: string, callID: string, workerSessionID = "ses-worker"): Promise<void> {
+  await n.native.runtime.commands.assignCell(nativeCoordinator, {
+    missionPk: n.native.missionPk, cellId: cellID, agent: "swarm/swarm-worker",
+  });
+  const payload = workerDispatchPayload(cellID, callID);
+  await n.rig.before(payload);
+  const marker = extractCellMarker(payload.input);
+  await n.rig.after({ ...payload, status: "completed", result: { sessionID: workerSessionID } });
+  n.rig.bindWorkerSession(workerSessionID, marker, SESSION);
+}
+
+const WORKER_VERIFICATION = [{ name: "tests", command: "bun test", exit_code: 0, output: "ok" }];
+
+async function nativeSubmit(
+  n: NativeRig,
+  cellID: string,
+  files: readonly string[],
+  extra: Record<string, unknown> = {},
+  workerSessionID = "ses-worker",
+): Promise<unknown> {
+  const result = await n.rig.tools.get("swarm_complete")?.execute(
+    {
+      project_key: n.project.path, agent_name: "swarm-worker", bead_id: cellID,
+      summary: `Completed ${cellID}.`, start_time: 1, files_touched: [...files], ...extra,
+    },
+    workerToolContext("swarm/swarm-worker", `call-complete-${cellID}`, workerSessionID),
+  );
+  return result?.output;
+}
+
+async function nativeReview(n: NativeRig, cellID: string, files: readonly string[]): Promise<void> {
+  await n.rig.tools.get("swarm_review")?.execute(
+    { project_key: n.project.path, epic_id: "epic-1", task_id: cellID, files_touched: [...files] },
+    toolContext("swarm/swarm-coordinator", `call-review-${cellID}`),
+  );
+}
+
+async function nativeFeedback(n: NativeRig, cellID: string, status: string, extra: Record<string, unknown> = {}) {
+  return n.rig.tools.get("swarm_review_feedback")?.execute(
+    { project_key: n.project.path, task_id: cellID, worker_id: "swarm/swarm-worker", status, summary: "reviewed", ...extra },
+    toolContext("swarm/swarm-coordinator", `call-feedback-${cellID}-${status}`),
+  );
+}
+
+async function nativeUnit(n: NativeRig, cellID: string) {
+  const units = (await listUnits(n.native.runtime.db, n.native.missionPk)).filter((unit) => unit.cell_id === cellID);
+  return units[units.length - 1]!;
+}
+
+async function nativeEffects(n: NativeRig, unitID: string): Promise<Record<string, unknown>[]> {
+  return (await n.native.runtime.db.query("SELECT kind, state, operation_id, request_json FROM swarmx_effects WHERE unit_id = ? ORDER BY kind", [unitID]))
+    .rows as Record<string, unknown>[];
+}
+
+describe("WorkUnit completion lifecycle", () => {
+  const rigs: NativeRig[] = [];
+  afterEach(async () => {
+    for (const n of rigs.splice(0)) await n.project.cleanup();
+  });
+  async function nativeRig(options: { readonly feedbackSucceeds?: boolean } = {}): Promise<NativeRig> {
+    const n = await createNativeRig(options);
+    rigs.push(n);
+    return n;
+  }
+
+  test("WorkUnit dispatch→submit→amend→review→complete uses the amended files everywhere", async () => {
+    const n = await nativeRig();
+    await nativeDispatch(n, "cell-a", "call-a");
+    expect(await nativeSubmit(n, "cell-a", ["src/a.ts", "docs/guide.md"])).toMatchObject({ status: "pending_review" });
+    const submitted = await nativeUnit(n, "cell-a");
+    expect(submitted.state).toBe("SUBMITTED");
+    expect(await n.rig.ctx.storage.get(pendingCompletionKey(PROJECT, "cell-a"))).toBeUndefined();
+
+    // Revert the code file so only the doc file still carries a diff.
+    git(n.project.path, "checkout", "--", "src/a.ts");
+    const amended = await n.rig.tools.get("swarm_amend_completion")?.execute(
+      { bead_id: "cell-a", reason: "code change reverted", files_touched: ["src/a.ts", "docs/guide.md"] },
+      workerToolContext("swarm/swarm-worker", "call-amend-a"),
+    );
+    expect(amended?.output).toMatchObject({ files_touched: ["docs/guide.md"], excluded: [{ file: "src/a.ts", reason: "no diff" }] });
+    const afterAmend = await nativeUnit(n, "cell-a");
+    expect(afterAmend).toMatchObject({
+      state: "SUBMITTED",
+      fence: submitted.fence + 1,
+      evidence_json: submitted.evidence_json,
+      evidence_hash: submitted.evidence_hash,
+      diff_hash: submitted.diff_hash,
+    });
+
+    // The review must name the effective (amended) files, not the submitted ones.
+    await expect(nativeReview(n, "cell-a", ["src/a.ts", "docs/guide.md"])).rejects.toThrow(/matching completion/);
+    await nativeReview(n, "cell-a", ["docs/guide.md"]);
+    expect((await nativeUnit(n, "cell-a")).state).toBe("IN_REVIEW");
+
+    const feedback = await nativeFeedback(n, "cell-a", "approved");
+    expect(feedback?.output).toMatchObject({ unit_state: "DONE", status: "unverifiable", approval_evidence: { status: "unverifiable" } });
+    const done = await nativeUnit(n, "cell-a");
+    expect(done).toMatchObject({ state: "DONE", review_verdict: "unverifiable", verification_receipt_json: null, evidence_json: submitted.evidence_json });
+    const [effect] = await nativeEffects(n, done.id);
+    expect(effect).toMatchObject({ kind: "backend_complete", state: "succeeded", operation_id: `op:${done.id}:backend_complete` });
+    expect(JSON.parse(String(effect?.request_json))).toMatchObject({
+      bead_id: "cell-a", agent_name: "swarm/swarm-worker", files_touched: ["docs/guide.md"], summary: "Completed cell-a.",
+    });
+    const reviewCalls = n.rig.runCalls.filter((call) => call.name === "swarm_review");
+    expect(reviewCalls.at(-1)?.args.files_touched).toEqual(["docs/guide.md"]);
+    expect(n.rig.runCalls.filter((call) => call.name === "swarm_complete").map((call) => call.args.files_touched))
+      .toEqual([["docs/guide.md"]]);
+  });
+
+  test("WorkUnit ReceiptAndEffects: code approval needs a receipt and persists it before the effect", async () => {
+    const n = await nativeRig();
+    await nativeDispatch(n, "cell-a", "call-a");
+    await nativeSubmit(n, "cell-a", ["src/a.ts"]);
+    await nativeReview(n, "cell-a", ["src/a.ts"]);
+    await expect(nativeFeedback(n, "cell-a", "approved")).rejects.toThrow(/verification receipt/);
+    expect(await nativeEffects(n, (await nativeUnit(n, "cell-a")).id)).toEqual([]);
+
+    await nativeDispatch(n, "cell-b", "call-b", "ses-worker-b");
+    await nativeSubmit(n, "cell-b", ["src/a.ts"], { verification: WORKER_VERIFICATION }, "ses-worker-b");
+    await nativeReview(n, "cell-b", ["src/a.ts"]);
+    const feedback = await nativeFeedback(n, "cell-b", "approved");
+    expect(feedback?.output).toMatchObject({ unit_state: "DONE", approval_evidence: { status: "approved" } });
+    const done = await nativeUnit(n, "cell-b");
+    const receipt = JSON.parse(String(done.verification_receipt_json));
+    expect(receipt).toMatchObject({ files_touched: ["src/a.ts"], verification: { passed: true } });
+    expect(receipt.diff_hash).toMatch(/^[a-f0-9]{64}$/);
+    expect(await nativeEffects(n, done.id)).toMatchObject([
+      { kind: "backend_complete", state: "succeeded", operation_id: `op:${done.id}:backend_complete` },
+    ]);
+  });
+
+  test("WorkUnit needsChanges clears the worker, drains feedback and allows an explicit retry", async () => {
+    const n = await nativeRig();
+    await nativeDispatch(n, "cell-a", "call-a");
+    await nativeSubmit(n, "cell-a", ["src/a.ts"]);
+    await nativeReview(n, "cell-a", ["src/a.ts"]);
+    const feedback = await nativeFeedback(n, "cell-a", "needs_changes", { issues: "fix it" });
+    expect(feedback?.output).toMatchObject({ unit_state: "CHANGES_REQUESTED", effect: { kind: "backend_feedback", state: "succeeded" } });
+    const returned = await nativeUnit(n, "cell-a");
+    expect(returned).toMatchObject({ state: "CHANGES_REQUESTED", worker_session: null, review_verdict: "needs_changes" });
+    const [effect] = await nativeEffects(n, returned.id);
+    expect(JSON.parse(String(effect?.request_json))).toMatchObject({ task_id: "cell-a", status: "needs_changes", issues: "fix it" });
+
+    const retry = await n.native.runtime.commands.retry(nativeCoordinator, {
+      priorUnitId: returned.id, workerAgent: "swarm/swarm-worker", callId: "call-a-retry", dispatchToken: "tok-retry", budgetCharge: 1,
+    });
+    expect(retry).toMatchObject({ state: "RESERVED", attempt_no: 2, retry_of: returned.id, worker_agent: "swarm/swarm-worker" });
+  });
+
+  test("WorkUnit unit cancel goes SUBMITTED→CANCELLED through cancelCompletion", async () => {
+    const n = await nativeRig();
+    await nativeDispatch(n, "cell-a", "call-a");
+    await nativeSubmit(n, "cell-a", ["src/a.ts"]);
+    const unitID = (await nativeUnit(n, "cell-a")).id;
+    await expect(n.native.runtime.commands.cancelCompletion({ kind: "worker", sessionId: "ses-worker" }, { unitId: unitID, reason: "x" }))
+      .rejects.toThrow(/Coordinator command/);
+    const result = await n.rig.tools.get("swarm_cancel_completion")?.execute(
+      { bead_id: "cell-a", reason: "scope dropped" },
+      toolContext("swarm/swarm-coordinator", "call-cancel-a"),
+    );
+    expect(result?.output).toEqual({ bead_id: "cell-a", canceled: true, reason: "scope dropped" });
+    expect(await getWorkUnit(n.native.runtime.db, unitID)).toMatchObject({ state: "CANCELLED", reason: "scope dropped" });
+    await expect(n.rig.tools.get("swarm_amend_completion")?.execute(
+      { bead_id: "cell-a", reason: "late", files_touched: ["src/a.ts"] },
+      workerToolContext("swarm/swarm-worker", "call-amend-late"),
+    )).rejects.toThrow();
+  });
+
+  test("WorkUnit MissionBarrier: finish refuses pending reviews, then closes; abandon cascades", async () => {
+    const n = await nativeRig();
+    await nativeDispatch(n, "cell-a", "call-a");
+    await nativeSubmit(n, "cell-a", ["docs/guide.md"]);
+    const finish = n.rig.tools.get("swarm_finish");
+    await expect(finish?.execute({}, toolContext("swarm/swarm-coordinator", "call-finish-1"))).rejects.toThrow(/pending completion reviews/);
+    expect((await getMission(n.native.runtime.db, PROJECT, SESSION))?.state).toBe("OPEN");
+    await nativeReview(n, "cell-a", ["docs/guide.md"]);
+    await nativeFeedback(n, "cell-a", "unverifiable");
+    const finished = await finish?.execute({}, toolContext("swarm/swarm-coordinator", "call-finish-2"));
+    expect(finished?.output).toMatchObject({ finished: true, active: false, state: "FINISHED" });
+
+    const other = await nativeRig();
+    await nativeDispatch(other, "cell-b", "call-b");
+    await nativeSubmit(other, "cell-b", ["src/a.ts"]);
+    const abandoned = await other.rig.tools.get("swarm_finish")?.execute(
+      { abandon: true, reason: "stop" },
+      toolContext("swarm/swarm-coordinator", "call-abandon"),
+    );
+    expect(abandoned?.output).toMatchObject({ state: "CANCELLED" });
+    expect(await nativeUnit(other, "cell-b")).toMatchObject({ state: "CANCELLED", reason: "mission_cancel" });
+  });
+
+  test("WorkUnit Consolidation is prepared and completed through setConsolidation", async () => {
+    const n = await nativeRig();
+    await nativeDispatch(n, "cell-a", "call-a");
+    await nativeSubmit(n, "cell-a", ["docs/guide.md"]);
+    await nativeReview(n, "cell-a", ["docs/guide.md"]);
+    const feedback = await nativeFeedback(n, "cell-a", "approved");
+    expect(feedback?.output).toMatchObject({ consolidation: { status: "ready", cell_id: "cell-consolidate" } });
+    const mission = await getMission(n.native.runtime.db, PROJECT, SESSION);
+    expect(JSON.parse(String(mission?.consolidation_json))).toMatchObject({ epicID: "epic-1", cellID: "cell-consolidate", status: "ready" });
+    const assignment = await n.native.runtime.db.query(
+      "SELECT agent, state FROM swarmx_legacy_assignments WHERE cell_id = 'cell-consolidate'",
+    );
+    expect(assignment.rows).toEqual([{ agent: "swarm/swarm-worker", state: "assigned" }]);
+
+    await expect(n.native.runtime.commands.setConsolidation(
+      { kind: "coordinator", sessionId: "ses-intruder" },
+      { missionPk: n.native.missionPk, expectedFence: Number(mission?.fence), consolidation: null },
+    )).rejects.toThrow(/does not own/);
+    await expect(n.native.runtime.commands.setConsolidation(
+      nativeCoordinator,
+      { missionPk: n.native.missionPk, expectedFence: Number(mission?.fence) - 1, consolidation: null },
+    )).rejects.toThrow(/fence/);
+
+    await nativeDispatch(n, "cell-consolidate", "call-consolidate", "ses-worker-c");
+    await nativeSubmit(n, "cell-consolidate", ["docs/guide.md"], {}, "ses-worker-c");
+    await nativeReview(n, "cell-consolidate", ["docs/guide.md"]);
+    await nativeFeedback(n, "cell-consolidate", "approved");
+    const completed = await getMission(n.native.runtime.db, PROJECT, SESSION);
+    expect(JSON.parse(String(completed?.consolidation_json))).toMatchObject({ status: "completed" });
+
+    await n.rig.tools.get("swarm_finish")?.execute({}, toolContext("swarm/swarm-coordinator", "call-finish"));
+    await expect(n.native.runtime.commands.setConsolidation(
+      nativeCoordinator,
+      { missionPk: n.native.missionPk, expectedFence: Number((await getMission(n.native.runtime.db, PROJECT, SESSION))?.fence ?? 0), consolidation: null },
+    )).rejects.toThrow();
+  });
+
+  test("WorkUnit wrong-worker and non-owner negatives are refused", async () => {
+    const n = await nativeRig();
+    await nativeDispatch(n, "cell-a", "call-a");
+    await nativeSubmit(n, "cell-a", ["src/a.ts", "docs/guide.md"]);
+    const unitID = (await nativeUnit(n, "cell-a")).id;
+    await expect(n.native.runtime.commands.amendCompletion(
+      { kind: "worker", sessionId: "ses-other" }, { unitId: unitID, filesTouched: ["docs/guide.md"], reason: "r" },
+    )).rejects.toThrow(/not bound/);
+    await expect(n.native.runtime.commands.amendCompletion(
+      nativeCoordinator, { unitId: unitID, filesTouched: ["docs/guide.md"], reason: "r" },
+    )).rejects.toThrow(/worker actor/);
+    await expect(n.native.runtime.commands.beginReview({ kind: "coordinator", sessionId: "ses-intruder" }, { unitId: unitID }))
+      .rejects.toThrow(/does not own/);
+    await expect(nativeFeedback(n, "cell-a", "approved")).rejects.toThrow(/scoped review receipt/);
+    expect((await nativeUnit(n, "cell-a")).state).toBe("SUBMITTED");
+  });
+
+  test("legacyRuntimeWithoutWorkUnitKeepsCompletionBehavior", async () => {
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath: await realpath(process.cwd()),
+      workerCell: { cellID: "cell-a", epicID: "epic-1" },
+    });
+    await dispatchWorker(rig, "cell-a", "call-legacy");
+    const output = await rig.tools.get("swarm_complete")?.execute(
+      {
+        project_key: await realpath(process.cwd()), agent_name: "swarm-worker", bead_id: "cell-a",
+        summary: "Legacy completion.", start_time: 1, files_touched: [SWARMX_FILE],
+      },
+      workerToolContext("swarm/swarm-worker", "call-legacy-complete"),
+    );
+    expect(output?.output).toMatchObject({ status: "pending_review" });
+    expect(await rig.ctx.storage.get(pendingCompletionKey(PROJECT, "cell-a"))).toMatchObject({
+      taskID: "cell-a", workerSessionID: "ses-worker", filesTouched: [SWARMX_FILE],
+    });
   });
 });

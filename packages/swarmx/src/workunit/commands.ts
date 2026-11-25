@@ -33,7 +33,13 @@ import {
   startPublishing,
   submitWorkUnit,
   FenceConflictError,
+  amendWorkUnitCompletion,
+  cancelSubmittedWorkUnit,
+  effectiveCompletionFiles,
+  setMissionConsolidation,
 } from "./store.js";
+
+export { effectiveCompletionFiles };
 
 export type MissionActor = { kind: "worker"; sessionId: string } | { kind: "coordinator"; sessionId: string };
 
@@ -92,6 +98,9 @@ export interface MissionCommands {
   retry(actor: MissionActor, input: { priorUnitId: string; workerAgent: string; callId: string; dispatchToken: string; budgetCharge: number }): Promise<WorkUnit>;
   assignCell(actor: MissionActor, input: { missionPk: string; cellId: string; agent: string }): Promise<AssignmentRow>;
   releaseAssignment(actor: MissionActor, input: { missionPk: string; cellId: string }): Promise<AssignmentRow>;
+  amendCompletion(actor: MissionActor, input: { unitId: string; filesTouched: string[]; reason: string }): Promise<WorkUnit>;
+  cancelCompletion(actor: MissionActor, input: { unitId: string; reason: string }): Promise<WorkUnit>;
+  setConsolidation(actor: MissionActor, input: { missionPk: string; expectedFence: number; consolidation: unknown }): Promise<Mission>;
 }
 
 export interface MissionCommandsOptions {
@@ -125,13 +134,7 @@ function isDocOnlyPath(path: string): boolean {
 
 function docOnlyEvidence(unit: WorkUnit): boolean {
   if (unit.evidence_json === null) return false;
-  try {
-    const evidence: unknown = JSON.parse(unit.evidence_json);
-    if (!isRecord(evidence) || !Array.isArray(evidence.filesTouched)) return false;
-    return evidence.filesTouched.every((path) => typeof path === "string" && isDocOnlyPath(path));
-  } catch {
-    return false;
-  }
+  return effectiveCompletionFiles(unit).every((path) => isDocOnlyPath(path));
 }
 
 /** Builds the review intent, decision and deterministic effects for an IN_REVIEW unit. */
@@ -342,6 +345,36 @@ export function createMissionCommands(db: DatabaseAdapter, opts: MissionCommands
       const mission = await ownedMission(actor, input.missionPk);
       return releaseMissionAssignment(db, {
         project: mission.project, cellId: input.cellId, missionPk: mission.id, ownerSessionId: actor.sessionId,
+      });
+    },
+    async amendCompletion(actor, input) {
+      if (actor.kind !== "worker") throw new MissionActorError("Amendment requires the bound worker actor");
+      const unit = await getWorkUnit(db, input.unitId);
+      if (unit === null) throw new FenceConflictError(input.unitId, "SUBMITTED", -1);
+      if (unit.worker_session !== actor.sessionId || unit.worker_agent === null) {
+        throw new MissionActorError(`Worker ${actor.sessionId} is not bound to WorkUnit ${unit.id}`);
+      }
+      if (unit.state !== "SUBMITTED") throw new FenceConflictError(unit.id, "SUBMITTED", unit.fence);
+      return amendWorkUnitCompletion(db, {
+        unitId: unit.id, expectedFence: unit.fence, workerSessionId: actor.sessionId, workerAgentId: unit.worker_agent,
+        amendmentJson: JSON.stringify({
+          version: 1, filesTouched: input.filesTouched, reason: input.reason, amendedAt: Date.now(),
+          workerSessionId: actor.sessionId, workerAgentId: unit.worker_agent,
+        }),
+      });
+    },
+    async cancelCompletion(actor, input) {
+      const { unit } = await ownedUnit(actor, input.unitId);
+      if (unit.state === "CANCELLED" && unit.reason === input.reason) return unit;
+      if (unit.state !== "SUBMITTED") throw new FenceConflictError(unit.id, "SUBMITTED", unit.fence);
+      return cancelSubmittedWorkUnit(db, { unitId: unit.id, unitFence: unit.fence, reason: input.reason });
+    },
+    async setConsolidation(actor, input) {
+      const mission = await ownedMission(actor, input.missionPk);
+      if (mission.state !== "OPEN") throw new MissionClosedError(input.missionPk);
+      return setMissionConsolidation(db, {
+        missionPk: mission.id, expectedFence: input.expectedFence, ownerSessionId: actor.sessionId,
+        consolidationJson: input.consolidation === null ? null : canonicalJson(input.consolidation),
       });
     },
   };
