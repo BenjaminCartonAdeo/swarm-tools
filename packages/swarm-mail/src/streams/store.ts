@@ -765,18 +765,24 @@ async function repairKeyedProjection(
   event: AgentEvent & { id: number; sequence: number },
 ): Promise<void> {
   if (event.type !== "message_sent" || !event.operation_id) return;
-  const found = await db.query<{ id: number }>(
-    "SELECT id FROM messages WHERE operation_id = $1",
-    [event.operation_id],
-  );
-  const messageId = found.rows[0]?.id;
-  if (messageId === undefined) {
+  const readMessageId = async () =>
+    (
+      await db.query<{ id: number }>("SELECT id FROM messages WHERE operation_id = $1", [
+        event.operation_id,
+      ])
+    ).rows[0]?.id;
+  if ((await readMessageId()) === undefined) {
     try {
       await handleMessageSent(db, event as MessageSentEvent & { id: number; sequence: number });
     } catch (error) {
+      // Lost the race to a concurrent projection: fall through and make the
+      // winner's row recipient-complete.
       if (!isOperationIdUniqueViolation(error, "messages")) throw error;
     }
-    return;
+  }
+  const messageId = await readMessageId();
+  if (messageId === undefined) {
+    throw new Error(`[SwarmMail] keyed message projection missing for ${event.operation_id}`);
   }
   for (const agent of event.to_agents) {
     await db.query(

@@ -1063,8 +1063,13 @@ export const swarm_complete = tool({
     // Check review gate (unless skipped) - BEFORE try block so errors are clear
     if (!args.skip_review) {
       let reviewStatusResult = getReviewStatus(args.bead_id);
+      // A local review decision (approval, rejection or counted needs_changes
+      // attempt) is authoritative; durable keyed feedback is consulted only
+      // when this process has no decision for the task.
+      const hasLocalDecision =
+        reviewStatusResult.reviewed || reviewStatusResult.attempt_count > 0;
       if (
-        !reviewStatusResult.approved &&
+        !hasLocalDecision &&
         (await getDurableReviewApproval(args.project_key, args.bead_id))
       ) {
         reviewStatusResult = { ...reviewStatusResult, reviewed: true, approved: true };

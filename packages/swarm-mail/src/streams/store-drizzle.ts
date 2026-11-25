@@ -355,19 +355,27 @@ export async function repairKeyedProjectionDrizzle(
   event: AgentEvent & { id: number; sequence: number },
 ): Promise<void> {
   if (event.type !== "message_sent" || !event.operation_id) return;
-  const found = await db
-    .select({ id: messagesTable.id })
-    .from(messagesTable)
-    .where(eq(messagesTable.operation_id, event.operation_id))
-    .limit(1);
-  const messageId = found[0]?.id;
-  if (messageId === undefined) {
+  const operationId = event.operation_id;
+  const readMessageId = async () => {
+    const found = await db
+      .select({ id: messagesTable.id })
+      .from(messagesTable)
+      .where(eq(messagesTable.operation_id, operationId))
+      .limit(1);
+    return found[0]?.id;
+  };
+  if ((await readMessageId()) === undefined) {
     try {
       await handleMessageSentDrizzle(db, event as MessageSentEvent & { id: number; sequence: number });
     } catch (error) {
+      // Lost the race to a concurrent projection: fall through and make the
+      // winner's row recipient-complete.
       if (!isOperationIdUniqueViolation(error, "messages")) throw error;
     }
-    return;
+  }
+  const messageId = await readMessageId();
+  if (messageId === undefined) {
+    throw new Error(`[SwarmMail] keyed message projection missing for ${operationId}`);
   }
   if (event.to_agents.length > 0) {
     await db

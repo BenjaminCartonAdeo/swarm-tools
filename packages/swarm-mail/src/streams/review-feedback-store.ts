@@ -252,7 +252,7 @@ export async function getDurableReviewApproval(
   const latest = await db.query<{ result: string | null }>(
     `SELECT result FROM review_feedback_operations
      WHERE project_key = ? AND task_id = ? AND state = 'done'
-     ORDER BY updated_at DESC, rowid DESC LIMIT 1`,
+     ORDER BY attempt DESC, rowid DESC LIMIT 1`,
     [projectKey, taskId],
   );
   const raw = latest.rows[0]?.result;

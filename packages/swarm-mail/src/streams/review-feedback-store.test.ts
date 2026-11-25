@@ -17,6 +17,7 @@ import {
   type ReviewFeedbackResult,
 } from "./review-feedback-store.js";
 import { appendEvent } from "./store-drizzle.js";
+import { appendEvent as appendEventLegacy } from "./store.js";
 import { sendSwarmMessage } from "./swarm-mail.js";
 
 const PROJECT = "/tmp/review-feedback-project";
@@ -323,4 +324,78 @@ describe("review feedback operations", () => {
     const restored = await db.query<{ n: number }>("SELECT COUNT(*) AS n FROM message_recipients");
     expect(restored.rows[0]?.n).toBe(1);
   });
+  test("durableStatusOrderedByAttemptNotTimestampOrRowid", async () => {
+    const insert = (op: string, attempt: number, status: string) =>
+      db.query(
+        `INSERT INTO review_feedback_operations
+         (operation_id, project_key, task_id, worker_id, status, request_hash, attempt, state, result, created_at, updated_at)
+         VALUES (?, ?, 'task-tie', 'w', ?, 'h', ?, 'done', ?, 1000, 1000)`,
+        [op, PROJECT, status, attempt, JSON.stringify({ success: true, status, task_id: "task-tie" })],
+      );
+    // Higher attempt inserted first (lower rowid), same updated_at
+    await insert("op-tie-approved", 2, "approved");
+    await insert("op-tie-rejected", 1, "needs_changes");
+    expect(await getDurableReviewApproval(PROJECT, "task-tie", db)).toBe(true);
+
+    await insert("op-tie-rejected-3", 3, "needs_changes");
+    expect(await getDurableReviewApproval(PROJECT, "task-tie", db)).toBe(false);
+  });
+
+  for (const [label, append] of [
+    ["drizzle", (e: Parameters<typeof appendEvent>[0]) => appendEvent(e, PROJECT, db)],
+    ["legacy", (e: Parameters<typeof appendEvent>[0]) => appendEventLegacy(e, PROJECT, db)],
+  ] as const) {
+    test(`concurrentRepairLoserEnsuresWinnerRecipients (${label})`, async () => {
+      const event = () =>
+        createEvent("message_sent", {
+          project_key: PROJECT,
+          from_agent: "coordinator",
+          to_agents: ["worker-1", "worker-2"],
+          subject: "race",
+          body: "b",
+          importance: "normal",
+          ack_required: false,
+          operation_id: "op-race",
+        });
+      await append(event());
+      // Crash state: event persisted, projection lost
+      await db.query("DELETE FROM message_recipients");
+      await db.query("DELETE FROM messages WHERE operation_id = 'op-race'");
+      // A concurrent projection (separate connection) wins between our read
+      // and insert: it inserts the message but never gets to recipients.
+      const other = await createLibSQLAdapter({ url: `file:${dbPath}` });
+      const client = (db as unknown as { getClient(): { execute: (...a: unknown[]) => Promise<unknown> } }).getClient();
+      const original = client.execute.bind(client);
+      let fired = false;
+      client.execute = async (...a: unknown[]) => {
+        const stmt = a[0] as string | { sql: string; args?: unknown[] };
+        const sql = typeof stmt === "string" ? stmt : stmt.sql;
+        const args = typeof stmt === "string" ? (a[1] as unknown[]) : stmt.args;
+        if (!fired && /insert into "?messages"?/i.test(sql) && JSON.stringify(args ?? []).includes("op-race")) {
+          fired = true;
+          await other.query(
+            "INSERT INTO messages (project_key, from_agent, subject, body, created_at, operation_id) VALUES (?, 'coordinator', 'race', 'b', 1, 'op-race')",
+            [PROJECT],
+          );
+        }
+        return original(...a);
+      };
+      try {
+        await append(event());
+      } finally {
+        client.execute = original;
+        await other.close?.();
+      }
+      expect(fired).toBe(true);
+      const msgs = await db.query<{ id: number }>("SELECT id FROM messages WHERE operation_id = 'op-race'");
+      expect(msgs.rows).toHaveLength(1);
+      const recipients = await db.query<{ agent_name: string }>(
+        "SELECT agent_name FROM message_recipients WHERE message_id = ? ORDER BY agent_name",
+        [msgs.rows[0]?.id],
+      );
+      expect(recipients.rows.map((r) => r.agent_name)).toEqual(["worker-1", "worker-2"]);
+      const events = await db.query<{ n: number }>("SELECT COUNT(id) AS n FROM events WHERE type = 'message_sent'");
+      expect(events.rows[0]?.n).toBe(1);
+    });
+  }
 });

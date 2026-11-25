@@ -403,6 +403,40 @@ describe("swarm_review_feedback operation-keyed path", () => {
 		expect(JSON.stringify(gated)).not.toContain("awaiting coordinator review");
 	});
 
+	test("unkeyedRejectionAfterKeyedApprovalBlocksSwarmComplete", async () => {
+		const beadId = "gate3-epic.1";
+		await feedback("op-gate3", "approved", beadId);
+		const rejected = JSON.parse(
+			await swarm_review_feedback.execute(
+				{
+					project_key: PROJECT,
+					task_id: beadId,
+					worker_id: "KeyedWorker",
+					status: "needs_changes",
+					issues: ISSUES,
+				},
+				mockContext,
+			),
+		);
+		expect(rejected.attempt).toBe(1);
+		const gated = JSON.parse(
+			await swarm_complete.execute(
+				{
+					project_key: PROJECT,
+					agent_name: "KeyedWorker",
+					bead_id: beadId,
+					summary: "done",
+					start_time: Date.now(),
+					skip_verification: true,
+				},
+				mockContext,
+			),
+		);
+		expect(["pending_review", "needs_changes"]).toContain(gated.status);
+		expect(gated.review_status.approved).toBe(false);
+		await swarm_reset.execute({}, mockContext);
+	});
+
 	test("keyedNeedsChangesAfterApprovalReclosesGate", async () => {
 		await feedback("op-gate-a", "approved", "gate2-epic.1");
 		await feedback("op-gate-b", "needs_changes", "gate2-epic.1");
