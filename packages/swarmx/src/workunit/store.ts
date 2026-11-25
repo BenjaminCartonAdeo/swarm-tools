@@ -420,7 +420,7 @@ export interface MissionCloseFence {
 export const TERMINAL_WORK_UNIT_STATES_SQL =
   "('DONE', 'CHANGES_REQUESTED', 'REJECTED', 'CANCELLED', 'ABANDONED', 'REVOKED', 'FAILED')";
 
-export async function getMission(db: DatabaseAdapter, missionId: string): Promise<Mission | null> {
+export async function getMissionByPk(db: DatabaseAdapter, missionId: string): Promise<Mission | null> {
   const result = await db.query("SELECT * FROM swarmx_missions WHERE id = ?", [missionId]);
   const row: unknown = result.rows[0];
   return isRecord(row) ? (row as unknown as Mission) : null;
@@ -447,7 +447,7 @@ export async function beginMissionClose(
   );
   const row: unknown = result.rows[0];
   if (isRecord(row)) return row as unknown as Mission;
-  const current = await getMission(db, input.missionPk);
+  const current = await getMissionByPk(db, input.missionPk);
   if (current !== null && current.session_id === input.ownerSessionId && current.state === "CLOSING"
     && current.close_intent === input.intent && Number(current.fence) === input.expectedFence + 1) {
     return current;
@@ -475,7 +475,7 @@ export async function cascadeMissionClose(
   );
   const unitIds = result.rows.flatMap((row) => (isRecord(row) && typeof row.id === "string" ? [row.id] : []));
   if (unitIds.length > 0) return { unitIds };
-  const mission = await getMission(db, input.missionPk);
+  const mission = await getMissionByPk(db, input.missionPk);
   if (mission === null || mission.session_id !== input.ownerSessionId || mission.state !== "CLOSING"
     || mission.close_intent !== input.intent || Number(mission.fence) !== input.expectedFence) {
     throw new MissionFenceConflictError(input.missionPk, input.expectedFence);
@@ -497,7 +497,7 @@ export async function finishMissionClose(db: DatabaseAdapter, input: MissionClos
   );
   const row: unknown = result.rows[0];
   if (isRecord(row)) return row as unknown as Mission;
-  const mission = await getMission(db, input.missionPk);
+  const mission = await getMissionByPk(db, input.missionPk);
   if (mission !== null && mission.session_id === input.ownerSessionId) {
     const fence = Number(mission.fence);
     if (["FINISHED", "CANCELLED", "ABANDONED"].includes(mission.state) && fence === input.expectedFence + 1) {

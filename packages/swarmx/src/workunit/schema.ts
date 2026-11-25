@@ -1,4 +1,5 @@
 import type { DatabaseAdapter } from "swarm-mail";
+import type { MissionMode } from "../types.js";
 
 export type WorkUnitState =
   | "RESERVED"
@@ -62,6 +63,10 @@ export interface Mission {
   fence: number;
   budget_limit: number | null;
   legacy_source: string | null;
+  mode: MissionMode | null;
+  budget_policy_json: string | null;
+  consolidation_json: string | null;
+  retry_causes_json: string | null;
   created_at: number;
   updated_at: number;
 }
