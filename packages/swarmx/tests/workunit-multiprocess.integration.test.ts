@@ -80,7 +80,7 @@ async function withProcesses(
     }
 
     const readyPaths = childIds.map((id) => join(tempDir, `ready-${id}`));
-    for (const id of childIds) {
+    for (const [index, id] of childIds.entries()) {
       const child = Bun.spawn([process.execPath, childFixture], {
         env: {
           ...process.env,
@@ -99,9 +99,9 @@ async function withProcesses(
         new Response(child.stdout).text(),
         new Response(child.stderr).text(),
       ]).then(([stdout, stderr]) => ({ stdout, stderr })));
+      await waitForReadyMarkers([readyPaths[index]!], children, outputPromises, 20_000);
     }
 
-    await waitForReadyMarkers(readyPaths, children, outputPromises, 20_000);
     await writeFile(startPath, "start\n", { flag: "wx" });
 
     let exitCodes: number[];

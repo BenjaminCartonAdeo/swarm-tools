@@ -83,3 +83,40 @@ Required checks:
 ### Commit
 
 Requested commit message: `test(swarmx): pin close race loser errors`
+
+## Fix round 2 — Serialize race child startup
+
+### Root cause and change
+
+The fresh controller finding reproduced an initialization failure, not a WorkUnit race: both children were spawned together and entered `createLibSQLAdapter` and schema initialization concurrently against the same SQLite file. The adapter performs startup PRAGMAs before establishing its busy timeout, so simultaneous initialization could exit with `SQLITE_BUSY: database is locked` before either child reached its ready marker.
+
+Changed the parent spawn loop to wait for each newly spawned child's ready marker before spawning the next child. Child A therefore finishes adapter/schema initialization and waits at the existing start-file gate before child B starts. The parent writes the shared gate only after child B also reports ready, so both contested store operations still race concurrently. Existing bounded readiness/exit diagnostics, forced child termination/awaiting, and temporary-directory cleanup are preserved.
+
+### Repeated-run evidence
+
+Five consecutive focused runs:
+
+1. `bun test tests/workunit-multiprocess.integration.test.ts` — 4 pass, 0 fail, 27 expectations (2.57s).
+2. `bun test tests/workunit-multiprocess.integration.test.ts` — 4 pass, 0 fail, 27 expectations (2.54s).
+3. `bun test tests/workunit-multiprocess.integration.test.ts` — 4 pass, 0 fail, 27 expectations (2.68s).
+4. `bun test tests/workunit-multiprocess.integration.test.ts` — 4 pass, 0 fail, 27 expectations (2.61s).
+5. `bun test tests/workunit-multiprocess.integration.test.ts` — 4 pass, 0 fail, 27 expectations (2.53s).
+
+Required checks:
+
+- `bun test tests/workunit-multiprocess.integration.test.ts tests/workunit-store.test.ts` — 45 pass, 0 fail, 496 expectations.
+- `bun test tests/` (three consecutive runs) — each run: 452 pass, 5 skipped, 0 fail; 457 tests across 24 files. Durations: 36.65s, 22.49s, and 18.61s.
+- `bun run typecheck` — passed (`$ tsc --noEmit`).
+- `bun run build` — passed; bundled 22 modules for `index.js` and 13 modules for `swarmx.js`.
+- `git diff --check` — passed.
+
+### Files and self-review
+
+- Changed `packages/swarmx/tests/workunit-multiprocess.integration.test.ts` and this report only.
+- Spawn/readiness is sequential only through child initialization. There is still no start-file release until all children are ready, and no lock/retry/serialization surrounds the contested store calls.
+- The round-1 close-vs-reserve loser assertions remain intact: closer winner expects `MissionClosedError`; reserver winner expects `MissionNotDrainedError`.
+- No changes to the fixture, production code, `tests/helpers.ts`, plan/ledger, lockfiles, or unrelated files. The pre-report Git status showed only the integration test modified; no generated bundle changes were present.
+
+### Commit
+
+Requested commit message: `test(swarmx): serialize race child startup`
