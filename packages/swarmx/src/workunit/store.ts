@@ -654,3 +654,284 @@ export async function finishMissionClose(db: DatabaseAdapter, input: MissionClos
   }
   throw new MissionFenceConflictError(input.missionPk, input.expectedFence);
 }
+
+// ---------------------------------------------------------------------------
+// Fixed-purpose fenced APIs used by the actor-checked command layer.
+// Tools never receive raw `transitionWorkUnit`; each API names its edge.
+// ---------------------------------------------------------------------------
+
+export class SubmissionConflictError extends Error {
+  constructor(unitId: string) {
+    super(`WorkUnit ${unitId} already holds different submitted evidence`);
+    this.name = "SubmissionConflictError";
+  }
+}
+
+export class WorkerSessionMismatchError extends Error {
+  constructor(unitId: string) {
+    super(`WorkUnit ${unitId} is bound to a different worker session`);
+    this.name = "WorkerSessionMismatchError";
+  }
+}
+
+export class ReviewIntentConflictError extends Error {
+  constructor(unitId: string) {
+    super(`WorkUnit ${unitId} already holds a different review intent`);
+    this.name = "ReviewIntentConflictError";
+  }
+}
+
+export class EffectReplayConflictError extends Error {
+  constructor(effectId: string) {
+    super(`WorkUnit effect ${effectId} exists with a different operation or request`);
+    this.name = "EffectReplayConflictError";
+  }
+}
+
+export class EffectsNotSettledError extends Error {
+  constructor(unitId: string) {
+    super(`WorkUnit ${unitId} mandatory effect has not succeeded`);
+    this.name = "EffectsNotSettledError";
+  }
+}
+
+const SUBMITTED_OR_LATER = new Set<WorkUnitState>([
+  "SUBMITTED", "IN_REVIEW", "APPROVED", "PUBLISHING", "RETURNING", "DONE", "CHANGES_REQUESTED", "REJECTED",
+]);
+
+/** Fenced RESERVED -> FAILED when the subagent dispatch definitely failed. */
+export async function failDispatch(
+  db: DatabaseAdapter,
+  input: { unitId: string; unitFence: number; errorJson: string },
+): Promise<WorkUnit> {
+  return transitionWorkUnit(db, {
+    unitId: input.unitId, expectedState: "RESERVED", unitFence: input.unitFence,
+    nextState: "FAILED", patch: { kind: "dispatch_failed", errorJson: input.errorJson },
+  });
+}
+
+export interface SubmitWorkUnitInput {
+  unitId: string;
+  workerSessionId: string;
+  evidenceJson: string;
+  evidenceHash: string;
+  diffHash: string;
+}
+
+function sameSubmission(unit: WorkUnit, input: SubmitWorkUnitInput): boolean {
+  return unit.evidence_hash === input.evidenceHash && unit.diff_hash === input.diffHash
+    && unit.evidence_json === input.evidenceJson;
+}
+
+function submitReplay(unit: WorkUnit | null, input: SubmitWorkUnitInput): WorkUnit {
+  if (unit === null || !SUBMITTED_OR_LATER.has(unit.state)) {
+    throw new FenceConflictError(input.unitId, "BOUND", unit?.fence ?? -1);
+  }
+  if (!sameSubmission(unit, input)) throw new SubmissionConflictError(input.unitId);
+  return unit;
+}
+
+/**
+ * Immutable submit: BOUND -> SUBMITTED by the bound worker only. An identical replay
+ * in SUBMITTED or later returns the saved unit without a write; different evidence conflicts.
+ */
+export async function submitWorkUnit(db: DatabaseAdapter, input: SubmitWorkUnitInput): Promise<WorkUnit> {
+  const current = await getWorkUnit(db, input.unitId);
+  if (current === null) throw new FenceConflictError(input.unitId, "BOUND", -1);
+  if (current.state !== "BOUND") return submitReplay(current, input);
+  if (current.worker_session !== input.workerSessionId) throw new WorkerSessionMismatchError(input.unitId);
+  const result = await db.query(
+    `UPDATE swarmx_work_units
+     SET state = 'SUBMITTED', fence = fence + 1, updated_at = ?, evidence_hash = ?, diff_hash = ?, evidence_json = ?
+     WHERE id = ? AND state = 'BOUND' AND fence = ? AND worker_session = ? RETURNING *`,
+    [Date.now(), input.evidenceHash, input.diffHash, input.evidenceJson, input.unitId, current.fence, input.workerSessionId],
+  );
+  const row: unknown = result.rows[0];
+  if (isRecord(row)) return row as unknown as WorkUnit;
+  return submitReplay(await getWorkUnit(db, input.unitId), input);
+}
+
+/** Fenced SUBMITTED -> IN_REVIEW. Replay by the same reviewer returns the IN_REVIEW row. */
+export async function beginReviewWorkUnit(
+  db: DatabaseAdapter,
+  input: { unitId: string; unitFence: number; reviewBy: string },
+): Promise<WorkUnit> {
+  try {
+    return await transitionWorkUnit(db, {
+      unitId: input.unitId, expectedState: "SUBMITTED", unitFence: input.unitFence,
+      nextState: "IN_REVIEW", patch: { kind: "begin_review", reviewBy: input.reviewBy },
+    });
+  } catch (error) {
+    const current = await getWorkUnit(db, input.unitId);
+    if (current !== null && current.state === "IN_REVIEW" && current.fence === input.unitFence + 1
+      && current.review_by === input.reviewBy) {
+      return current;
+    }
+    throw error;
+  }
+}
+
+export interface ReviewIntent {
+  verdict: string;
+  reviewer: string;
+  receiptJson: string | null;
+  feedbackJson: string | null;
+}
+
+function intentMatches(unit: WorkUnit, intent: ReviewIntent): boolean {
+  return unit.review_verdict === intent.verdict && unit.review_by === intent.reviewer
+    && unit.verification_receipt_json === intent.receiptJson && unit.review_feedback_json === intent.feedbackJson;
+}
+
+/**
+ * Persists the single review intent without bumping the fence. The update is conditional on
+ * IN_REVIEW at `reviewFence` with no prior verdict; a different concurrent intent is rejected.
+ */
+export async function recordReviewIntent(
+  db: DatabaseAdapter,
+  input: { unitId: string; reviewFence: number; intent: ReviewIntent },
+): Promise<WorkUnit> {
+  const { intent } = input;
+  const result = await db.query(
+    `UPDATE swarmx_work_units
+     SET review_verdict = ?, verification_receipt_json = ?, review_feedback_json = ?, updated_at = ?
+     WHERE id = ? AND state = 'IN_REVIEW' AND fence = ? AND review_by = ? AND review_verdict IS NULL RETURNING *`,
+    [intent.verdict, intent.receiptJson, intent.feedbackJson, Date.now(), input.unitId, input.reviewFence, intent.reviewer],
+  );
+  const row: unknown = result.rows[0];
+  if (isRecord(row)) return row as unknown as WorkUnit;
+  const current = await getWorkUnit(db, input.unitId);
+  if (current === null) throw new FenceConflictError(input.unitId, "IN_REVIEW", input.reviewFence);
+  if (current.fence >= input.reviewFence && current.review_verdict !== null) {
+    if (intentMatches(current, intent)) return current;
+    throw new ReviewIntentConflictError(input.unitId);
+  }
+  throw new FenceConflictError(input.unitId, "IN_REVIEW", input.reviewFence);
+}
+
+export interface ReviewEffectSpec {
+  effectId: string;
+  kind: "backend_complete" | "backend_feedback";
+  mandatory: boolean;
+  operationId: string;
+  requestJson: string;
+  unitFence: number;
+}
+
+/**
+ * Inserts deterministic review effects guarded by the IN_REVIEW state/fence. Replay verifies the
+ * exact operation_id/request_json/unit_fence of rows that already exist.
+ */
+export async function insertReviewEffects(
+  db: DatabaseAdapter,
+  input: { unitId: string; reviewFence: number; effects: readonly ReviewEffectSpec[] },
+): Promise<void> {
+  for (const effect of input.effects) {
+    await db.query(
+      `INSERT INTO swarmx_effects (effect_id, unit_id, kind, mandatory, operation_id, unit_fence, state, request_json, updated_at)
+       SELECT ?, ?, ?, ?, ?, ?, 'pending', ?, ?
+       WHERE EXISTS (SELECT 1 FROM swarmx_work_units WHERE id = ? AND state = 'IN_REVIEW' AND fence = ?)
+       ON CONFLICT DO NOTHING`,
+      [effect.effectId, input.unitId, effect.kind, effect.mandatory ? 1 : 0, effect.operationId, effect.unitFence,
+        effect.requestJson, Date.now(), input.unitId, input.reviewFence],
+    );
+    const existing = await db.query("SELECT * FROM swarmx_effects WHERE effect_id = ?", [effect.effectId]);
+    const row: unknown = existing.rows[0];
+    if (!isRecord(row)) throw new FenceConflictError(input.unitId, "IN_REVIEW", input.reviewFence);
+    if (row.unit_id !== input.unitId || row.kind !== effect.kind || row.operation_id !== effect.operationId
+      || row.request_json !== effect.requestJson || Number(row.unit_fence) !== effect.unitFence) {
+      throw new EffectReplayConflictError(effect.effectId);
+    }
+  }
+}
+
+export type ReviewDecision =
+  | { kind: "approve"; verdict: string }
+  | { kind: "request_changes"; verdict: string; feedbackJson: string }
+  | { kind: "reject"; verdict: string; reason: string };
+
+const decisionTargets: Record<ReviewDecision["kind"], readonly WorkUnitState[]> = {
+  approve: ["APPROVED", "PUBLISHING", "DONE"],
+  request_changes: ["RETURNING", "CHANGES_REQUESTED"],
+  reject: ["REJECTED"],
+};
+
+/** Applies the fenced review decision last; replay after the decision returns the current row. */
+export async function applyReviewDecision(
+  db: DatabaseAdapter,
+  input: { unitId: string; reviewFence: number; decision: ReviewDecision },
+): Promise<WorkUnit> {
+  const { decision } = input;
+  const states = decisionTargets[decision.kind];
+  const patch: WorkUnitPatch = decision.kind === "approve"
+    ? { kind: "approve", reviewVerdict: decision.verdict }
+    : decision.kind === "request_changes"
+      ? { kind: "request_changes", reviewVerdict: decision.verdict, reviewFeedbackJson: decision.feedbackJson }
+      : { kind: "reject", reviewVerdict: decision.verdict, reason: decision.reason };
+  try {
+    return await transitionWorkUnit(db, {
+      unitId: input.unitId, expectedState: "IN_REVIEW", unitFence: input.reviewFence, nextState: states[0] as WorkUnitState, patch,
+    });
+  } catch (error) {
+    const current = await getWorkUnit(db, input.unitId);
+    if (current !== null && current.fence > input.reviewFence && states.includes(current.state)
+      && current.review_verdict === decision.verdict) {
+      return current;
+    }
+    throw error;
+  }
+}
+
+/** Fenced APPROVED -> PUBLISHING; replay returns the later row. */
+export async function startPublishing(
+  db: DatabaseAdapter,
+  input: { unitId: string; unitFence: number },
+): Promise<WorkUnit> {
+  const result = await db.query(
+    `UPDATE swarmx_work_units SET state = 'PUBLISHING', fence = fence + 1, updated_at = ?
+     WHERE id = ? AND state = 'APPROVED' AND fence = ? RETURNING *`,
+    [Date.now(), input.unitId, input.unitFence],
+  );
+  const row: unknown = result.rows[0];
+  if (isRecord(row)) return row as unknown as WorkUnit;
+  const current = await getWorkUnit(db, input.unitId);
+  if (current !== null && current.fence > input.unitFence && (current.state === "PUBLISHING" || current.state === "DONE")) {
+    return current;
+  }
+  throw new FenceConflictError(input.unitId, "APPROVED", input.unitFence);
+}
+
+async function finalizeAfterEffect(
+  db: DatabaseAdapter,
+  input: { unitId: string; unitFence: number },
+  from: "PUBLISHING" | "RETURNING",
+  to: "DONE" | "CHANGES_REQUESTED",
+  kind: "backend_complete" | "backend_feedback",
+): Promise<WorkUnit> {
+  const result = await db.query(
+    `UPDATE swarmx_work_units SET state = ?, fence = fence + 1, updated_at = ?
+     WHERE id = ? AND state = ? AND fence = ?
+       AND EXISTS (SELECT 1 FROM swarmx_effects e WHERE e.unit_id = swarmx_work_units.id
+         AND e.kind = ? AND e.state = 'succeeded' AND e.unit_fence = ?)
+     RETURNING *`,
+    [to, Date.now(), input.unitId, from, input.unitFence, kind, input.unitFence],
+  );
+  const row: unknown = result.rows[0];
+  if (isRecord(row)) return row as unknown as WorkUnit;
+  const current = await getWorkUnit(db, input.unitId);
+  if (current !== null && current.state === to && current.fence === input.unitFence + 1) return current;
+  if (current !== null && current.state === from && current.fence === input.unitFence) {
+    throw new EffectsNotSettledError(input.unitId);
+  }
+  throw new FenceConflictError(input.unitId, from, input.unitFence);
+}
+
+/** Fenced PUBLISHING -> DONE, only after the completion effect succeeded. */
+export function finalizePublish(db: DatabaseAdapter, input: { unitId: string; unitFence: number }): Promise<WorkUnit> {
+  return finalizeAfterEffect(db, input, "PUBLISHING", "DONE", "backend_complete");
+}
+
+/** Fenced RETURNING -> CHANGES_REQUESTED, only after the feedback effect succeeded. */
+export function finalizeReturn(db: DatabaseAdapter, input: { unitId: string; unitFence: number }): Promise<WorkUnit> {
+  return finalizeAfterEffect(db, input, "RETURNING", "CHANGES_REQUESTED", "backend_feedback");
+}

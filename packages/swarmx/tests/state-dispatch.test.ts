@@ -8,7 +8,7 @@
  *   - exact-once ledger keyed by `Tool.CallID`, orphan recovery;
  *   - persistence, `finishMission`, `audit`.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import type { Plugin } from "@opencode/plugin";
 
 import swarmx from "../src/index";
@@ -40,6 +40,29 @@ import {
 } from "../src/state";
 import { DispatchGateError, type GateReason, type MissionState } from "../src/types";
 import { createFakeContext, type FakeAgentInfo, type FakeContext } from "./helpers";
+import { createLibSQLAdapter, type DatabaseAdapter } from "swarm-mail";
+import { ensureWorkUnitSchema, type WorkUnit } from "../src/workunit/schema";
+import { assignCell, createMission, listUnits } from "../src/workunit/mission";
+import {
+  getWorkUnit,
+  recordReviewIntent,
+  insertReviewEffects,
+  ReviewIntentConflictError,
+  SubmissionConflictError,
+  EffectReplayConflictError,
+  RetryNotAllowedError,
+} from "../src/workunit/store";
+import {
+  createMissionCommands,
+  MissionActorError,
+  ReviewReceiptRequiredError,
+  reviewEffectPlan,
+  type MissionActor,
+} from "../src/workunit/commands";
+import { createWorkUnitEffectPorts } from "../src/workunit/ports";
+import { DefiniteEffectError, type WorkUnitEffectPorts } from "../src/workunit/effects";
+import { CliError } from "../src/cli";
+import { LocalToolError } from "../src/types";
 
 const PROJECT = "adeo";
 const SESSION = "ses-1";
@@ -1223,5 +1246,245 @@ describe("plugin wiring", () => {
     await expect(
       Promise.resolve(beforeHooks[0]?.(beforeEvent({ id: "call-2", prompt: "no marker" }))),
     ).rejects.toBeInstanceOf(DispatchGateError);
+  });
+});
+
+
+describe("WorkUnit actor-checked mission commands", () => {
+  const opened: DatabaseAdapter[] = [];
+  const owner: MissionActor = { kind: "coordinator", sessionId: "coord" };
+  const host = { hostInstanceId: "host-1", hostname: "box", pid: 1 };
+  const policy = { total: 10, perCellIterations: 3, workerShare: null, version: 1 as const };
+
+  async function rig(portsOverride?: Partial<WorkUnitEffectPorts>) {
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    opened.push(db);
+    await ensureWorkUnitSchema(db);
+    const mission = await createMission(db, { project: "p", sessionId: "coord", missionId: "m", mode: "dev", budgetPolicy: policy });
+    const calls: { name: string; args: Record<string, unknown> }[] = [];
+    const closed = new Map<string, { status: string; completionOperationId: string | null }>();
+    const ports: WorkUnitEffectPorts = {
+      readHiveCell: async (_project, cellId) => closed.get(cellId) ?? { status: "in_progress" },
+      runBackendTool: async (name, args) => {
+        calls.push({ name, args });
+        if (name === "swarm_complete") closed.set(String(args.bead_id), { status: "closed", completionOperationId: String(args.operation_id) });
+        return { success: true };
+      },
+      prepareConsolidation: async () => ({}),
+      ...portsOverride,
+    };
+    const commands = createMissionCommands(db, { host, ports: () => ports });
+    return { db, mission, commands, calls };
+  }
+
+  async function submitted(r: Awaited<ReturnType<typeof rig>>, cellId = "c1", evidence: Record<string, unknown> = { filesTouched: ["src/a.ts"], summary: "ok" }) {
+    const reserved = await r.commands.reserve(owner, {
+      project: "p", missionId: "m", workerAgent: "coder", callId: `call-${cellId}`, dispatchToken: `tok-${cellId}`,
+      cellId, budgetCharge: 1, idemKey: `idem-${cellId}`, attemptNo: 1,
+    });
+    const bound = await r.commands.settleDispatch(owner, { unitId: reserved.id, unitFence: reserved.fence, outcome: { ok: true, workerSessionId: "w1", workerAgent: "coder" } });
+    const unit = await r.commands.submit({ kind: "worker", sessionId: "w1" }, { unitId: bound.id, evidence, diff: "diff" });
+    return unit;
+  }
+
+  afterEach(async () => {
+    for (const db of opened.splice(0)) await db.close?.();
+  });
+
+  test("actor: non-owner coordinators and worker actors are rejected for coordinator commands", async () => {
+    const r = await rig();
+    const input = { project: "p", missionId: "m", workerAgent: "coder", callId: "c", dispatchToken: "t", cellId: "c1", budgetCharge: 1, idemKey: "i", attemptNo: 1 };
+    await expect(r.commands.reserve({ kind: "coordinator", sessionId: "other" }, input)).rejects.toThrow(MissionActorError);
+    await expect(r.commands.reserve({ kind: "worker", sessionId: "coord" }, input)).rejects.toThrow(MissionActorError);
+    const unit = await r.commands.reserve(owner, input);
+    await expect(r.commands.bindWorker({ kind: "coordinator", sessionId: "other" }, { unitId: unit.id, unitFence: unit.fence, workerSessionId: "w", workerAgent: "coder" })).rejects.toThrow(MissionActorError);
+    await expect(r.commands.assignCell({ kind: "coordinator", sessionId: "other" }, { missionPk: r.mission.id, cellId: "x", agent: "coder" })).rejects.toThrow(MissionActorError);
+    await expect(r.commands.releaseAssignment({ kind: "coordinator", sessionId: "other" }, { missionPk: r.mission.id, cellId: "x" })).rejects.toThrow(MissionActorError);
+    await expect(r.commands.finish({ kind: "coordinator", sessionId: "other" }, { missionPk: r.mission.id })).rejects.toThrow(MissionActorError);
+    await expect(r.commands.cancel({ kind: "worker", sessionId: "coord" }, { missionPk: r.mission.id })).rejects.toThrow(MissionActorError);
+    expect(await listUnits(r.db, r.mission.id)).toHaveLength(1);
+  });
+
+  test("actor: dispatch failure is a fixed-purpose RESERVED to FAILED settlement", async () => {
+    const r = await rig();
+    const unit = await r.commands.reserve(owner, { project: "p", missionId: "m", workerAgent: "coder", callId: "c", dispatchToken: "t", cellId: "c1", budgetCharge: 1, idemKey: "i", attemptNo: 1 });
+    const failed = await r.commands.settleDispatch(owner, { unitId: unit.id, unitFence: unit.fence, outcome: { ok: false, error: { message: "spawn failed" } } });
+    expect(failed).toMatchObject({ state: "FAILED", fence: unit.fence + 1, error_json: JSON.stringify({ message: "spawn failed" }) });
+  });
+
+  test("actor: worker submit requires the bound worker session and persists canonical evidence", async () => {
+    const r = await rig();
+    const reserved = await r.commands.reserve(owner, { project: "p", missionId: "m", workerAgent: "coder", callId: "c", dispatchToken: "t", cellId: "c1", budgetCharge: 1, idemKey: "i", attemptNo: 1 });
+    await expect(r.commands.submit({ kind: "worker", sessionId: "w1" }, { unitId: reserved.id, evidence: {} })).rejects.toThrow();
+    const bound = await r.commands.bindWorker(owner, { unitId: reserved.id, unitFence: reserved.fence, workerSessionId: "w1", workerAgent: "coder" });
+    await expect(r.commands.submit({ kind: "worker", sessionId: "intruder" }, { unitId: bound.id, evidence: { b: 1 } })).rejects.toThrow(MissionActorError);
+    await expect(r.commands.submit({ kind: "coordinator", sessionId: "coord" }, { unitId: bound.id, evidence: { b: 1 } })).rejects.toThrow(MissionActorError);
+    const unit = await r.commands.submit({ kind: "worker", sessionId: "w1" }, { unitId: bound.id, evidence: { b: 1, a: [2, { d: 1, c: 0 }] }, diff: "x" });
+    expect(unit).toMatchObject({ state: "SUBMITTED", fence: bound.fence + 1, evidence_json: '{"a":[2,{"c":0,"d":1}],"b":1}' });
+    expect(unit.evidence_hash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("submit replay: identical evidence returns the saved unit without a write; changed evidence conflicts", async () => {
+    const r = await rig();
+    const first = await submitted(r);
+    const replay = await r.commands.submit({ kind: "worker", sessionId: "w1" }, { unitId: first.id, evidence: { summary: "ok", filesTouched: ["src/a.ts"] }, diff: "diff" });
+    expect(replay).toEqual(first);
+    await expect(r.commands.submit({ kind: "worker", sessionId: "w1" }, { unitId: first.id, evidence: { summary: "changed" }, diff: "diff" })).rejects.toThrow(SubmissionConflictError);
+    await expect(r.commands.submit({ kind: "worker", sessionId: "w1" }, { unitId: first.id, evidence: { summary: "ok", filesTouched: ["src/a.ts"] }, diff: "other" })).rejects.toThrow(SubmissionConflictError);
+    await r.commands.review(owner, { unitId: first.id, status: "approved", receipt: { filesTouched: ["src/a.ts"], passed: true } });
+    const later = await r.commands.submit({ kind: "worker", sessionId: "w1" }, { unitId: first.id, evidence: { summary: "ok", filesTouched: ["src/a.ts"] }, diff: "diff" });
+    expect(later.state).toBe("DONE");
+    expect(later).toEqual((await getWorkUnit(r.db, first.id)) as WorkUnit);
+  });
+
+  test("review approval requires a receipt for non-doc work and drains completion with fence reviewFence + 2", async () => {
+    const r = await rig();
+    const unit = await submitted(r);
+    await expect(r.commands.review(owner, { unitId: unit.id, status: "approved" })).rejects.toThrow(ReviewReceiptRequiredError);
+    await expect(r.commands.review(owner, { unitId: unit.id, status: "unverifiable" })).rejects.toThrow(ReviewReceiptRequiredError);
+    await expect(r.commands.review({ kind: "coordinator", sessionId: "other" }, { unitId: unit.id, status: "approved", receipt: { filesTouched: [] } })).rejects.toThrow(MissionActorError);
+    expect((await getWorkUnit(r.db, unit.id))?.state).toBe("SUBMITTED");
+    const result = await r.commands.review(owner, { unitId: unit.id, status: "approved", receipt: { filesTouched: ["src/a.ts"], passed: true } });
+    const reviewFence = unit.fence + 1;
+    const effect = result.effects.find((e) => e.kind === "backend_complete");
+    expect(effect).toMatchObject({ effect_id: `effect:${unit.id}:backend_complete`, unit_fence: reviewFence + 2, state: "succeeded", mandatory: 1 });
+    expect(result.unit).toMatchObject({ state: "DONE", review_verdict: "approved", review_by: "coord" });
+    expect(JSON.parse(result.unit.verification_receipt_json ?? "null")).toEqual({ filesTouched: ["src/a.ts"], passed: true });
+    expect(r.calls.map((c) => c.name)).toEqual(["swarm_complete"]);
+  });
+
+  test("review unverifiable approves doc-only and empty-file work without a receipt", async () => {
+    const r = await rig();
+    const docs = await submitted(r, "c-doc", { filesTouched: ["README.md", "docs/guide.txt", "assets/logo.svg"] });
+    expect((await r.commands.review(owner, { unitId: docs.id, status: "unverifiable" })).unit).toMatchObject({ state: "DONE", review_verdict: "unverifiable", verification_receipt_json: null });
+    const empty = await submitted(r, "c-empty", { filesTouched: [] });
+    expect((await r.commands.review(owner, { unitId: empty.id, status: "unverifiable" })).unit.state).toBe("DONE");
+  });
+
+  test("review needs_changes revokes the worker, drains feedback at reviewFence + 1, then CHANGES_REQUESTED", async () => {
+    const order: string[] = [];
+    let r!: Awaited<ReturnType<typeof rig>>;
+    r = await rig({
+      runBackendTool: async (name, args) => {
+        const unit = (await listUnits(r.db, r.mission.id))[0];
+        order.push(`${name}:${unit?.state}:${unit?.worker_session}`);
+        r.calls.push({ name, args });
+        return { success: true, status: "needs_changes" };
+      },
+    });
+    const unit = await submitted(r);
+    const result = await r.commands.review(owner, { unitId: unit.id, status: "needs_changes", feedback: ["fix it"] });
+    expect(order).toEqual(["swarm_review_feedback:RETURNING:null"]);
+    const reviewFence = unit.fence + 1;
+    expect(result.effects).toEqual([expect.objectContaining({ effect_id: `effect:${unit.id}:backend_feedback`, unit_fence: reviewFence + 1, state: "succeeded" })]);
+    expect(result.unit).toMatchObject({ state: "CHANGES_REQUESTED", worker_session: null, review_verdict: "needs_changes" });
+    expect(r.calls[0]?.args).toMatchObject({ status: "needs_changes", operation_id: `op:${unit.id}:backend_feedback` });
+    await expect(r.commands.retry(owner, { priorUnitId: unit.id, workerAgent: "", callId: "c2", dispatchToken: "t2", budgetCharge: 1 })).rejects.toThrow(RetryNotAllowedError);
+    const retried = await r.commands.retry(owner, { priorUnitId: unit.id, workerAgent: "coder", callId: "c2", dispatchToken: "t2", budgetCharge: 1 });
+    expect(retried).toMatchObject({ state: "RESERVED", retry_of: unit.id, attempt_no: 2 });
+  });
+
+  test("review needs_changes stays RETURNING when the mandatory feedback effect is definitely rejected", async () => {
+    const r = await rig({ runBackendTool: async () => { throw new DefiniteEffectError("nope"); } });
+    const unit = await submitted(r);
+    const result = await r.commands.review(owner, { unitId: unit.id, status: "needs_changes", feedback: ["fix"] });
+    expect(result.unit.state).toBe("RETURNING");
+    expect(result.effects[0]?.state).toBe("failed_mandatory");
+    await expect(r.commands.retry(owner, { priorUnitId: unit.id, workerAgent: "coder", callId: "c2", dispatchToken: "t2", budgetCharge: 1 })).rejects.toThrow(RetryNotAllowedError);
+  });
+
+  test("review intent conflict: a different concurrent intent is rejected", async () => {
+    const r = await rig();
+    const unit = await submitted(r);
+    const begun = await r.commands.beginReview(owner, { unitId: unit.id });
+    const intent = { verdict: "approved", reviewer: "coord", receiptJson: '{"filesTouched":[]}', feedbackJson: null };
+    await recordReviewIntent(r.db, { unitId: unit.id, reviewFence: begun.fence, intent });
+    await recordReviewIntent(r.db, { unitId: unit.id, reviewFence: begun.fence, intent });
+    await expect(recordReviewIntent(r.db, { unitId: unit.id, reviewFence: begun.fence, intent: { ...intent, verdict: "needs_changes", receiptJson: null, feedbackJson: '["x"]' } })).rejects.toThrow(ReviewIntentConflictError);
+    await expect(r.commands.review(owner, { unitId: unit.id, status: "needs_changes", feedback: ["x"] })).rejects.toThrow(ReviewIntentConflictError);
+  });
+
+  test("review crash replay: intent-only and intent+effects states complete by exact replay", async () => {
+    const r = await rig();
+    const unit = await submitted(r);
+    const input = { unitId: unit.id, status: "approved" as const, receipt: { filesTouched: ["src/a.ts"] } };
+    const begun = await r.commands.beginReview(owner, { unitId: unit.id });
+    const plan = reviewEffectPlan(begun, input);
+    await recordReviewIntent(r.db, { unitId: unit.id, reviewFence: begun.fence, intent: plan.intent });
+    await insertReviewEffects(r.db, { unitId: unit.id, reviewFence: begun.fence, effects: plan.effects });
+    const effectRows = await r.db.query("SELECT effect_id, state, unit_fence FROM swarmx_effects");
+    expect(effectRows.rows).toEqual([{ effect_id: `effect:${unit.id}:backend_complete`, state: "pending", unit_fence: begun.fence + 2 }]);
+    expect(r.calls).toEqual([]);
+    const replayed = await r.commands.review(owner, input);
+    expect(replayed.unit.state).toBe("DONE");
+    expect(r.calls).toHaveLength(1);
+    const again = await r.commands.review(owner, input);
+    expect(again.unit).toEqual(replayed.unit);
+    expect(r.calls).toHaveLength(1);
+    await expect(insertReviewEffects(r.db, { unitId: unit.id, reviewFence: begun.fence, effects: [{ ...plan.effects[0]!, requestJson: '{"other":1}' }] })).rejects.toThrow(EffectReplayConflictError);
+  });
+
+  test("review effects are never inserted before IN_REVIEW", async () => {
+    const r = await rig();
+    const unit = await submitted(r);
+    const plan = reviewEffectPlan({ ...unit, state: "IN_REVIEW", fence: unit.fence + 1 }, { unitId: unit.id, status: "approved", receipt: {} });
+    await expect(insertReviewEffects(r.db, { unitId: unit.id, reviewFence: unit.fence + 1, effects: plan.effects })).rejects.toThrow();
+    expect((await r.db.query("SELECT effect_id FROM swarmx_effects")).rows).toEqual([]);
+  });
+
+  test("assignment: owner-fenced assign and release through commands", async () => {
+    const r = await rig();
+    await r.commands.assignCell(owner, { missionPk: r.mission.id, cellId: "c9", agent: "coder" });
+    const released = await r.commands.releaseAssignment(owner, { missionPk: r.mission.id, cellId: "c9" });
+    expect(released).toMatchObject({ state: "released", owner: null, agent: null });
+  });
+
+  test("finish and cancel close the mission with chained fences", async () => {
+    const r = await rig();
+    const finished = await r.commands.finish(owner, { missionPk: r.mission.id });
+    expect(finished).toMatchObject({ state: "FINISHED", fence: 2 });
+    const other = await createMission(r.db, { project: "p", sessionId: "coord", missionId: "m2", mode: "dev", budgetPolicy: policy });
+    await r.commands.reserve(owner, { project: "p", missionId: "m2", workerAgent: "coder", callId: "cx", dispatchToken: "t", cellId: "cz", budgetCharge: 1, idemKey: "iz", attemptNo: 1 });
+    const cancelled = await r.commands.cancel(owner, { missionPk: other.id });
+    expect(cancelled.state).toBe("CANCELLED");
+    expect((await listUnits(r.db, other.id))[0]?.state).toBe("CANCELLED");
+  });
+});
+
+describe("WorkUnit effect ports", () => {
+  test("effectPortsMapCompletionOperationId maps Hive completion identity and forwards exact args", async () => {
+    const calls: { name: string; args: Record<string, unknown> }[] = [];
+    const ports = createWorkUnitEffectPorts({
+      runTool: async (name, args) => {
+        calls.push({ name, args });
+        if (name === "hive_cells") return [{ id: "c1", status: "closed", completion_operation_id: "op-1" }];
+        return { success: true };
+      },
+    });
+    expect(await ports.readHiveCell("/proj", "c1")).toEqual({ status: "closed", completionOperationId: "op-1" });
+    const args = { project_key: "/proj", bead_id: "c1", operation_id: "op-1" };
+    await ports.runBackendTool("swarm_complete", args);
+    expect(calls[1]).toEqual({ name: "swarm_complete", args });
+    expect(calls[1]?.args).toBe(args);
+  });
+
+  test("effectPortsMapCompletionOperationId returns null for a missing cell", async () => {
+    const ports = createWorkUnitEffectPorts({ runTool: async () => [] });
+    expect(await ports.readHiveCell("/proj", "c1")).toBeNull();
+  });
+
+  test("effectPortsClassifyDefiniteRejection only treats explicit rejections as definite", async () => {
+    const throwing = (value: unknown) => createWorkUnitEffectPorts({ runTool: async () => { throw value; } });
+    await expect(throwing(new DefiniteEffectError("x")).runBackendTool("swarm_complete", {})).rejects.toBeInstanceOf(DefiniteEffectError);
+    await expect(throwing(new LocalToolError("swarm_complete", "invalid_input", "bad")).runBackendTool("swarm_complete", {})).rejects.toBeInstanceOf(DefiniteEffectError);
+    for (const ambiguous of [new CliError("CliNonZero", "swarm_complete", "boom", 1), new Error("generic"), "thrown string", { success: false, error: "obj" }]) {
+      const rejection = await throwing(ambiguous).runBackendTool("swarm_complete", {}).catch((error: unknown) => error);
+      expect(rejection).not.toBeInstanceOf(DefiniteEffectError);
+    }
+    const feedback = (value: unknown) => createWorkUnitEffectPorts({ runTool: async () => value }).runBackendTool("swarm_review_feedback", {});
+    await expect(feedback({ success: false, error: "denied" })).rejects.toBeInstanceOf(DefiniteEffectError);
+    expect(await feedback({ success: true, status: "needs_changes" })).toEqual({ success: true, status: "needs_changes" });
+    expect(await feedback({ success: false, error: "denied", extra: 1 })).toEqual({ success: false, error: "denied", extra: 1 });
+    expect(await feedback({ success: false, error: 3 })).toEqual({ success: false, error: 3 });
   });
 });

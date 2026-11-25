@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { createLibSQLAdapter, type DatabaseAdapter } from "swarm-mail";
 import { ensureWorkUnitSchema, type Mission } from "../src/workunit/schema.js";
 import {
+  AssignmentReleaseConflictError,
   assignCell,
   createMission,
   getMission,
@@ -15,6 +16,12 @@ import {
   updateMissionPolicy,
 } from "../src/workunit/mission.js";
 import { getMissionByPk as storeGetMissionByPk } from "../src/workunit/store.js";
+import {
+  createWorkUnitMissionStore,
+  DerivedFieldWriteError,
+  MissionSaveValidationError,
+} from "../src/workunit/mission-store-adapter.js";
+import type { MissionCellSnapshot, MissionState } from "../src/types.js";
 
 const policy = {
   total: 12,
@@ -142,9 +149,12 @@ describe("WorkUnit mission store", () => {
     });
     const changed = await assignCell(adapter, { project: "p", cellId: "cell-1", missionPk: mission.id, agent: "worker-b", ownerSessionId: "session-b", now: 21 });
     expect(changed).toMatchObject({ owner: "session-b", agent: "worker-b", state: "assigned", updated_at: 21 });
-    const released = await releaseAssignment(adapter, { project: "p", cellId: "cell-1", now: 22 });
+    const fenced = { project: "p", cellId: "cell-1", missionPk: mission.id, ownerSessionId: "s" };
+    await expect(releaseAssignment(adapter, { ...fenced, ownerSessionId: "intruder" })).rejects.toThrow(AssignmentReleaseConflictError);
+    await expect(releaseAssignment(adapter, { ...fenced, missionPk: "mission:other" })).rejects.toThrow(AssignmentReleaseConflictError);
+    const released = await releaseAssignment(adapter, { ...fenced, now: 22 });
     expect(released).toMatchObject({ owner: null, agent: null, state: "released", updated_at: 22 });
-    expect(await releaseAssignment(adapter, { project: "p", cellId: "missing" })).toBeNull();
+    await expect(releaseAssignment(adapter, { ...fenced, cellId: "missing" })).rejects.toThrow(AssignmentReleaseConflictError);
   });
 
   test("lists mission units in stable creation order", async () => {
@@ -158,5 +168,168 @@ describe("WorkUnit mission store", () => {
       );
     }
     expect((await listUnits(adapter, mission.id)).map((unit) => unit.id)).toEqual(["unit-first", "unit-later"]);
+  });
+});
+
+describe("WorkUnit mission store adapter", () => {
+  const opened: DatabaseAdapter[] = [];
+  afterEach(async () => {
+    for (const adapter of opened.splice(0)) await adapter.close?.();
+  });
+  async function fresh(): Promise<DatabaseAdapter> {
+    const adapter = await createLibSQLAdapter({ url: ":memory:" });
+    opened.push(adapter);
+    await ensureWorkUnitSchema(adapter);
+    return adapter;
+  }
+  const T0 = "2026-01-01T00:00:00.000Z";
+  const base = (over: Partial<MissionState> = {}): MissionState => ({
+    missionID: "m1", projectID: "p", sessionID: "s", active: true, mode: "dev",
+    budget: { maxSpawns: 10, maxIterations: 2 },
+    counts: { spawns: 0, cells: 0, attemptsByCell: {}, workerSpawns: 0 },
+    createdAt: T0, updatedAt: T0, ...over,
+  });
+  function legacyReader(missions: MissionState[]) {
+    const reads: string[] = [];
+    return {
+      reads,
+      getMission: async (project: string, session: string) => {
+        reads.push(`get:${project}:${session}`);
+        return missions.filter((m) => m.projectID === project && m.sessionID === session).at(-1);
+      },
+      listMissions: async (project: string) => {
+        reads.push(`list:${project}`);
+        return missions.filter((m) => m.projectID === project);
+      },
+    };
+  }
+
+  test("WorkUnit adapter save creates a native mission with policy v1 and load projects it", async () => {
+    const adapter = await fresh();
+    const store = createWorkUnitMissionStore(adapter);
+    await store.save(base());
+    const row = await getMission(adapter, "p", "s");
+    expect(row).toMatchObject({ mission_id: "m1", state: "OPEN", fence: 0, created_at: Date.parse(T0), updated_at: Date.parse(T0) });
+    expect(JSON.parse(row?.budget_policy_json ?? "null")).toEqual({
+      total: 10, perCellIterations: 2, workerShare: { agent: "swarm-worker", maxFraction: 0.2 }, version: 1,
+    });
+    expect(await store.load("p", "s")).toEqual({
+      missionID: "m1", projectID: "p", sessionID: "s", active: true, mode: "dev",
+      budget: { maxSpawns: 10, maxIterations: 2, workerShare: 0.2 },
+      counts: { spawns: 0, cells: 0, attemptsByCell: {}, workerSpawns: 0 },
+      retryCauses: [], createdAt: T0, updatedAt: T0,
+    });
+  });
+
+  test("WorkUnit adapter load prefers native state and falls back to the read-only legacy view", async () => {
+    const adapter = await fresh();
+    const legacy = legacyReader([
+      base({ missionID: "legacy-s", counts: { spawns: 4, cells: 1, attemptsByCell: { a: 4 }, workerSpawns: 0 } }),
+      base({ missionID: "legacy-s2", sessionID: "s2" }),
+    ]);
+    const store = createWorkUnitMissionStore(adapter, { projectID: "p", legacyReader: legacy });
+    await store.save(base());
+    expect((await store.load("p", "s"))?.missionID).toBe("m1");
+    expect((await store.load("p", "s2"))?.missionID).toBe("legacy-s2");
+    expect(await store.load("p", "none")).toBeUndefined();
+    expect(await listMissions(adapter, "p", "s2")).toEqual([]);
+  });
+
+  test("WorkUnit adapter load cells projects injected Hive cells with units and assignments", async () => {
+    const adapter = await fresh();
+    const cells: MissionCellSnapshot[] = [{ id: "c1", title: "Cell one", attempts: 0 }];
+    const store = createWorkUnitMissionStore(adapter, { listCells: async () => cells });
+    await store.save(base());
+    const mission = await getMission(adapter, "p", "s");
+    await assignCell(adapter, { project: "p", cellId: "c2", missionPk: mission?.id ?? "", agent: "coder", ownerSessionId: "s" });
+    expect(await store.loadCells("p", "s")).toEqual([
+      { id: "c1", title: "Cell one", attempts: 0 },
+      { id: "c2", agent: "coder", attempts: 0 },
+    ]);
+  });
+
+  test("WorkUnit adapter list returns one current generation per session, native wins, sorted by createdAt then key", async () => {
+    const adapter = await fresh();
+    const legacy = legacyReader([
+      base({ missionID: "legacy-old-s", createdAt: "2025-01-01T00:00:00.000Z", updatedAt: "2025-01-01T00:00:00.000Z" }),
+      base({ missionID: "legacy-s2", sessionID: "s2", createdAt: "2025-06-01T00:00:00.000Z", updatedAt: "2025-06-01T00:00:00.000Z" }),
+      base({ missionID: "legacy-s3", sessionID: "s3", createdAt: T0, updatedAt: T0 }),
+    ]);
+    const store = createWorkUnitMissionStore(adapter, { projectID: "p", legacyReader: legacy });
+    await store.save(base({ missionID: "old" }));
+    await adapter.query("UPDATE swarmx_missions SET state = 'FINISHED' WHERE mission_id = 'old'");
+    await store.save(base({ missionID: "new", createdAt: "2026-02-01T00:00:00.000Z", updatedAt: "2026-02-01T00:00:00.000Z" }));
+    await store.save(base({ missionID: "a-native", sessionID: "s4" }));
+    const listed = await store.list();
+    expect(listed.map((m) => `${m.sessionID}:${m.missionID}`)).toEqual([
+      "s2:legacy-s2", "s4:a-native", "s3:legacy-s3", "s:new",
+    ]);
+  });
+
+  test("WorkUnit adapter list without legacy reader only lists native sessions", async () => {
+    const adapter = await fresh();
+    const store = createWorkUnitMissionStore(adapter);
+    await store.save(base());
+    await store.save(base({ projectID: "q", missionID: "q1" }));
+    expect((await store.list()).map((m) => `${m.projectID}:${m.missionID}`)).toEqual(["p:m1", "q:q1"]);
+  });
+
+  test("WorkUnit adapter save rejects invalid creation inputs and nonzero legacy counts", async () => {
+    const adapter = await fresh();
+    const store = createWorkUnitMissionStore(adapter);
+    const bad: MissionState[] = [
+      base({ missionID: "" }),
+      base({ missionID: undefined }),
+      base({ projectID: "" }),
+      base({ sessionID: "" }),
+      base({ active: false }),
+      base({ counts: { spawns: 1, cells: 0, attemptsByCell: {}, workerSpawns: 0 } }),
+      base({ counts: { spawns: 0, cells: 1, attemptsByCell: {}, workerSpawns: 0 } }),
+      base({ counts: { spawns: 0, cells: 0, attemptsByCell: {}, workerSpawns: 1 } }),
+      base({ counts: { spawns: 0, cells: 0, attemptsByCell: { c: 1 }, workerSpawns: 0 } }),
+      base({ updatedAt: "2026-01-02T00:00:00.000Z" }),
+      base({ createdAt: "not-a-date", updatedAt: "not-a-date" }),
+    ];
+    for (const state of bad) {
+      await expect(store.save(state)).rejects.toThrow(MissionSaveValidationError);
+    }
+    expect(await listMissions(adapter, "p")).toEqual([]);
+  });
+
+  test("WorkUnit adapter save updates writable fields, chaining fences across mutations", async () => {
+    const adapter = await fresh();
+    let tick = Date.parse(T0);
+    const store = createWorkUnitMissionStore(adapter, { now: () => ++tick });
+    await store.save(base());
+    const loaded = await store.load("p", "s");
+    if (loaded === undefined) throw new Error("missing");
+    const consolidation = { epicID: "e", cellID: "c", status: "pending" as const, createdAt: 5 };
+    await store.save({ ...loaded, mode: "audit", budget: { maxSpawns: 20, maxIterations: 3, workerShare: 0.5 }, consolidation });
+    const row = await getMission(adapter, "p", "s");
+    expect(row?.fence).toBe(3);
+    const after = await store.load("p", "s");
+    expect(after).toMatchObject({ mode: "audit", budget: { maxSpawns: 20, maxIterations: 3, workerShare: 0.5 }, consolidation });
+    if (after === undefined) throw new Error("missing");
+    await store.save(after);
+    expect((await getMission(adapter, "p", "s"))?.fence).toBe(3);
+  });
+
+  test("WorkUnit adapter save throws DerivedFieldWriteError on derived drift and rejects identity changes", async () => {
+    const adapter = await fresh();
+    const store = createWorkUnitMissionStore(adapter);
+    await store.save(base());
+    const loaded = await store.load("p", "s");
+    if (loaded === undefined) throw new Error("missing");
+    for (const drift of [
+      { ...loaded, active: false },
+      { ...loaded, counts: { ...loaded.counts, spawns: 1 } },
+      { ...loaded, counts: { ...loaded.counts, attemptsByCell: { c: 1 } } },
+      { ...loaded, retryCauses: [{ cellID: "c", epicID: "e", attempt: 2, ts: T0 }] },
+      { ...loaded, updatedAt: "2026-03-01T00:00:00.000Z" },
+    ]) {
+      await expect(store.save(drift)).rejects.toThrow(DerivedFieldWriteError);
+    }
+    await expect(store.save({ ...loaded, createdAt: "2025-03-01T00:00:00.000Z" })).rejects.toThrow(MissionSaveValidationError);
+    expect((await getMission(adapter, "p", "s"))?.fence).toBe(0);
   });
 });

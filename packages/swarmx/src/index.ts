@@ -14,6 +14,11 @@ import { Plugin } from "@opencode/plugin";
 
 import { pendingCompletionKey, registerTools } from "./catalog";
 import { createSwarmCliRunner } from "./cli";
+
+export { createWorkUnitEffectPorts, setupWorkUnitRuntime } from "./workunit/ports";
+export type { SetupWorkUnitRuntimeOptions, WorkUnitRuntime } from "./workunit/ports";
+export { createWorkUnitMissionStore, DerivedFieldWriteError } from "./workunit/mission-store-adapter";
+export { createMissionCommands, type MissionActor, type MissionCommands } from "./workunit/commands";
 import { COMPACTION_HOOK_NAME, buildCompactionContribution } from "./compaction";
 import { resolveWorkerProtocol } from "./roster";
 import { DEFAULT_WORKER_PROTOCOL } from "./worker-protocol-default";

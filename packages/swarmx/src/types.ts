@@ -9,6 +9,7 @@
 
 import type { SessionEventSink } from "./session-events";
 import type { MissionStateStore } from "./state";
+import type { WorkUnitRuntime } from "./workunit/ports";
 
 /** JSON-serialisable value, aligned with plugin storage's `Schema.Json`. */
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -188,6 +189,11 @@ export interface SwarmxRuntime {
   resolveWorkerParentSession?: (sessionID: string) => Promise<string | null | undefined>;
   /** Mission store backing budget/finish/audit/assignments. */
   store?: MissionStateStore;
+  /**
+   * Additive WorkUnit runtime (Task 13c). Undefined in the default plugin setup;
+   * tests inject it through the runtime override seam. The legacy `store` stays authoritative.
+   */
+  workUnit?: WorkUnitRuntime;
   /** Project id bound to the mission documents (production: `location.project.id`). */
   projectID?: string;
   /** Canonical project root used to constrain scoped review tools. */

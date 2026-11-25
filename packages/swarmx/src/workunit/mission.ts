@@ -219,16 +219,40 @@ export async function assignCell(
   return row;
 }
 
+export class AssignmentReleaseConflictError extends Error {
+  constructor(project: string, cellId: string) {
+    super(`Assignment ${project}/${cellId} is not held by the owning mission session`);
+    this.name = "AssignmentReleaseConflictError";
+  }
+}
+
+/**
+ * Mission/owner-fenced release: only the live mission that holds the assignment, acting
+ * through its owner session, may release it.
+ */
 export async function releaseAssignment(
   db: DatabaseAdapter,
-  input: { project: string; cellId: string; now?: number },
-): Promise<AssignmentRow | null> {
+  input: { project: string; cellId: string; missionPk: string; ownerSessionId: string; now?: number },
+): Promise<AssignmentRow> {
   const result = await db.query(
     `UPDATE swarmx_legacy_assignments SET owner = NULL, agent = NULL, state = 'released', updated_at = ?
-     WHERE project = ? AND cell_id = ? RETURNING *`,
-    [input.now ?? Date.now(), input.project, input.cellId],
+     WHERE project = ? AND cell_id = ? AND mission_pk = ? AND state = 'assigned'
+       AND EXISTS (SELECT 1 FROM swarmx_missions m WHERE m.id = ? AND m.project = ? AND m.session_id = ?
+         AND m.state IN ('OPEN', 'CLOSING'))
+     RETURNING *`,
+    [input.now ?? Date.now(), input.project, input.cellId, input.missionPk, input.missionPk, input.project, input.ownerSessionId],
   );
-  return asAssignment(result.rows[0]);
+  const row = asAssignment(result.rows[0]);
+  if (row === null) throw new AssignmentReleaseConflictError(input.project, input.cellId);
+  return row;
+}
+
+export async function updateMissionMode(
+  db: DatabaseAdapter,
+  input: { missionPk: string; expectedFence: number; mode: MissionMode; now?: number },
+): Promise<Mission> {
+  if (input.mode !== "dev" && input.mode !== "audit") throw new MissionPolicyValidationError("Unsupported mission mode");
+  return updateMission(db, input, "mode = ?", [input.mode]);
 }
 
 export async function listUnits(db: DatabaseAdapter, missionPk: string): Promise<WorkUnit[]> {

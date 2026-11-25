@@ -3561,3 +3561,78 @@ describe("mission gate → settle sequence", () => {
     expect(event.result).toBeUndefined();
   });
 });
+
+
+describe("WorkUnit runtime setup (additive)", () => {
+  test("setup order: host identity -> schema -> recovery -> adapter/commands, with no tombstone or migration", async () => {
+    const { createLibSQLAdapter } = await import("swarm-mail");
+    const { setupWorkUnitRuntime } = await import("../src/index");
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      const steps: string[] = [];
+      const legacyReads: string[] = [];
+      const workUnit = await setupWorkUnitRuntime(db, {
+        host: { hostInstanceId: "h", hostname: "box", pid: 42 },
+        isProcessAlive: () => false,
+        trace: (step) => steps.push(step),
+        projectID: PROJECT,
+        legacyReader: {
+          getMission: async () => { legacyReads.push("get"); return undefined; },
+          listMissions: async () => { legacyReads.push("list"); return []; },
+        },
+      });
+      expect(steps).toEqual(["host", "schema", "recovery", "adapter", "commands"]);
+      expect(workUnit.recovery).toEqual({ recovered: 0, foreignHostCandidates: [] });
+      expect(workUnit.host).toEqual({ hostInstanceId: "h", hostname: "box", pid: 42 });
+      expect(await workUnit.store.list()).toEqual([]);
+      expect(legacyReads).toEqual(["list"]);
+      const missions = await db.query("SELECT COUNT(id) AS n FROM swarmx_missions");
+      expect(Number((missions.rows[0] as { n: unknown }).n)).toBe(0);
+      const ports = workUnit.createEffectPorts({ runTool: async () => ({ success: true }) });
+      expect(typeof ports.runBackendTool).toBe("function");
+    } finally {
+      await db.close?.();
+    }
+  });
+
+  test("setup recovers stale same-host effects after ensuring the schema", async () => {
+    const { createLibSQLAdapter } = await import("swarm-mail");
+    const { setupWorkUnitRuntime } = await import("../src/index");
+    const { ensureWorkUnitSchema } = await import("../src/workunit/schema");
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      await ensureWorkUnitSchema(db);
+      await db.query(
+        `INSERT INTO swarmx_effects (effect_id, unit_id, kind, mandatory, unit_fence, state, claim_token, host_instance_id, claimed_hostname, claimed_by_pid, updated_at)
+         VALUES ('e', 'u', 'backend_complete', 1, 1, 'in_flight', 'tok', 'h', 'box', 7, 0)`,
+      );
+      const workUnit = await setupWorkUnitRuntime(db, { host: { hostInstanceId: "h", hostname: "box", pid: 42 }, isProcessAlive: () => false });
+      expect(workUnit.recovery.recovered).toBe(1);
+    } finally {
+      await db.close?.();
+    }
+  });
+
+  test("setup: default plugin keeps the legacy store and writes no tombstone; workUnit is injectable via the override seam", async () => {
+    const { createLibSQLAdapter } = await import("swarm-mail");
+    const { setupWorkUnitRuntime } = await import("../src/index");
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      const workUnit = await setupWorkUnitRuntime(db, { host: { hostInstanceId: "h", hostname: "box", pid: 42 }, isProcessAlive: () => true });
+      for (const overrides of [{}, { runtime: { workUnit } }]) {
+        const ctx = createFakeContext({ projectId: PROJECT });
+        const plugin = createSwarmxPlugin(overrides);
+        await plugin.setup(ctx as unknown as Plugin.Context);
+        expect(ctx.captures.toolTransforms).toHaveLength(1);
+        const editor = ctx.createEditor();
+        ctx.captures.toolTransforms[0]?.(editor);
+        expect(editor.list().length).toBeGreaterThan(0);
+        expect([...ctx.storage.map.keys()].filter((key) => key.startsWith("legacy-tombstone:"))).toEqual([]);
+      }
+      const missions = await db.query("SELECT COUNT(id) AS n FROM swarmx_missions");
+      expect(Number((missions.rows[0] as { n: unknown }).n)).toBe(0);
+    } finally {
+      await db.close?.();
+    }
+  });
+});
