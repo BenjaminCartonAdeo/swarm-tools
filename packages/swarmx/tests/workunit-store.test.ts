@@ -5,6 +5,9 @@ import { ensureWorkUnitSchema } from "../src/workunit/schema.js";
 import {
   bindWorkUnit,
   BudgetExceededError,
+  BudgetGateError,
+  BudgetPolicyError,
+  AssignmentMismatchError,
   CallSettledError,
   CellBusyError,
   FenceConflictError,
@@ -61,6 +64,7 @@ function reservation(project = "p", overrides: Partial<Parameters<typeof reserve
     project,
     missionId: "mission",
     sessionId: "session",
+    workerAgent: "agent-1",
     callId: "call-1",
     dispatchToken: "dispatch-1",
     cellId: "cell-1",
@@ -69,6 +73,26 @@ function reservation(project = "p", overrides: Partial<Parameters<typeof reserve
     attemptNo: 1,
     ...overrides,
   };
+}
+
+async function setBudgetPolicy(
+  db: DatabaseAdapter,
+  policy: unknown,
+  missionPk = "mission-pk-mission",
+): Promise<void> {
+  await db.query("UPDATE swarmx_missions SET budget_policy_json = ? WHERE id = ?", [JSON.stringify(policy), missionPk]);
+}
+
+async function setAssignment(
+  db: DatabaseAdapter,
+  cellId: string,
+  { state, owner, agent }: { state: string | null; owner: string | null; agent: string | null },
+): Promise<void> {
+  await db.query(
+    `INSERT INTO swarmx_legacy_assignments (project, cell_id, owner, agent, state, raw_json, created_at)
+     VALUES ('p', ?, ?, ?, ?, '{}', 0)`,
+    [cellId, owner, agent, state],
+  );
 }
 
 async function withWorkUnitDb(run: (db: DatabaseAdapter) => Promise<void>): Promise<void> {
@@ -510,6 +534,168 @@ describe("WorkUnit reservation, retry, and legacy assignment", () => {
     });
   });
 
+  test("totalPolicyBudgetGateRejectsChargedOverage", async () => {
+    await withWorkUnitDb(async (db) => {
+      await seedMission(db);
+      await setBudgetPolicy(db, { total: 3, perCellIterations: 10, workerShare: null, version: 1 });
+      await reserveWorkUnit(db, reservation("p", { budgetCharge: 2 }));
+      await expect(reserveWorkUnit(db, reservation("p", { callId: "call-2", idemKey: "idem-2", cellId: "cell-2", budgetCharge: 1.01 })))
+        .rejects.toMatchObject({ name: "BudgetGateError", gate: "total" });
+    });
+  });
+
+  test("perCellPolicyCountsChargedTerminalAndRetryUnitsOnly", async () => {
+    await withWorkUnitDb(async (db) => {
+      const missionPk = await seedMission(db);
+      await setBudgetPolicy(db, { total: 20, perCellIterations: 1, workerShare: null, version: 1 });
+      await db.query(
+        `INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, cell_id, idem_key, attempt_no, retry_of, state, fence, budget_charge, legacy_source, created_at, updated_at)
+         VALUES ('charged-old', 'p', ?, 'old-call', 'cell-1', 'old-idem', 1, NULL, 'REVOKED', 1, 0.5, 'legacy', 0, 0)`,
+        [missionPk],
+      );
+      await db.query(
+        `INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, cell_id, idem_key, attempt_no, retry_of, state, fence, budget_charge, created_at, updated_at)
+         VALUES ('charged-retry', 'p', ?, 'retry-call', 'cell-1', 'retry-idem', 2, 'charged-old', 'FAILED', 1, 0.5, 0, 0)`,
+        [missionPk],
+      );
+      await expect(reserveWorkUnit(db, reservation("p", { callId: "next", idemKey: "next-idem", budgetCharge: 0.25 })))
+        .rejects.toMatchObject({ name: "BudgetGateError", gate: "cell" });
+      const followup = await reserveWorkUnit(db, reservation("p", { callId: "read-only", idemKey: "read-only-idem", budgetCharge: 0 }));
+      expect(followup.budget_charge).toBe(0);
+    });
+  });
+
+  test("zeroChargeReadOnlyFollowupDoesNotConsumePerCellIteration", async () => {
+    await withWorkUnitDb(async (db) => {
+      await seedMission(db);
+      await setBudgetPolicy(db, { total: 5, perCellIterations: 1, workerShare: null, version: 1 });
+      const original = await reserveWorkUnit(db, reservation());
+      await db.query("UPDATE swarmx_work_units SET state = 'DONE' WHERE id = ?", [original.id]);
+      const followup = await reserveWorkUnit(db, reservation("p", { callId: "followup", idemKey: "followup-idem", budgetCharge: 0 }));
+      expect(followup.state).toBe("RESERVED");
+    });
+  });
+
+  test("sharePolicyEnforcesBoundaryOnlyForConfiguredAgent", async () => {
+    await withWorkUnitDb(async (db) => {
+      await seedMission(db);
+      await setBudgetPolicy(db, { total: 20, perCellIterations: 20, workerShare: { agent: "agent-1", maxFraction: 0.5 }, version: 1 });
+      const otherAgent = await reserveWorkUnit(db, reservation("p", { workerAgent: "agent-2", budgetCharge: 2 }));
+      await db.query("UPDATE swarmx_work_units SET state = 'DONE' WHERE id = ?", [otherAgent.id]);
+      const boundary = await reserveWorkUnit(db, reservation("p", { callId: "boundary", idemKey: "boundary-idem", cellId: "cell-2", budgetCharge: 2 }));
+      expect(boundary.worker_agent).toBe("agent-1");
+      await expect(reserveWorkUnit(db, reservation("p", { callId: "over", idemKey: "over-idem", cellId: "cell-3", budgetCharge: 1 })))
+        .rejects.toMatchObject({ name: "BudgetGateError", gate: "share" });
+      const nonPolicyAgent = await reserveWorkUnit(db, reservation("p", { workerAgent: "agent-2", callId: "non-policy", idemKey: "non-policy-idem", cellId: "cell-4", budgetCharge: 1 }));
+      expect(nonPolicyAgent.worker_agent).toBe("agent-2");
+    });
+  });
+
+  test("nullPolicyUsesLegacyBudgetLimitAndMalformedOrUnsupportedPolicyFailsClosed", async () => {
+    await withWorkUnitDb(async (db) => {
+      await seedMission(db, { budgetLimit: 2 });
+      await reserveWorkUnit(db, reservation("p", { budgetCharge: 2 }));
+      await expect(reserveWorkUnit(db, reservation("p", { callId: "legacy-over", idemKey: "legacy-over", cellId: "cell-2", budgetCharge: 0.1 })))
+        .rejects.toBeInstanceOf(BudgetExceededError);
+
+      await db.query("UPDATE swarmx_missions SET budget_policy_json = ? WHERE id = ?", ["{bad-json", "mission-pk-mission"]);
+      await expect(reserveWorkUnit(db, reservation("p", { callId: "bad-json", idemKey: "bad-json", cellId: "cell-3" })))
+        .rejects.toBeInstanceOf(BudgetPolicyError);
+      await setBudgetPolicy(db, { total: 10, perCellIterations: 10, workerShare: null, version: 2 });
+      await expect(reserveWorkUnit(db, reservation("p", { callId: "bad-version", idemKey: "bad-version", cellId: "cell-4" })))
+        .rejects.toBeInstanceOf(BudgetPolicyError);
+    });
+  });
+
+  test("assignmentGateRejectsOnlyOwnedAssignedDifferentAgent", async () => {
+    await withWorkUnitDb(async (db) => {
+      await seedMission(db);
+      await setBudgetPolicy(db, { total: 20, perCellIterations: 20, workerShare: null, version: 1 });
+      await setAssignment(db, "assigned-mismatch", { state: "assigned", owner: "owner", agent: "agent-2" });
+      await expect(reserveWorkUnit(db, reservation("p", { cellId: "assigned-mismatch" })))
+        .rejects.toBeInstanceOf(AssignmentMismatchError);
+      const allowed = [
+        { cellId: "no-row", row: null },
+        { cellId: "unowned", row: { state: "assigned", owner: null, agent: "agent-2" } },
+        { cellId: "agent-null", row: { state: "assigned", owner: "owner", agent: null } },
+        { cellId: "released", row: { state: "released", owner: "owner", agent: "agent-2" } },
+        { cellId: "legacy-ambiguous", row: { state: "legacy_ambiguous", owner: "owner", agent: "agent-2" } },
+        { cellId: "null-state", row: { state: null, owner: "owner", agent: "agent-2" } },
+        { cellId: "matching", row: { state: "assigned", owner: "owner", agent: "agent-1" } },
+      ];
+      for (const entry of allowed) {
+        if (entry.row !== null) await setAssignment(db, entry.cellId, entry.row);
+        const unit = await reserveWorkUnit(db, reservation("p", {
+          cellId: entry.cellId, callId: `call-${entry.cellId}`, idemKey: `idem-${entry.cellId}`, budgetCharge: 0,
+        }));
+        expect(unit.cell_id).toBe(entry.cellId);
+      }
+    });
+  });
+
+  test("bindRequiresTheAgentReservedOnTheWorkUnitAndMismatchWritesNothing", async () => {
+    await withWorkUnitDb(async (db) => {
+      await seedMission(db);
+      const reserved = await reserveWorkUnit(db, reservation());
+      await expect(bindWorkUnit(db, {
+        unitId: reserved.id, expectedState: "RESERVED", unitFence: 1,
+        workerSessionId: "worker-session", workerAgent: "agent-2",
+      })).rejects.toBeInstanceOf(AssignmentMismatchError);
+      expect(await getWorkUnit(db, reserved.id)).toMatchObject({ state: "RESERVED", fence: 1, worker_agent: "agent-1" });
+      const bound = await bindWorkUnit(db, {
+        unitId: reserved.id, expectedState: "RESERVED", unitFence: 1,
+        workerSessionId: "worker-session", workerAgent: "agent-1",
+      });
+      expect(bound.worker_agent).toBe("agent-1");
+    });
+  });
+
+  test("retryUsesExplicitAgentAndRechecksBudgetAndAssignmentGates", async () => {
+    await withWorkUnitDb(async (db) => {
+      const missionPk = await seedMission(db);
+      await setBudgetPolicy(db, { total: 2, perCellIterations: 2, workerShare: { agent: "agent-2", maxFraction: 0.5 }, version: 1 });
+      const original = await reserveWorkUnit(db, reservation("p", { budgetCharge: 1 }));
+      await db.query("UPDATE swarmx_work_units SET state = 'FAILED', worker_agent = 'agent-1' WHERE id = ?", [original.id]);
+      const retried = await retryWorkUnit(db, {
+        priorUnitId: original.id, sessionId: "session", workerAgent: "agent-2", callId: "retry-call",
+        dispatchToken: "retry-dispatch", budgetCharge: 1,
+      });
+      expect(retried.worker_agent).toBe("agent-2");
+      await db.query("UPDATE swarmx_work_units SET state = 'FAILED' WHERE id = ?", [retried.id]);
+      await expect(retryWorkUnit(db, {
+        priorUnitId: retried.id, sessionId: "session", workerAgent: "agent-2", callId: "retry-over-budget",
+        dispatchToken: "retry-dispatch-over-budget", budgetCharge: 1,
+      })).rejects.toMatchObject({ name: "BudgetGateError", gate: "total" });
+      await setBudgetPolicy(db, { total: 5, perCellIterations: 2, workerShare: { agent: "agent-2", maxFraction: 0.5 }, version: 1 });
+      await setAssignment(db, "cell-1", { state: "assigned", owner: "owner", agent: "agent-1" });
+      await expect(retryWorkUnit(db, {
+        priorUnitId: retried.id, sessionId: "session", workerAgent: "agent-2", callId: "retry-blocked",
+        dispatchToken: "retry-dispatch-2", budgetCharge: 1,
+      })).rejects.toBeInstanceOf(AssignmentMismatchError);
+      const units = await db.query("SELECT id, worker_agent FROM swarmx_work_units WHERE mission_pk = ?", [missionPk]);
+      expect(units.rows).toHaveLength(2);
+    });
+  });
+
+  test("existingReservationDiagnosticsPrecedePolicyAssignmentAndBudgetGates", async () => {
+    await withWorkUnitDb(async (db) => {
+      await seedMission(db);
+      const original = await reserveWorkUnit(db, reservation());
+      await setAssignment(db, "cell-1", { state: "assigned", owner: "owner", agent: "wrong-agent" });
+      await db.query("UPDATE swarmx_missions SET budget_policy_json = ? WHERE id = ?", ["broken", "mission-pk-mission"]);
+      await expect(reserveWorkUnit(db, reservation("p", { dispatchToken: "changed" })))
+        .rejects.toBeInstanceOf(ReservationConflictError);
+      await expect(reserveWorkUnit(db, reservation("p", { callId: "different-call", idemKey: "idem-1", cellId: "cell-2" })))
+        .rejects.toBeInstanceOf(IdempotencyConflictError);
+      await expect(reserveWorkUnit(db, reservation("p", { callId: "cell-call", idemKey: "cell-idem" })))
+        .rejects.toBeInstanceOf(CellBusyError);
+      await db.query("UPDATE swarmx_missions SET state = 'CLOSING' WHERE id = ?", ["mission-pk-mission"]);
+      await expect(reserveWorkUnit(db, reservation("p", { callId: "closed", idemKey: "closed", cellId: "cell-3" })))
+        .rejects.toBeInstanceOf(MissionClosedError);
+      expect(await getWorkUnit(db, original.id)).not.toBeNull();
+    });
+  });
+
   test("onlyOneLiveUnitPerProjectCell", async () => {
     await withWorkUnitDb(async (db) => {
       await seedMission(db);
@@ -525,9 +711,9 @@ describe("WorkUnit reservation, retry, and legacy assignment", () => {
       const reserved = await reserveWorkUnit(db, reservation());
       const bound = await bindWorkUnit(db, {
         unitId: reserved.id, expectedState: "RESERVED", unitFence: 1,
-        workerSessionId: "worker-session", workerAgent: "worker-agent",
+        workerSessionId: "worker-session", workerAgent: "agent-1",
       });
-      expect(bound).toMatchObject({ state: "BOUND", fence: 2, worker_session: "worker-session", worker_agent: "worker-agent" });
+      expect(bound).toMatchObject({ state: "BOUND", fence: 2, worker_session: "worker-session", worker_agent: "agent-1" });
     });
   });
 
@@ -537,7 +723,7 @@ describe("WorkUnit reservation, retry, and legacy assignment", () => {
       const original = await reserveWorkUnit(db, reservation());
       await db.query("UPDATE swarmx_work_units SET state = 'CHANGES_REQUESTED', reason = 'preserve this feedback' WHERE id = ?", [original.id]);
       const retried = await retryWorkUnit(db, {
-        priorUnitId: original.id, sessionId: "session", callId: "call-2", dispatchToken: "dispatch-2", budgetCharge: 3,
+        priorUnitId: original.id, sessionId: "session", workerAgent: "agent-2", callId: "call-2", dispatchToken: "dispatch-2", budgetCharge: 3,
       });
       const expectedIdem = createHash("sha256").update("p|mission|cell-1|2").digest("hex");
       expect(retried).toMatchObject({
@@ -554,7 +740,7 @@ describe("WorkUnit reservation, retry, and legacy assignment", () => {
       await seedMission(db);
       const original = await reserveWorkUnit(db, reservation());
       await expect(retryWorkUnit(db, {
-        priorUnitId: original.id, sessionId: "session", callId: "call-2", dispatchToken: "dispatch-2", budgetCharge: 1,
+        priorUnitId: original.id, sessionId: "session", workerAgent: "agent-2", callId: "call-2", dispatchToken: "dispatch-2", budgetCharge: 1,
       })).rejects.toBeInstanceOf(RetryNotAllowedError);
     });
   });

@@ -78,10 +78,33 @@ export class CellBusyError extends Error {
   }
 }
 
-export class BudgetExceededError extends Error {
+export class BudgetGateError extends Error {
+  readonly gate: "total" | "cell" | "share";
+  constructor(gate: "total" | "cell" | "share") {
+    super(`WorkUnit reservation exceeds the mission ${gate} budget gate`);
+    this.name = "BudgetGateError";
+    this.gate = gate;
+  }
+}
+
+export class BudgetExceededError extends BudgetGateError {
   constructor() {
-    super("WorkUnit reservation exceeds the mission budget");
+    super("total");
     this.name = "BudgetExceededError";
+  }
+}
+
+export class AssignmentMismatchError extends Error {
+  constructor() {
+    super("WorkUnit reservation or binding does not match the assigned agent");
+    this.name = "AssignmentMismatchError";
+  }
+}
+
+export class BudgetPolicyError extends Error {
+  constructor() {
+    super("Mission budget policy is malformed or unsupported");
+    this.name = "BudgetPolicyError";
   }
 }
 
@@ -237,6 +260,7 @@ export interface ReserveWorkUnitInput {
   project: string;
   missionId: string;
   sessionId: string;
+  workerAgent: string;
   callId: string;
   dispatchToken: string;
   cellId: string;
@@ -244,6 +268,39 @@ export interface ReserveWorkUnitInput {
   idemKey: string;
   attemptNo: number;
   retryOf?: string;
+}
+
+interface BudgetPolicyV1 {
+  total: number;
+  perCellIterations: number;
+  workerShare: { agent: string; maxFraction: number } | null;
+  version: 1;
+}
+
+function parseBudgetPolicy(value: unknown): BudgetPolicyV1 {
+  if (typeof value !== "string") throw new BudgetPolicyError();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new BudgetPolicyError();
+  }
+  if (!isRecord(parsed)) throw new BudgetPolicyError();
+  const { total, perCellIterations, workerShare, version } = parsed;
+  if (version !== 1 || typeof total !== "number" || !Number.isFinite(total) || total < 0
+    || typeof perCellIterations !== "number" || !Number.isSafeInteger(perCellIterations) || perCellIterations < 0) {
+    throw new BudgetPolicyError();
+  }
+  let parsedShare: BudgetPolicyV1["workerShare"] = null;
+  if (workerShare !== null) {
+    if (!isRecord(workerShare) || typeof workerShare.agent !== "string" || workerShare.agent.length === 0
+      || typeof workerShare.maxFraction !== "number" || !Number.isFinite(workerShare.maxFraction)
+      || workerShare.maxFraction < 0 || workerShare.maxFraction > 1) {
+      throw new BudgetPolicyError();
+    }
+    parsedShare = { agent: workerShare.agent, maxFraction: workerShare.maxFraction };
+  }
+  return { total, perCellIterations, workerShare: parsedShare, version: 1 };
 }
 
 function valueAsString(value: unknown): string | null {
@@ -260,6 +317,7 @@ function sameReservation(unit: WorkUnit, missionPk: string, input: ReserveWorkUn
   return unit.mission_pk === missionPk
     && unit.cell_id === input.cellId
     && unit.dispatch_token === input.dispatchToken
+    && unit.worker_agent === input.workerAgent
     && unit.budget_charge === input.budgetCharge
     && unit.idem_key === input.idemKey
     && unit.attempt_no === input.attemptNo
@@ -274,26 +332,63 @@ export async function reserveWorkUnit(db: DatabaseAdapter, input: ReserveWorkUni
   const now = Date.now();
   const inserted = await db.query(
     `INSERT INTO swarmx_work_units
-      (id, project, mission_pk, call_id, cell_id, idem_key, attempt_no, retry_of, state, fence, dispatch_token, budget_charge, created_at, updated_at)
+      (id, project, mission_pk, call_id, cell_id, idem_key, attempt_no, retry_of, state, fence, dispatch_token, worker_agent, budget_charge, created_at, updated_at)
      SELECT 'unit:' || m.project || ':' || m.mission_id || ':' || ?,
-       m.project, m.id, ?, ?, ?, ?, ?, 'RESERVED', 1, ?, ?, ?, ?
-     FROM swarmx_missions AS m
-     WHERE m.project = ? AND m.mission_id = ? AND m.session_id = ? AND m.state = 'OPEN'
-       AND (m.budget_limit IS NULL OR
-         COALESCE((SELECT SUM(existing.budget_charge) FROM swarmx_work_units AS existing WHERE existing.mission_pk = m.id), 0) + ? <= m.budget_limit)
-     ON CONFLICT DO NOTHING
-     RETURNING *`,
+        m.project, m.id, ?, ?, ?, ?, ?, 'RESERVED', 1, ?, ?, ?, ?, ?
+      FROM swarmx_missions AS m
+      WHERE m.project = ? AND m.mission_id = ? AND m.session_id = ? AND m.state = 'OPEN'
+        AND NOT EXISTS (
+          SELECT 1 FROM swarmx_legacy_assignments AS assignment
+          WHERE assignment.project = m.project AND assignment.cell_id = ?
+            AND assignment.state = 'assigned' AND assignment.owner IS NOT NULL
+            AND assignment.agent IS NOT NULL AND assignment.agent <> ?)
+        AND CASE WHEN m.budget_policy_json IS NULL THEN
+          (m.budget_limit IS NULL OR
+            COALESCE((SELECT SUM(existing.budget_charge) FROM swarmx_work_units AS existing WHERE existing.mission_pk = m.id), 0) + ? <= m.budget_limit)
+        ELSE CASE WHEN json_valid(m.budget_policy_json) THEN
+          CASE WHEN json_type(m.budget_policy_json) = 'object'
+            AND json_type(m.budget_policy_json, '$.version') = 'integer'
+            AND json_extract(m.budget_policy_json, '$.version') = 1
+            AND json_type(m.budget_policy_json, '$.total') IN ('integer', 'real')
+            AND json_extract(m.budget_policy_json, '$.total') >= 0
+            AND json_extract(m.budget_policy_json, '$.total') <= 1.7976931348623157e308
+            AND json_type(m.budget_policy_json, '$.perCellIterations') = 'integer'
+            AND json_extract(m.budget_policy_json, '$.perCellIterations') >= 0
+            AND json_extract(m.budget_policy_json, '$.perCellIterations') <= 9007199254740991
+            AND (json_type(m.budget_policy_json, '$.workerShare') = 'null' OR (
+              json_type(m.budget_policy_json, '$.workerShare') = 'object'
+              AND json_type(m.budget_policy_json, '$.workerShare.agent') = 'text'
+              AND length(json_extract(m.budget_policy_json, '$.workerShare.agent')) > 0
+              AND json_type(m.budget_policy_json, '$.workerShare.maxFraction') IN ('integer', 'real')
+              AND json_extract(m.budget_policy_json, '$.workerShare.maxFraction') >= 0
+              AND json_extract(m.budget_policy_json, '$.workerShare.maxFraction') <= 1))
+          THEN
+            COALESCE((SELECT SUM(existing.budget_charge) FROM swarmx_work_units AS existing WHERE existing.mission_pk = m.id), 0) + ? <= json_extract(m.budget_policy_json, '$.total')
+            AND (? <= 0 OR (SELECT COUNT(existing.id) FROM swarmx_work_units AS existing
+              WHERE existing.mission_pk = m.id AND existing.cell_id = ? AND existing.budget_charge > 0)
+              < json_extract(m.budget_policy_json, '$.perCellIterations'))
+            AND (json_type(m.budget_policy_json, '$.workerShare') = 'null'
+              OR json_extract(m.budget_policy_json, '$.workerShare.agent') <> ?
+              OR COALESCE((SELECT SUM(existing.budget_charge) FROM swarmx_work_units AS existing
+                WHERE existing.mission_pk = m.id AND existing.worker_agent = json_extract(m.budget_policy_json, '$.workerShare.agent')), 0) + ?
+                <= json_extract(m.budget_policy_json, '$.workerShare.maxFraction') *
+                  (COALESCE((SELECT SUM(existing.budget_charge) FROM swarmx_work_units AS existing WHERE existing.mission_pk = m.id), 0) + ?))
+          ELSE 0 END
+        ELSE 0 END END
+      ON CONFLICT DO NOTHING
+      RETURNING *`,
     [
       input.callId, input.callId, input.cellId, input.idemKey, input.attemptNo, input.retryOf ?? null,
-      input.dispatchToken, input.budgetCharge, now, now, input.project, input.missionId, input.sessionId,
-      input.budgetCharge,
+      input.dispatchToken, input.workerAgent, input.budgetCharge, now, now, input.project, input.missionId, input.sessionId,
+      input.cellId, input.workerAgent, input.budgetCharge, input.budgetCharge, input.budgetCharge,
+      input.cellId, input.workerAgent, input.budgetCharge, input.budgetCharge,
     ],
   );
   const insertedRow: unknown = inserted.rows[0];
   if (isRecord(insertedRow)) return insertedRow as unknown as WorkUnit;
 
   const missionResult = await db.query(
-    `SELECT id, session_id, state, budget_limit FROM swarmx_missions
+    `SELECT id, session_id, state, budget_limit, budget_policy_json FROM swarmx_missions
      WHERE project = ? AND mission_id = ?
      ORDER BY CASE WHEN session_id = ? THEN 0 ELSE 1 END LIMIT 1`,
     [input.project, input.missionId, input.sessionId],
@@ -330,10 +425,40 @@ export async function reserveWorkUnit(db: DatabaseAdapter, input: ReserveWorkUni
   if (cellResult.rows.length > 0) throw new CellBusyError(input.cellId);
 
   if (valueAsString(mission.state) !== "OPEN") throw new MissionClosedError(input.missionId);
+  const rawPolicy = mission.budget_policy_json;
+  const policy = rawPolicy === null || rawPolicy === undefined ? null : parseBudgetPolicy(rawPolicy);
+  const assignmentResult = await db.query(
+    `SELECT 1 FROM swarmx_legacy_assignments
+     WHERE project = ? AND cell_id = ? AND state = 'assigned' AND owner IS NOT NULL
+       AND agent IS NOT NULL AND agent <> ? LIMIT 1`,
+    [input.project, input.cellId, input.workerAgent],
+  );
+  if (assignmentResult.rows.length > 0) throw new AssignmentMismatchError();
+
+  const budgetStatsResult = await db.query(
+    `SELECT COALESCE(SUM(budget_charge), 0) AS total,
+       COALESCE(SUM(CASE WHEN worker_agent = ? THEN budget_charge ELSE 0 END), 0) AS agent_total,
+       SUM(CASE WHEN cell_id = ? AND budget_charge > 0 THEN 1 ELSE 0 END) AS cell_iterations
+     FROM swarmx_work_units WHERE mission_pk = ?`,
+    [policy?.workerShare?.agent ?? "", input.cellId, missionPk],
+  );
+  const budgetStats: unknown = budgetStatsResult.rows[0];
+  const chargedTotal = isRecord(budgetStats) ? (valueAsNumber(budgetStats.total) ?? 0) : 0;
+  const cellIterations = isRecord(budgetStats) ? (valueAsNumber(budgetStats.cell_iterations) ?? 0) : 0;
+  if (policy !== null) {
+    if (chargedTotal + input.budgetCharge > policy.total) throw new BudgetGateError("total");
+    if (input.budgetCharge > 0 && cellIterations >= policy.perCellIterations) throw new BudgetGateError("cell");
+    const agentTotal = isRecord(budgetStats) ? (valueAsNumber(budgetStats.agent_total) ?? 0) : 0;
+    if (policy.workerShare !== null && input.workerAgent === policy.workerShare.agent
+      && agentTotal + input.budgetCharge > policy.workerShare.maxFraction * (chargedTotal + input.budgetCharge)) {
+      throw new BudgetGateError("share");
+    }
+  }
   const budgetLimit = valueAsNumber(mission.budget_limit);
-  if (budgetLimit !== null && (await getMissionBudgetUsed(db, missionPk)) + input.budgetCharge > budgetLimit) {
+  if (policy === null && budgetLimit !== null && chargedTotal + input.budgetCharge > budgetLimit) {
     throw new BudgetExceededError();
   }
+  if (policy !== null) throw new ReservationConflictError("WorkUnit reservation failed an undiagnosed budget gate");
   throw new ReservationConflictError("WorkUnit reservation did not match a diagnosable conflict");
 }
 
@@ -341,20 +466,39 @@ export async function bindWorkUnit(
   db: DatabaseAdapter,
   input: TransitionFence & { workerSessionId: string; workerAgent: string },
 ): Promise<WorkUnit> {
-  return transitionWorkUnit(db, {
-    unitId: input.unitId,
-    expectedState: input.expectedState,
-    unitFence: input.unitFence,
-    nextState: "BOUND",
-    patch: { kind: "bind", workerSession: input.workerSessionId, workerAgent: input.workerAgent },
-  });
+  if (!(LEGAL_WORK_UNIT_TRANSITIONS[input.expectedState] as readonly WorkUnitState[]).includes("BOUND")) {
+    throw new IllegalTransitionError(input.expectedState, "BOUND");
+  }
+  const result = await db.query(
+    `UPDATE swarmx_work_units
+     SET state = 'BOUND', fence = fence + 1, updated_at = ?, worker_session = ?, worker_agent = ?
+     WHERE id = ? AND state = ? AND fence = ? AND worker_agent = ? RETURNING *`,
+    [Date.now(), input.workerSessionId, input.workerAgent, input.unitId, input.expectedState, input.unitFence, input.workerAgent],
+  );
+  const row: unknown = result.rows[0];
+  if (isRecord(row)) return row as unknown as WorkUnit;
+  const current = await getWorkUnit(db, input.unitId);
+  if (current !== null && current.state === input.expectedState && current.fence === input.unitFence
+    && current.worker_agent !== input.workerAgent) {
+    throw new AssignmentMismatchError();
+  }
+  throw new FenceConflictError(input.unitId, input.expectedState, input.unitFence);
 }
 
 const retryableStates = new Set<WorkUnitState>(["CHANGES_REQUESTED", "REJECTED", "ABANDONED", "FAILED", "REVOKED"]);
 
+export interface RetryWorkUnitInput {
+  priorUnitId: string;
+  sessionId: string;
+  workerAgent: string;
+  callId: string;
+  dispatchToken: string;
+  budgetCharge: number;
+}
+
 export async function retryWorkUnit(
   db: DatabaseAdapter,
-  input: { priorUnitId: string; sessionId: string; callId: string; dispatchToken: string; budgetCharge: number },
+  input: RetryWorkUnitInput,
 ): Promise<WorkUnit> {
   const prior = await getWorkUnit(db, input.priorUnitId);
   if (prior === null || !retryableStates.has(prior.state) || prior.cell_id === null) {
@@ -375,6 +519,7 @@ export async function retryWorkUnit(
     project: prior.project,
     missionId,
     sessionId: input.sessionId,
+    workerAgent: input.workerAgent,
     callId: input.callId,
     dispatchToken: input.dispatchToken,
     cellId: prior.cell_id,

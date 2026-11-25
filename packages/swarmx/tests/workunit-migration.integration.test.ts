@@ -315,6 +315,7 @@ describe("legacy lifecycle import", () => {
       project: P,
       missionId: "m1",
       sessionId: "s1",
+      workerAgent: "agent-1",
       callId: "new-call",
       dispatchToken: "new-tok",
       cellId: "c99",
