@@ -468,6 +468,15 @@ describe("work unit effect runner", () => {
     expect(effect.state).toBe("failed_optional");
   });
 
+  test("consolidate without resolvable epic_id makes no port call and is failed_optional", async () => {
+    const db = await seedUnit([{ effectId: "eff-k", kind: "consolidate", mandatory: false, request: { projectKey: "proj", unitId: "unit-1" } }]);
+    await db.query("UPDATE swarmx_missions SET epic_id = NULL WHERE id = 'mission-1'");
+    const ports = fakePorts();
+    const effect = await runWorkUnitEffect(db, { effectId: "eff-k", host: HOST, ports });
+    expect(effect.state).toBe("failed_optional");
+    expect(ports.order).toEqual([]);
+  });
+
   test("multipleFollowupsUseDistinctOperationIds", async () => {
     const db = await seedUnit([
       { effectId: "eff-f0", kind: "followup:0", mandatory: false, request: { title: "A", parent_id: "epic-9" }, operationId: "op-0" },

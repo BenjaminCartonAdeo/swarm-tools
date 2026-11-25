@@ -286,9 +286,13 @@ async function runOptional(
   try {
     if (effect.kind === "consolidate") {
       const stored = request ?? {};
+      const epicId = typeof stored.epicId === "string" && stored.epicId.length > 0 ? stored.epicId : mission.epic_id;
+      if (typeof epicId !== "string" || epicId.length === 0) {
+        return { state: "failed_optional", error: { message: "No mission epic_id to consolidate" } };
+      }
       const result = await ports.prepareConsolidation({
         projectKey: typeof stored.projectKey === "string" ? stored.projectKey : unit.project,
-        epicId: typeof stored.epicId === "string" ? stored.epicId : (mission.epic_id ?? ""),
+        epicId,
         unitId: typeof stored.unitId === "string" ? stored.unitId : unit.id,
       });
       return { state: "succeeded", result };
