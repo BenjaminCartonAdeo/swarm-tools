@@ -42,6 +42,7 @@ import {
   releaseBuildLock,
   selectPendingOrphans,
   type MissionStorageLike,
+  legacyStoreOf,
 } from "./state";
 import type { DispatchAgentInfo, DispatchAgentList, SwarmxRuntime, ToolContextLike } from "./types";
 import { getMission } from "./workunit/mission";
@@ -194,8 +195,9 @@ async function workerMutationDenial(
   let mission;
   try {
     if (runtime.workUnit === undefined) {
-      if (runtime.store === undefined) return "token_missing";
-      mission = await readMission(runtime.store, runtime.projectID, parentSessionID);
+      const legacyStore = legacyStoreOf(runtime);
+      if (legacyStore === undefined) return "token_missing";
+      mission = await readMission(legacyStore, runtime.projectID, parentSessionID);
     } else {
       mission = await runtime.workUnit.store.load(runtime.projectID, parentSessionID);
     }
@@ -211,7 +213,7 @@ async function workerMutationDenial(
   try {
     if (runtime.workUnit === undefined) {
       const binding = await bindWorkerAttemptSession(
-        runtime.store!,
+        legacyStoreOf(runtime)!,
         runtime.projectID,
         parentSessionID,
         sessionID,
@@ -273,8 +275,9 @@ async function workerMutationDenial(
   if (followup) return "read_only_followup";
   // Native binding is authoritative; legacy pending-completion is an optional
   // overlay until Task 13d3 and must not deny when no legacy store exists.
-  if (runtime.store === undefined) return undefined;
-  const pending = await runtime.store.storage.get(pendingCompletionKey(runtime.projectID, marker.cellID));
+  const legacyStore = legacyStoreOf(runtime);
+  if (legacyStore === undefined) return undefined;
+  const pending = await legacyStore.storage.get(pendingCompletionKey(runtime.projectID, marker.cellID));
   const pendingRecord =
     typeof pending === "object" && pending !== null ? (pending as Record<string, unknown>) : undefined;
   return pendingRecord?.projectID === runtime.projectID &&

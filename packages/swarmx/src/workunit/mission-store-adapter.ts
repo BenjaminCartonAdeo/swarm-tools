@@ -1,5 +1,5 @@
 /**
- * Read-mostly `MissionStateStore` adapter over the WorkUnit tables.
+ * Read-mostly core `MissionStore` adapter over the WorkUnit tables.
  *
  * `load`/`list` project native missions and fall back to the read-only legacy view;
  * `save` is an upsert that only writes mode, budget policy and consolidation. Derived
@@ -7,7 +7,7 @@
  * The legacy KV store is never written through this adapter.
  */
 import type { DatabaseAdapter } from "swarm-mail";
-import { DEFAULT_WORKER_SHARE, type LegacyLifecycleReader, type MissionStateStore } from "../state.js";
+import { DEFAULT_WORKER_SHARE, type LegacyLifecycleReader, type MissionStore } from "../state.js";
 import type { ConsolidationState, MissionCellSnapshot, MissionState } from "../types.js";
 import {
   type AssignmentRow,
@@ -45,7 +45,7 @@ export interface WorkUnitMissionStoreOptions {
   legacyReader?: Pick<LegacyLifecycleReader, "getMission" | "listMissions">;
 }
 
-export interface WorkUnitMissionStore extends Pick<MissionStateStore, "load" | "save" | "list"> {
+export interface WorkUnitMissionStore extends MissionStore {
   /** Cell projection of the current native mission (units, assignments, injected Hive cells). */
   loadCells(projectID: string, sessionID: string): Promise<MissionCellSnapshot[]>;
 }

@@ -32,7 +32,7 @@ import {
   setBudget,
   missionKey,
   createMissionStateStore,
-  type MissionStateStore,
+  type LegacyMissionStateStore,
   type MissionStorageLike,
 } from "../src/state";
 import type {
@@ -103,8 +103,8 @@ function cells(): readonly MissionCellSnapshot[] {
 
 function setup(options: {
   state?: MissionState;
-  store?: (ctx: FakeContext) => MissionStateStore;
-} = {}): { ctx: FakeContext; store: MissionStateStore } {
+  store?: (ctx: FakeContext) => LegacyMissionStateStore;
+} = {}): { ctx: FakeContext; store: LegacyMissionStateStore } {
   const ctx = createFakeContext({
     projectId: PROJECT,
     ...(options.state === undefined ? {} : { storage: [[missionKey(PROJECT, SESSION), options.state]] }),

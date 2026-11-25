@@ -3836,6 +3836,38 @@ describe("WorkUnit runtime setup (additive)", () => {
     }
   });
 
+  test("setup runs the optional legacy migration between schema and recovery", async () => {
+    const { createLibSQLAdapter } = await import("swarm-mail");
+    const { setupWorkUnitRuntime } = await import("../src/index");
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      const steps: string[] = [];
+      const empty = async () => [];
+      const legacyStore = {
+        listMissions: async () => { steps.push("legacy-read"); return []; },
+        getMission: async () => undefined,
+        listAttempts: async () => { steps.push("legacy-read"); return []; },
+        listAssignments: empty,
+        listPendingCompletions: empty,
+        listReviewReceipts: empty,
+        getBuildLock: async () => undefined,
+        getCleanupClaim: async () => undefined,
+        setTombstone: async () => undefined,
+      };
+      await setupWorkUnitRuntime(db, {
+        host: { hostInstanceId: "h", hostname: "box", pid: 42 },
+        isProcessAlive: () => false,
+        trace: (step) => steps.push(step),
+        projectID: PROJECT,
+        migrate: { project: PROJECT, legacyStore },
+      });
+      const filtered = steps.filter((s, i) => s !== "legacy-read" || steps[i - 1] !== "legacy-read");
+      expect(filtered).toEqual(["host", "schema", "legacy-read", "migration", "recovery", "adapter", "commands"]);
+    } finally {
+      await db.close?.();
+    }
+  });
+
   test("setup recovers stale same-host effects after ensuring the schema", async () => {
     const { createLibSQLAdapter } = await import("swarm-mail");
     const { setupWorkUnitRuntime } = await import("../src/index");

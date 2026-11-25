@@ -124,11 +124,15 @@ export interface MissionStateStoreOptions {
   readonly orphanGraceMs?: number;
 }
 
-/** Load/save boundary for mission documents plus ledger access. */
-export interface MissionStateStore {
+/** Core load/save/list boundary for mission documents, backend-agnostic. */
+export interface MissionStore {
   load(projectID: string, sessionID: string): Promise<MissionState | undefined>;
   save(state: MissionState): Promise<void>;
   list(): Promise<MissionState[]>;
+}
+
+/** Legacy KV mission store: the core contract plus ledger access over plugin storage. */
+export interface LegacyMissionStateStore extends MissionStore {
   /** Underlying plugin storage, used by the ledger helpers. */
   readonly storage: MissionStorageLike;
   /** Project bound at creation (dispatch gates), when provided. */
@@ -141,6 +145,16 @@ export interface MissionStateStore {
 }
 
 const EMPTY_ROSTER: DispatchAgentLister = async () => [];
+
+/** True when a core store also carries the legacy KV ledger members. */
+export function isLegacyMissionStateStore(store: MissionStore | undefined): store is LegacyMissionStateStore {
+  return store !== undefined && "storage" in store;
+}
+
+/** Legacy KV store bound to the runtime, or undefined when the store is native/absent. */
+export function legacyStoreOf(runtime: { readonly store?: MissionStore }): LegacyMissionStateStore | undefined {
+  return isLegacyMissionStateStore(runtime.store) ? runtime.store : undefined;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -425,8 +439,8 @@ async function scanAll(
 export function createMissionStateStore(
   storage: MissionStorageLike,
   options: MissionStateStoreOptions = {},
-): MissionStateStore {
-  const store: MissionStateStore = {
+): LegacyMissionStateStore {
+  const store: LegacyMissionStateStore = {
     storage,
     projectID: options.projectID,
     listAgents: options.listAgents ?? EMPTY_ROSTER,
@@ -464,7 +478,7 @@ export function createMissionStateStore(
 
 /** Reads a mission without running orphan recovery. */
 export async function readMission(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   sessionID: string,
 ): Promise<MissionState | undefined> {
@@ -474,7 +488,7 @@ export async function readMission(
 
 /** Reads one ledger entry by call id. */
 export async function getAttempt(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   callID: string,
 ): Promise<DispatchAttempt | undefined> {
@@ -484,7 +498,7 @@ export async function getAttempt(
 
 /** Writes one ledger entry by call id. */
 export async function putAttempt(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   attempt: DispatchAttempt,
 ): Promise<void> {
@@ -512,7 +526,7 @@ function buildLockKey(projectID: string): string {
 
 /** Acquires the project build lock. Returns false when another build is active. */
 export async function acquireBuildLock(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   sessionID: string,
   callID: string,
@@ -539,7 +553,7 @@ export async function acquireBuildLock(
 
 /** Releases the project build lock when the owning shell call settles. */
 export async function releaseBuildLock(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   callID: string,
 ): Promise<boolean> {
@@ -561,7 +575,7 @@ export async function releaseBuildLock(
  * one worker session; a different session can never reuse it.
  */
 export async function bindWorkerAttemptSession(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   parentSessionID: string,
   workerSessionID: string,
@@ -601,7 +615,7 @@ export async function bindWorkerAttemptSession(
  * Sorted by timestamp then call id so audits and recovery are deterministic.
  */
 export async function listAttempts(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   sessionID?: string,
   mission?: Pick<MissionState, "missionID" | "createdAt" | "sessionID">,
@@ -619,7 +633,7 @@ export async function listAttempts(
 
 /** Reconciles one mission's counters from its durable attempt ledger. */
 async function reconcileMissionCountsLocked(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   sessionID: string,
   mission: MissionState,
@@ -636,7 +650,7 @@ async function reconcileMissionCountsLocked(
 
 /** Reconciles a replayed reservation under the mission lock before allowing it. */
 export async function reconcileMissionCounts(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   sessionID: string,
   expectedMission?: MissionState,
@@ -660,7 +674,7 @@ export async function reconcileMissionCounts(
  * @returns How many pending attempts remain candidates for reconciliation.
  */
 export async function recoverPendingOrphans(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   sessionID: string,
 ): Promise<number> {
@@ -686,7 +700,7 @@ export interface SetBudgetInput {
  * by a fresh one (counters reset).
  */
 export async function setBudget(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   input: SetBudgetInput,
 ): Promise<MissionState> {
   const budget = normalizeBudget({
@@ -717,7 +731,7 @@ export async function setBudget(
 
 /** Marks the mission inactive. No-op when it does not exist or is already over. */
 export async function finishMission(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   input: { readonly projectID: string; readonly sessionID: string; readonly abandon?: boolean },
 ): Promise<MissionState | undefined> {
   return withMissionLock(input.projectID, input.sessionID, async () => {
@@ -769,7 +783,7 @@ export interface RecordRetryCauseInput {
  * (nothing to audit against) — the retry itself is not blocked by that.
  */
 export async function recordRetryCause(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   input: RecordRetryCauseInput,
 ): Promise<RetryCauseRecord | undefined> {
   return withMissionLock(input.projectID, input.sessionID, async () => {
@@ -791,7 +805,7 @@ export async function recordRetryCause(
 
 /** Resets a mission: removes its document, attempts, and assignments. */
 export async function resetMission(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   input: { readonly projectID: string; readonly sessionID: string },
 ): Promise<void> {
   return withMissionLock(input.projectID, input.sessionID, async () => {
@@ -807,7 +821,7 @@ export async function resetMission(
 
 /** Removes only assignments explicitly owned by one session. */
 async function removeSessionAssignments(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   sessionID: string,
 ): Promise<void> {
@@ -822,7 +836,7 @@ async function removeSessionAssignments(
 
 /** Records the agent assigned to a cell. Storage only — never a Hive write. */
 export async function setAssignment(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   cellID: string,
   agent: string,
@@ -845,7 +859,7 @@ export async function setAssignment(
  * Nothing is ever written to Hive.
  */
 export async function resolveAssignment(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   cellID: string,
   cellText?: string,
@@ -876,7 +890,7 @@ export function parseAgentTag(text: string): string | undefined {
  * Read-only: this never falls back to Hive and never writes.
  */
 export async function listAssignments(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
 ): Promise<Readonly<Record<string, string>>> {
   const entries = await scanAll(store.storage, `${ASSIGNMENT_KEY_PREFIX}${projectID}:`);
@@ -1049,7 +1063,7 @@ export function isConsolidationCellFinished(status: string): boolean {
  * the epic has no children, or when the mission is absent/inactive.
  */
 export async function maybePrepareConsolidation(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   input: MaybePrepareConsolidationInput,
 ): Promise<ConsolidationState | undefined> {
   return withMissionLock(input.projectID, input.sessionID, async () => {
@@ -1086,7 +1100,7 @@ export async function maybePrepareConsolidation(
  * so it is safe to call on every approval.
  */
 export async function completeConsolidation(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   input: { readonly projectID: string; readonly sessionID: string; readonly cellID: string },
 ): Promise<ConsolidationState | undefined> {
   return withMissionLock(input.projectID, input.sessionID, async () => {
@@ -1109,7 +1123,7 @@ export async function completeConsolidation(
  * their status; elapsed time alone cannot establish that a worker is gone.
  */
 export async function audit(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   sessionID: string,
 ): Promise<MissionAudit> {
@@ -1158,7 +1172,7 @@ export class LegacyLifecycleTombstonedError extends Error {
 }
 
 async function assertLegacyLifecycleWritable(
-  store: Pick<MissionStateStore, "storage">,
+  store: Pick<LegacyMissionStateStore, "storage">,
   projectID: string,
   sessionID: string | undefined,
 ): Promise<void> {
@@ -1359,7 +1373,7 @@ function isLegacyReviewReceipt(value: unknown): value is LegacyReviewReceipt {
 }
 
 /** Builds the read-only legacy reader plus the single tombstone write over `ctx.storage`. */
-export function createLegacyLifecycleStore(store: MissionStateStore): LegacyLifecycleStore {
+export function createLegacyLifecycleStore(store: LegacyMissionStateStore): LegacyLifecycleStore {
   const scanValues = async (prefix: string): Promise<unknown[]> =>
     (await scanAll(store.storage, prefix)).map((entry) => entry.value);
   return {

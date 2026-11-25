@@ -333,3 +333,42 @@ describe("WorkUnit mission store adapter", () => {
     expect((await getMission(adapter, "p", "s"))?.fence).toBe(0);
   });
 });
+
+describe("MissionStore core contract", () => {
+  test("WorkUnit adapter and legacy store both satisfy the core MissionStore without KV members", async () => {
+    const { createMissionStateStore } = await import("../src/state.js");
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      await ensureWorkUnitSchema(db);
+      const native: import("../src/state.js").MissionStore = createWorkUnitMissionStore(db);
+      expect(typeof native.load).toBe("function");
+      expect(typeof native.save).toBe("function");
+      expect(typeof native.list).toBe("function");
+      expect("storage" in native).toBe(false);
+      expect("listAgents" in native).toBe(false);
+      const legacy: import("../src/state.js").MissionStore = createMissionStateStore({
+        get: async () => undefined,
+        set: async () => undefined,
+        delete: async () => undefined,
+        list: async () => [],
+      } as never);
+      expect("storage" in legacy).toBe(true);
+      const runtime: import("../src/types.js").SwarmxRuntime = {
+        runTool: async () => undefined,
+        store: native,
+        now: () => 1,
+        orphanGraceMs: 0,
+      };
+      expect(runtime.now?.()).toBe(1);
+    } finally {
+      await db.close?.();
+    }
+  });
+
+  test("tests use the canonical SWARM_DB_PATH in-memory override", async () => {
+    const { getDatabasePath } = await import("swarm-mail");
+    expect(process.env.SWARM_DB_PATH).toBe(":memory:");
+    expect(getDatabasePath()).toBe(":memory:");
+    expect(process.env.SWARMX_WORKUNIT_DB).toBeUndefined();
+  });
+});

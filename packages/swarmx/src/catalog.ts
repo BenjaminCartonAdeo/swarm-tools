@@ -65,7 +65,7 @@ import {
   resetMission,
   withMissionLock,
 } from "./state";
-import type { MissionStateStore } from "./state";
+import { legacyStoreOf, type LegacyMissionStateStore } from "./state";
 import { getMission, listUnits } from "./workunit/mission";
 import type { Mission, WorkUnit } from "./workunit/schema";
 import { effectiveCompletionFiles, MissionNotDrainedError } from "./workunit/store";
@@ -1124,7 +1124,7 @@ function runtimeSessionID(runtime: SwarmxRuntime): string | undefined {
 }
 
 interface StoreScope {
-  readonly store: MissionStateStore;
+  readonly store: LegacyMissionStateStore;
   readonly projectID: string;
 }
 
@@ -1184,7 +1184,7 @@ async function assignWorkUnitCell(
 }
 
 function requireStoreProject(tool: string, runtime: SwarmxRuntime): StoreScope {
-  const store = runtime.store;
+  const store = legacyStoreOf(runtime);
   if (store === undefined) {
     throw new LocalToolError(tool, "runtime_unavailable", "mission store is not wired");
   }
@@ -1660,8 +1660,9 @@ async function runSpawnRetry(
   const injected = injectRetryRootCause(tool, output, section);
 
   const projectID = resolveProjectID(runtime);
-  if (runtime.store !== undefined && projectID !== undefined) {
-    await recordRetryCause(runtime.store, {
+  const legacyStore = legacyStoreOf(runtime);
+  if (legacyStore !== undefined && projectID !== undefined) {
+    await recordRetryCause(legacyStore, {
       projectID,
       sessionID,
       cellID,
@@ -1760,11 +1761,12 @@ async function runMissionStatus(
   context: ToolExecuteContextLike,
 ): Promise<ToolExecuteResult> {
   const projectID = resolveProjectID(runtime);
-  if (runtime.store === undefined || projectID === undefined) {
+  const legacyStore = legacyStoreOf(runtime);
+  if (legacyStore === undefined || projectID === undefined) {
     throw new LocalToolError("swarm_mission_status", "runtime_unavailable", "mission store is not available");
   }
-  const missions = (await runtime.store.list()).filter((mission) => mission.projectID === projectID);
-  const allAttempts = await listAttempts(runtime.store, projectID);
+  const missions = (await legacyStore.list()).filter((mission) => mission.projectID === projectID);
+  const allAttempts = await listAttempts(legacyStore, projectID);
   const missionSessionIDs = new Set(missions.map((mission) => mission.sessionID));
   const rows = [];
   for (const mission of missions) {
@@ -1777,7 +1779,7 @@ async function runMissionStatus(
     );
     const pendingCells: string[] = [];
     for (const cellID of new Set(attempts.map((attempt) => attempt.cellID))) {
-      const pending = await readPendingCompletion(runtime.store, projectID, cellID);
+      const pending = await readPendingCompletion(legacyStore, projectID, cellID);
       if (pending?.parentSessionID === mission.sessionID && pending.finalized !== true) {
         pendingCells.push(cellID);
       }
@@ -1812,7 +1814,7 @@ async function runMissionStatus(
 }
 
 async function abandonMissionSession(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   targetSessionID: string,
   reason: string,
@@ -3394,7 +3396,7 @@ async function readScopedReview(
 }
 
 async function removeScopedReviewReceipt(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   receipt: ScopedReviewReceipt,
   tool: string,
 ): Promise<void> {
@@ -3416,7 +3418,7 @@ async function removeScopedReviewReceipt(
 }
 
 async function markPendingCompletionFinalized(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   receipt: ScopedReviewReceipt,
   pending: PendingCompletionReceipt,
 ): Promise<PendingCompletionReceipt> {
@@ -3440,7 +3442,7 @@ async function markPendingCompletionFinalized(
 }
 
 async function revokeWorkerAttempt(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   receipt: ScopedReviewReceipt,
   pending: PendingCompletionReceipt,
   tool: string,
@@ -3465,7 +3467,7 @@ async function revokeWorkerAttempt(
 }
 
 async function setPendingCompletionFinalizing(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   receipt: ScopedReviewReceipt,
   pending: PendingCompletionReceipt,
   finalizing: boolean,
@@ -3497,7 +3499,7 @@ async function setPendingCompletionFinalizing(
  * reuse the gate result when the backend reports the cell as already closed.
  */
 async function recordPendingCompletionVerification(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   receipt: ScopedReviewReceipt,
   pending: PendingCompletionReceipt,
   verification: VerificationGateReceipt,
@@ -3527,7 +3529,7 @@ async function recordPendingCompletionVerification(
 }
 
 async function readPendingCompletion(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   taskID: string,
 ): Promise<PendingCompletionReceipt | undefined> {
@@ -3541,7 +3543,7 @@ async function submitPendingCompletion(
   args: Record<string, unknown>,
   worker: AssignedWorkerScope,
 ): Promise<ToolExecuteResult> {
-  const store = runtime.store;
+  const store = legacyStoreOf(runtime);
   const projectID = resolveProjectID(runtime);
   if (store === undefined || projectID === undefined || context.sessionID === undefined) {
     throw new LocalToolError("swarm_complete", "runtime_unavailable", "pending completion storage is not available");
@@ -3623,7 +3625,7 @@ async function submitPendingCompletion(
 }
 
 async function clearReviewState(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   receipt: ScopedReviewReceipt,
   pending: PendingCompletionReceipt,
   keepFinalized: boolean,
@@ -3961,7 +3963,7 @@ async function executeReviewFeedbackLocked(
   backendName: string,
 ): Promise<ToolExecuteResult> {
   const receipt = await readScopedReview(runtime, context, args);
-  const store = runtime.store;
+  const store = legacyStoreOf(runtime);
   if (store === undefined) {
     throw new LocalToolError("swarm_review_feedback", "runtime_unavailable", "mission storage is not wired");
   }
@@ -5045,22 +5047,23 @@ async function requireHiveCloseAllowed(
 ): Promise<void> {
   const cellID = typeof input.id === "string" ? input.id : "";
   const projectID = resolveProjectID(runtime);
-  if (runtime.store === undefined || projectID === undefined || cellID.length === 0) {
+  const legacyStore = legacyStoreOf(runtime);
+  if (legacyStore === undefined || projectID === undefined || cellID.length === 0) {
     throw new LocalToolError("hive_close", "runtime_unavailable", "cannot verify active project missions");
   }
   let missions: readonly MissionState[];
   try {
-    missions = await runtime.store.list();
+    missions = await legacyStore.list();
   } catch {
     throw new LocalToolError("hive_close", "runtime_unavailable", "cannot verify active project missions");
   }
   const activeMissions = missions.filter((entry) => entry.projectID === projectID && entry.active);
   for (const mission of activeMissions) {
-    const attempts = await listAttempts(runtime.store, projectID, mission.sessionID, mission);
+    const attempts = await listAttempts(legacyStore, projectID, mission.sessionID, mission);
     if (!attempts.some((attempt) => attempt.cellID === cellID)) continue;
-    const pending = await readPendingCompletion(runtime.store, projectID, cellID);
+    const pending = await readPendingCompletion(legacyStore, projectID, cellID);
     if (pending?.finalized === true || pending?.canceled === true || pending?.finalizing === true) return;
-    const review = await runtime.store.storage.get(
+    const review = await legacyStore.storage.get(
       reviewReceiptKey(projectID, mission.sessionID, reviewMissionID(mission), cellID),
     );
     if (isScopedReviewReceipt(review) && review.approval !== undefined) return;
@@ -5078,7 +5081,7 @@ async function requireHiveCloseAllowed(
     );
   }
   // No active mission owns this cell; still block orphaned unrevoked attempts.
-  const attempts = await listAttempts(runtime.store, projectID);
+  const attempts = await listAttempts(legacyStore, projectID);
   if (
     attempts.some(
       (attempt) =>
@@ -5126,12 +5129,13 @@ async function restrictHiveUpdate(
 
 async function requireNoActiveProjectMission(runtime: SwarmxRuntime, tool: string): Promise<void> {
   const projectID = resolveProjectID(runtime);
-  if (runtime.store === undefined || projectID === undefined) {
+  const legacyStore = legacyStoreOf(runtime);
+  if (legacyStore === undefined || projectID === undefined) {
     throw new LocalToolError(tool, "runtime_unavailable", "cannot verify active project missions");
   }
   let missions: readonly MissionState[];
   try {
-    missions = await runtime.store.list();
+    missions = await legacyStore.list();
   } catch {
     throw new LocalToolError(tool, "runtime_unavailable", "cannot verify active project missions");
   }
@@ -5145,7 +5149,7 @@ async function requireNoActiveProjectMission(runtime: SwarmxRuntime, tool: strin
   // finishMission refuses to close with unrevoked attempts, so a closed mission
   // cannot hide a pending attempt; scanning all project attempts also covers
   // orphaned ledger entries whose mission document was removed.
-  const attempts = await listAttempts(runtime.store, projectID);
+  const attempts = await listAttempts(legacyStore, projectID);
   if (
     attempts.some(
       (attempt) =>
@@ -5163,10 +5167,11 @@ async function requireNoActiveTaskAttempt(
   taskID: string,
 ): Promise<void> {
   const projectID = resolveProjectID(runtime);
-  if (runtime.store === undefined || projectID === undefined) {
+  const legacyStore = legacyStoreOf(runtime);
+  if (legacyStore === undefined || projectID === undefined) {
     throw new LocalToolError(tool, "runtime_unavailable", "cannot verify active task attempts");
   }
-  const attempts = await listAttempts(runtime.store, projectID);
+  const attempts = await listAttempts(legacyStore, projectID);
   if (
     attempts.some(
       (attempt) =>
@@ -5186,7 +5191,7 @@ async function runWorktreeCleanup(
   backendName: string,
 ): Promise<ToolExecuteResult> {
   const projectID = resolveProjectID(runtime);
-  const store = runtime.store;
+  const store = legacyStoreOf(runtime);
   if (store === undefined || projectID === undefined) {
     throw new LocalToolError(
       "swarm_worktree_cleanup",
@@ -5349,10 +5354,11 @@ async function requireCoordinatorOrMissionOwner(
 
   const projectID = resolveProjectID(runtime);
   const sessionID = resolveSessionID(runtime, context);
-  if (runtime.store === undefined || projectID === undefined || sessionID === undefined) {
+  const legacyStore = legacyStoreOf(runtime);
+  if (legacyStore === undefined || projectID === undefined || sessionID === undefined) {
     throw new LocalToolError(tool, "runtime_unavailable", "cannot verify the mission owner");
   }
-  const mission = await readMission(runtime.store, projectID, sessionID);
+  const mission = await readMission(legacyStore, projectID, sessionID);
   const ownsActiveMission = mission !== undefined && mission.active;
   if (!ownsActiveMission || (await resolveCallerMode(runtime, context, tool)) !== "primary") {
     throw new LocalToolError(tool, "conflict", "only the canonical swarm coordinator may use this tool");

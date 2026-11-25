@@ -35,7 +35,7 @@ import {
   setAssignment,
   setBudget,
   withMissionLock,
-  type MissionStateStore,
+  type LegacyMissionStateStore,
   type MissionStorageLike,
 } from "../src/state";
 import { DispatchGateError, type GateReason, type MissionState } from "../src/types";
@@ -79,7 +79,7 @@ const AGENTS: readonly FakeAgentInfo[] = [
 
 interface Harness {
   readonly ctx: FakeContext;
-  readonly store: MissionStateStore;
+  readonly store: LegacyMissionStateStore;
 }
 
 function setup(): Harness {
@@ -149,7 +149,7 @@ interface BudgetOverrides {
 }
 
 async function startMission(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   overrides: BudgetOverrides = {},
 ): Promise<MissionState> {
   return setBudget(store, {

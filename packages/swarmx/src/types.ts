@@ -8,7 +8,7 @@
  */
 
 import type { SessionEventSink } from "./session-events";
-import type { MissionStateStore } from "./state";
+import type { MissionStore } from "./state";
 import type { WorkUnitRuntime } from "./workunit/ports";
 
 /** JSON-serialisable value, aligned with plugin storage's `Schema.Json`. */
@@ -188,7 +188,11 @@ export interface SwarmxRuntime {
   /** Parent session recorded by OpenCode for the actual worker session. */
   resolveWorkerParentSession?: (sessionID: string) => Promise<string | null | undefined>;
   /** Mission store backing budget/finish/audit/assignments. */
-  store?: MissionStateStore;
+  store?: MissionStore;
+  /** Epoch-ms clock override for lifecycle decisions. */
+  now?: () => number;
+  /** Grace window (ms) before a pending attempt is treated as orphaned. */
+  orphanGraceMs?: number;
   /**
    * Additive WorkUnit runtime (Task 13c). Undefined in the default plugin setup;
    * tests inject it through the runtime override seam. The legacy `store` stays authoritative.

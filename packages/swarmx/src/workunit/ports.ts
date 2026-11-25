@@ -22,6 +22,7 @@ import {
   type WorkUnitMissionStoreOptions,
 } from "./mission-store-adapter.js";
 import { ensureWorkUnitSchema } from "./schema.js";
+import { migrateLegacyLifecycle, type LegacyLifecycleStore } from "./migrate.js";
 
 const SWARM_REVIEW_FEEDBACK_TOOL = "swarm_review_feedback";
 const HIVE_CELLS_TOOL = "hive_cells";
@@ -96,8 +97,10 @@ export interface WorkUnitRuntime {
 export interface SetupWorkUnitRuntimeOptions extends WorkUnitMissionStoreOptions {
   host?: EffectHostIdentity;
   isProcessAlive?: (pid: number) => boolean;
+  /** Project-wide idempotent legacy import, run after the schema and before recovery. */
+  migrate?: { project: string; legacyStore: LegacyLifecycleStore };
   /** Test seam: observes setup steps in order. */
-  trace?: (step: "host" | "schema" | "recovery" | "adapter" | "commands") => void;
+  trace?: (step: "host" | "schema" | "migration" | "recovery" | "adapter" | "commands") => void;
 }
 
 function defaultIsProcessAlive(pid: number): boolean {
@@ -114,12 +117,16 @@ export async function setupWorkUnitRuntime(
   db: DatabaseAdapter,
   opts: SetupWorkUnitRuntimeOptions = {},
 ): Promise<WorkUnitRuntime> {
-  const { host: hostOption, isProcessAlive: aliveOption, trace, ...storeOptions } = opts;
+  const { host: hostOption, isProcessAlive: aliveOption, trace, migrate, ...storeOptions } = opts;
   const host = hostOption ?? { hostInstanceId: randomUUID(), hostname: osHostname(), pid: process.pid };
   const isProcessAlive = aliveOption ?? defaultIsProcessAlive;
   trace?.("host");
   await ensureWorkUnitSchema(db);
   trace?.("schema");
+  if (migrate !== undefined) {
+    await migrateLegacyLifecycle(db, migrate);
+    trace?.("migration");
+  }
   const recovery = await recoverStaleEffects(db, { hostInstanceId: host.hostInstanceId, hostname: host.hostname, isProcessAlive });
   trace?.("recovery");
   const store = createWorkUnitMissionStore(db, storeOptions);

@@ -25,7 +25,7 @@ import {
   sameMissionGeneration,
   withMissionLock,
 } from "./state";
-import type { MissionStateStore } from "./state";
+import type { LegacyMissionStateStore } from "./state";
 import {
   DispatchGateError,
   type CellMarker,
@@ -81,7 +81,7 @@ function normalizeAgentList(listed: DispatchAgentList): readonly DispatchAgentIn
   return (listed as { readonly data: readonly DispatchAgentInfo[] }).data;
 }
 
-async function requireCoordinatorCaller(store: MissionStateStore, callerID: string): Promise<void> {
+async function requireCoordinatorCaller(store: LegacyMissionStateStore, callerID: string): Promise<void> {
   const caller = normalizeAgentList(await store.listAgents()).find((agent) => agent.id === callerID);
   const coordinatorIDs = new Set(["swarm/swarm-coordinator", "build", "plan"]);
   if (
@@ -183,7 +183,7 @@ function attachDispatchToken(input: unknown, dispatchToken: string, cellID: stri
 }
 
 async function requireDispatchableAgent(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   agentID: string,
 ): Promise<DispatchAgentInfo> {
   const roster = normalizeAgentList(await store.listAgents());
@@ -206,7 +206,7 @@ async function requireDispatchableAgent(
 }
 
 async function requireAssignment(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   sessionID: string,
   marker: CellMarker,
@@ -271,7 +271,7 @@ function chargeBudget(
  * together. A replayed `callID` returns without touching either.
  */
 async function reserveSpawn(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   projectID: string,
   event: DispatchBeforeEvent,
   marker: CellMarker,
@@ -371,7 +371,7 @@ async function reserveSpawn(
  * thrown as {@link DispatchGateError}.
  */
 export async function gateBefore(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   event: DispatchBeforeEvent,
   workUnit?: WorkUnitRuntime,
 ): Promise<void> {
@@ -453,7 +453,7 @@ export async function gateBefore(
 }
 
 async function gateBeforeWorkUnit(
-  legacyStore: MissionStateStore,
+  legacyStore: LegacyMissionStateStore,
   workUnit: WorkUnitRuntime,
   event: DispatchBeforeEvent,
 ): Promise<void> {
@@ -602,7 +602,7 @@ async function gateBeforeWorkUnit(
  * counters are never touched here.
  */
 export async function settleAfter(
-  store: MissionStateStore,
+  store: LegacyMissionStateStore,
   event: DispatchAfterEvent,
   workUnit?: WorkUnitRuntime,
 ): Promise<void> {
@@ -643,7 +643,7 @@ function childSessionID(result: unknown): string | undefined {
 }
 
 async function settleAfterWorkUnit(
-  legacyStore: MissionStateStore,
+  legacyStore: LegacyMissionStateStore,
   workUnit: WorkUnitRuntime,
   event: DispatchAfterEvent,
 ): Promise<void> {
