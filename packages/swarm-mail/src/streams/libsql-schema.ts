@@ -88,6 +88,13 @@ export async function createLibSQLStreamsSchema(db: DatabaseAdapter): Promise<vo
     ON events(type)
   `);
 
+  // Guarded hive close looks up its own cell_closed event by internal event_token.
+  await db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_events_cell_closed_event_token
+    ON events(json_extract(data, '$.event_token'))
+    WHERE type = 'cell_closed'
+  `);
+
   await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_events_timestamp 
     ON events(timestamp)

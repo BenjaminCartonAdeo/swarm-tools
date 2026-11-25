@@ -220,8 +220,9 @@ async function appendGuardedCellClosed(
   const cellId = event.cell_id;
   const rawIdentity = (event as { completion_operation_id?: unknown }).completion_operation_id;
   const identity = typeof rawIdentity === "string" && rawIdentity.length > 0 ? rawIdentity : null;
-  const eventToken = typeof rest.event_token === "string" ? rest.event_token : randomUUID();
-  const data = JSON.stringify({ ...rest, event_token: eventToken });
+  const eventToken = randomUUID(); // internal-only: caller-supplied tokens are ignored
+  const { event_token: _ignoredToken, ...restWithoutToken } = rest;
+  const data = JSON.stringify({ ...restWithoutToken, event_token: eventToken });
   const reason = (event as { reason?: string | null }).reason ?? null;
   const rawResult = (event as { result?: unknown }).result;
   // Truthy-result semantics, as in handleBeadClosedDrizzle (`if (result)`).

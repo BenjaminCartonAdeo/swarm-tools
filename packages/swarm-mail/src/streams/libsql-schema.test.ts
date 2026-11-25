@@ -50,6 +50,26 @@ describe("libSQL streams schema", () => {
       expect(tableNames).toContain("decision_traces");
     });
 
+    test("creates idempotent cell_closed event_token expression index used by the close gate", async () => {
+      const local = await createLibSQLAdapter({ url: ":memory:" });
+      try {
+        await createLibSQLStreamsSchema(local);
+        await createLibSQLStreamsSchema(local);
+        const index = await local.query<{ sql: string }>(
+          "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_cell_closed_event_token'",
+        );
+        expect(index.rows).toHaveLength(1);
+        expect(index.rows[0].sql).toContain("json_extract(data, '$.event_token')");
+        expect(index.rows[0].sql).toContain("WHERE type = 'cell_closed'");
+        const plan = await local.query<{ detail: string }>(
+          "EXPLAIN QUERY PLAN SELECT 1 FROM events WHERE type = 'cell_closed' AND json_extract(data, '$.event_token') = 'tok'",
+        );
+        expect(plan.rows.map((row) => row.detail).join(" ")).toContain("idx_events_cell_closed_event_token");
+      } finally {
+        await local.close?.();
+      }
+    });
+
     test("creates indexes", async () => {
       await createLibSQLStreamsSchema(db);
 

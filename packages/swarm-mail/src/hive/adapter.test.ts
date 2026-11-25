@@ -90,8 +90,8 @@ describe("Beads Adapter", () => {
         expect(final.completion_operation_id).toBe(identity);
         expect(final.closed_reason).toBe("identity");
         expect(identityClose.status).toBe("fulfilled");
-        expect(manual.status).toBe("rejected");
-        expect((manual as PromiseRejectedResult).reason).toMatchObject({ name: "OperationIdConflictError" });
+        // Manual close losing to an identity close is the legacy silent no-op.
+        expect(manual.status).toBe("fulfilled");
       }
     }
   });
@@ -174,6 +174,49 @@ describe("Beads Adapter", () => {
       .map((row) => JSON.parse(row.data)).find((data) => data.cell_id === a.id);
     expect(typeof token.event_token).toBe("string");
     expect((await adapter.getCell(projectKey, a.id))?.completion_operation_id).toBe("rebuild-op");
+  });
+
+  test("manual close after an identity close is a silent no-op with no new event or bookkeeping", async () => {
+    const cell = await adapter.createCell(projectKey, { title: "Manual after identity", type: "task" });
+    const closed = await adapter.closeCell(projectKey, cell.id, "identity", { completion_operation_id: "keep-op" });
+    await db.query("DELETE FROM dirty_beads");
+    const countEvents = async () => (await db.query<{ data: string }>("SELECT data FROM events WHERE type = 'cell_closed'"))
+      .rows.filter((row) => JSON.parse(row.data).cell_id === cell.id).length;
+    expect(await countEvents()).toBe(1);
+
+    const again = await adapter.closeCell(projectKey, cell.id, "manual later");
+    expect(again).toEqual(closed);
+    expect(await countEvents()).toBe(1);
+    expect((await db.query("SELECT cell_id FROM dirty_beads")).rows).toHaveLength(0);
+  });
+
+  test("identity close on a closed cell: same identity succeeds, different or null identity conflicts", async () => {
+    const withIdentity = await adapter.createCell(projectKey, { title: "Identity replay", type: "task" });
+    await adapter.closeCell(projectKey, withIdentity.id, "done", { completion_operation_id: "id-1" });
+    expect(await adapter.closeCell(projectKey, withIdentity.id, "replay", { completion_operation_id: "id-1" }))
+      .toMatchObject({ completion_operation_id: "id-1", closed_reason: "done" });
+    await expect(adapter.closeCell(projectKey, withIdentity.id, "other", { completion_operation_id: "id-2" }))
+      .rejects.toMatchObject({ name: "OperationIdConflictError" });
+
+    const manual = await adapter.createCell(projectKey, { title: "Manual first", type: "task" });
+    await adapter.closeCell(projectKey, manual.id, "manual");
+    await expect(adapter.closeCell(projectKey, manual.id, "late", { completion_operation_id: "id-3" }))
+      .rejects.toMatchObject({ name: "OperationIdConflictError" });
+  });
+
+  test("caller-supplied event_token is ignored and replaced", async () => {
+    const { appendCellEvent } = await import("./store.js");
+    const cell = await adapter.createCell(projectKey, { title: "Token", type: "task" });
+    const appended = await appendCellEvent(
+      { type: "cell_closed", project_key: projectKey, cell_id: cell.id, timestamp: Date.now(), reason: "x", event_token: "caller-token" } as any,
+      undefined,
+      db,
+    );
+    const stored = (await db.query<{ data: string }>("SELECT data FROM events WHERE id = ?", [appended.id])).rows[0];
+    const token = JSON.parse(stored.data).event_token;
+    expect(token).not.toBe("caller-token");
+    expect(token).toMatch(/^[0-9a-f-]{36}$/);
+    expect((appended as { event_token?: string }).event_token).toBe(token);
   });
 
   test("concurrent different-identity closes: one event, one winner, loser conflicts", async () => {

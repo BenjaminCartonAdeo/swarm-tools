@@ -223,6 +223,10 @@ export function createHiveAdapter(
       }
 
       const completionOperationId = options?.completion_operation_id;
+      if (!completionOperationId && existingBead.status === "closed") {
+        // Manual close of an already-closed cell: legacy silent no-op, no event.
+        return existingBead;
+      }
       if (completionOperationId && existingBead.status === "closed") {
         // Idempotent completion: same identity → return the already-closed cell.
         if (existingBead.completion_operation_id === completionOperationId) return existingBead;
@@ -253,6 +257,8 @@ export function createHiveAdapter(
         // null for manual closes) → idempotent success; otherwise conflict.
         const current = await getCell(db, projectKeyParam, cellId);
         if (!current) throw new CellNotFoundError(cellId);
+        // Manual close (no identity) of a closed cell stays a silent no-op (legacy behaviour).
+        if (!completionOperationId && current.status === "closed") return;
         const expected = completionOperationId ?? null;
         if (current.status === "closed" && (current.completion_operation_id ?? null) === expected) return;
         throw new OperationIdConflictError(
