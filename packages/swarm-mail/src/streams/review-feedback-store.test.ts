@@ -324,21 +324,53 @@ describe("review feedback operations", () => {
     const restored = await db.query<{ n: number }>("SELECT COUNT(*) AS n FROM message_recipients");
     expect(restored.rows[0]?.n).toBe(1);
   });
-  test("durableStatusOrderedByAttemptNotTimestampOrRowid", async () => {
-    const insert = (op: string, attempt: number, status: string) =>
-      db.query(
-        `INSERT INTO review_feedback_operations
-         (operation_id, project_key, task_id, worker_id, status, request_hash, attempt, state, result, created_at, updated_at)
-         VALUES (?, ?, 'task-tie', 'w', ?, 'h', ?, 'done', ?, 1000, 1000)`,
-        [op, PROJECT, status, attempt, JSON.stringify({ success: true, status, task_id: "task-tie" })],
+  test("durableStatusFollowsCompletionOrderNotInsertionOrAttempt", async () => {
+    const cases: Array<["needs_changes" | "approved", boolean]> = [
+      ["needs_changes", false],
+      ["approved", true],
+    ];
+    for (const [lastStatus, expected] of cases) {
+      const taskId = `task-order-${lastStatus}`;
+      const firstStatus = lastStatus === "approved" ? "needs_changes" : "approved";
+      // Inserted (claimed) first, completed last
+      const early = await claimReviewFeedback(
+        claimInput(`${taskId}-early`, { taskId, status: lastStatus }),
+        db,
       );
-    // Higher attempt inserted first (lower rowid), same updated_at
-    await insert("op-tie-approved", 2, "approved");
-    await insert("op-tie-rejected", 1, "needs_changes");
-    expect(await getDurableReviewApproval(PROJECT, "task-tie", db)).toBe(true);
-
-    await insert("op-tie-rejected-3", 3, "needs_changes");
-    expect(await getDurableReviewApproval(PROJECT, "task-tie", db)).toBe(false);
+      // Inserted second, completed first
+      const late = await claimReviewFeedback(
+        claimInput(`${taskId}-late`, { taskId, status: firstStatus }),
+        db,
+      );
+      if (early.kind !== "claimed" || late.kind !== "claimed") throw new Error("expected claims");
+      expect(early.attempt).toBe(1);
+      expect(late.attempt).toBe(1);
+      await completeReviewFeedback(
+        `${taskId}-late`,
+        late.claimToken,
+        { success: true, status: firstStatus, task_id: taskId },
+        db,
+      );
+      await completeReviewFeedback(
+        `${taskId}-early`,
+        early.claimToken,
+        { success: true, status: lastStatus, task_id: taskId },
+        db,
+      );
+      // Identical updated_at: timestamps must not decide
+      await db.query("UPDATE review_feedback_operations SET updated_at = 1000 WHERE task_id = ?", [
+        taskId,
+      ]);
+      expect(await getDurableReviewApproval(PROJECT, taskId, db)).toBe(expected);
+      const seqs = await db.query<{ operation_id: string; completion_seq: number }>(
+        "SELECT operation_id, completion_seq FROM review_feedback_operations WHERE task_id = ? ORDER BY completion_seq",
+        [taskId],
+      );
+      expect(seqs.rows).toEqual([
+        { operation_id: `${taskId}-late`, completion_seq: 1 },
+        { operation_id: `${taskId}-early`, completion_seq: 2 },
+      ]);
+    }
   });
 
   for (const [label, append] of [

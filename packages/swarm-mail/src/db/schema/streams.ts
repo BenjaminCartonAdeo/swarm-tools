@@ -314,6 +314,7 @@ export const reviewFeedbackOperationsTable = sqliteTable(
     hostname: text("hostname"),
     pid: integer("pid"),
     result: text("result"), // JSON
+    completion_seq: integer("completion_seq"), // per-(project_key, task_id) completion order
     created_at: integer("created_at").notNull(),
     updated_at: integer("updated_at").notNull(),
   },

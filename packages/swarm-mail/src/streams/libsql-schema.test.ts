@@ -607,4 +607,30 @@ describe("operation_id upgrade of existing streams schema", () => {
       await fresh.close?.();
     }
   });
+
+  test("existingReviewFeedbackTableGetsCompletionSeqIdempotently", async () => {
+    const legacy = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      await legacy.exec(`CREATE TABLE review_feedback_operations (
+        operation_id TEXT PRIMARY KEY, project_key TEXT NOT NULL, unit_id TEXT,
+        task_id TEXT NOT NULL, worker_id TEXT NOT NULL, status TEXT NOT NULL,
+        request_hash TEXT NOT NULL, attempt INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('claimed', 'in_progress', 'done')),
+        claim_token TEXT, host_instance_id TEXT, hostname TEXT, pid INTEGER,
+        result TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+      await legacy.query(
+        "INSERT INTO review_feedback_operations (operation_id, project_key, task_id, worker_id, status, request_hash, attempt, state, created_at, updated_at) VALUES ('op-old', '/p', 't', 'w', 'approved', 'h', 1, 'done', 1, 1)",
+      );
+      await createLibSQLStreamsSchema(legacy);
+      await createLibSQLStreamsSchema(legacy);
+      const names = await columns(legacy, "review_feedback_operations");
+      expect(names.filter((n) => n === "completion_seq")).toEqual(["completion_seq"]);
+      const rows = await legacy.query<{ operation_id: string; completion_seq: number | null }>(
+        "SELECT operation_id, completion_seq FROM review_feedback_operations",
+      );
+      expect(rows.rows).toEqual([{ operation_id: "op-old", completion_seq: null }]);
+    } finally {
+      await legacy.close?.();
+    }
+  });
 });

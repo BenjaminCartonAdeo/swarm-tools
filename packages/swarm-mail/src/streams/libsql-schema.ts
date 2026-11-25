@@ -445,10 +445,12 @@ export async function createLibSQLStreamsSchema(db: DatabaseAdapter): Promise<vo
       hostname TEXT,
       pid INTEGER,
       result TEXT,
+      completion_seq INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     )
   `);
+  await ensureColumn(db, "review_feedback_operations", "completion_seq", "INTEGER");
 
   await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_review_feedback_operations_task
@@ -462,11 +464,20 @@ export async function createLibSQLStreamsSchema(db: DatabaseAdapter): Promise<vo
  * `CREATE TABLE IF NOT EXISTS` never alters pre-existing tables, so older
  * databases are upgraded here.
  */
-async function ensureOperationIdColumn(db: DatabaseAdapter, table: string): Promise<void> {
+async function ensureColumn(
+  db: DatabaseAdapter,
+  table: string,
+  column: string,
+  type: string,
+): Promise<void> {
   const info = await db.query<{ name: string }>(`PRAGMA table_info('${table}')`);
-  if (!info.rows.some((row) => row.name === "operation_id")) {
-    await db.exec(`ALTER TABLE ${table} ADD COLUMN operation_id TEXT`);
+  if (!info.rows.some((row) => row.name === column)) {
+    await db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
   }
+}
+
+async function ensureOperationIdColumn(db: DatabaseAdapter, table: string): Promise<void> {
+  await ensureColumn(db, table, "operation_id", "TEXT");
   await db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_${table}_operation_id
     ON ${table}(operation_id) WHERE operation_id IS NOT NULL

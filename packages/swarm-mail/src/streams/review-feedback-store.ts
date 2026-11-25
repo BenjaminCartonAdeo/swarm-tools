@@ -177,7 +177,13 @@ export async function completeReviewFeedback(
   const db = await resolveDb(dbOverride);
   const updated = await db.query(
     `UPDATE review_feedback_operations
-     SET state = 'done', result = ?, claim_token = NULL, updated_at = ?
+     SET state = 'done', result = ?, claim_token = NULL, updated_at = ?,
+         completion_seq = (
+           SELECT COALESCE(MAX(prior.completion_seq), 0) + 1
+           FROM review_feedback_operations AS prior
+           WHERE prior.project_key = review_feedback_operations.project_key
+             AND prior.task_id = review_feedback_operations.task_id
+         )
      WHERE operation_id = ? AND claim_token = ? AND state IN ('claimed', 'in_progress')
      RETURNING operation_id`,
     [JSON.stringify(result), Date.now(), operationId, claimToken],
@@ -252,7 +258,7 @@ export async function getDurableReviewApproval(
   const latest = await db.query<{ result: string | null }>(
     `SELECT result FROM review_feedback_operations
      WHERE project_key = ? AND task_id = ? AND state = 'done'
-     ORDER BY attempt DESC, rowid DESC LIMIT 1`,
+     ORDER BY completion_seq DESC LIMIT 1`,
     [projectKey, taskId],
   );
   const raw = latest.rows[0]?.result;
