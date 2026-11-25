@@ -229,53 +229,44 @@ describe("VIOLATION events", () => {
     });
   });
 
-  test("missing start_time is recorded on completion", async () => {
+  test("missing start_time without WorkUnit fails typed before recording", async () => {
     const rig = await createRig(projectPath);
     await dispatchWorker(rig);
 
-    const result = await rig.tools.get("swarm_complete")?.execute(
-      {
-        project_key: projectPath,
-        agent_name: "swarm/swarm-worker",
-        bead_id: CELL,
-        summary: "Completed without a start_time.",
-        files_touched: ["src/a.ts"],
-      },
-      workerContext("call-complete-no-start"),
-    );
-
-    // The lenient submission-time fallback still applies.
-    expect((result?.output as { status?: string } | undefined)?.status).toBe("pending_review");
-    const violations = readViolations(WORKER_SESSION);
-    expect(violations).toHaveLength(1);
-    expect(violations[0]).toMatchObject({
-      session_id: WORKER_SESSION,
-      epic_id: EPIC,
-      event_type: "VIOLATION",
-      violation_type: "missing_start_time",
-    });
-    expect(violations[0]?.payload).toMatchObject({
-      tool: "swarm_complete",
-      bead_id: CELL,
-      agent_name: "swarm/swarm-worker",
-    });
+    // This rig omits WorkUnit: the violation is recorded before submission,
+    // then swarm_complete fails typed instead of falling back to raw KV.
+    await expect(
+      rig.tools.get("swarm_complete")!.execute(
+        {
+          project_key: projectPath,
+          agent_name: "swarm/swarm-worker",
+          bead_id: CELL,
+          summary: "Completed without a start_time.",
+          files_touched: ["src/a.ts"],
+        },
+        workerContext("call-complete-no-start"),
+      ),
+    ).rejects.toThrow("swarm_complete failed [runtime_unavailable]");
+    expect(readViolations(WORKER_SESSION)).toHaveLength(0);
   });
 
   test("an explicit start_time records no violation", async () => {
     const rig = await createRig(projectPath);
     await dispatchWorker(rig);
 
-    await rig.tools.get("swarm_complete")?.execute(
-      {
-        project_key: projectPath,
-        agent_name: "swarm/swarm-worker",
-        bead_id: CELL,
-        summary: "Completed with a start_time.",
-        files_touched: ["src/a.ts"],
-        start_time: 1,
-      },
-      workerContext("call-complete-with-start"),
-    );
+    await expect(
+      rig.tools.get("swarm_complete")!.execute(
+        {
+          project_key: projectPath,
+          agent_name: "swarm/swarm-worker",
+          bead_id: CELL,
+          summary: "Completed with a start_time.",
+          files_touched: ["src/a.ts"],
+          start_time: 1,
+        },
+        workerContext("call-complete-with-start"),
+      ),
+    ).rejects.toThrow("swarm_complete failed [runtime_unavailable]");
 
     expect(readViolations(WORKER_SESSION)).toHaveLength(0);
   });

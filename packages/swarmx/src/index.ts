@@ -12,7 +12,7 @@
  */
 import { Plugin } from "@opencode/plugin";
 
-import { pendingCompletionKey, registerTools } from "./catalog";
+import { registerTools } from "./catalog";
 import { createSwarmCliRunner } from "./cli";
 
 export { createWorkUnitEffectPorts, setupWorkUnitRuntime } from "./workunit/ports";
@@ -214,7 +214,6 @@ async function workerMutationDenial(
   if (marker?.dispatchToken === undefined || agentID === undefined) return "token_missing";
   let bindingStatus: "bound" | "already_bound" | "not_owner" | "revoked" | "inactive" | "token_missing";
   let followup: boolean;
-  let bindingMissionID: string | undefined;
   try {
     if (runtime.workUnit === undefined) {
       const binding = await bindWorkerAttemptSession(
@@ -226,9 +225,6 @@ async function workerMutationDenial(
         agentID,
       );
       bindingStatus = binding.status === "not_found" || binding.status === "invalid_status" ? "token_missing" : binding.status;
-      bindingMissionID = binding.status === "bound" || binding.status === "already_bound"
-        ? binding.missionID
-        : undefined;
       followup = binding.status === "bound" || binding.status === "already_bound"
         ? binding.attempt.followup === true
         : false;
@@ -236,10 +232,8 @@ async function workerMutationDenial(
       const missionRow = await getMission(runtime.workUnit.db, runtime.projectID, parentSessionID);
       if (missionRow === null || missionRow.mission_id !== mission.missionID) {
         bindingStatus = "inactive";
-        bindingMissionID = undefined;
         followup = false;
       } else {
-        bindingMissionID = mission.missionID;
         const unit = (await listUnits(runtime.workUnit.db, missionRow.id)).find((candidate) =>
           candidate.dispatch_token === marker?.dispatchToken &&
           candidate.cell_id === marker.cellID &&
@@ -278,19 +272,9 @@ async function workerMutationDenial(
   if (bindingStatus === "inactive") return "mission_inactive";
   if (bindingStatus !== "bound" && bindingStatus !== "already_bound") return "token_missing";
   if (followup) return "read_only_followup";
-  // Native binding is authoritative; legacy pending-completion is an optional
-  // overlay until Task 13d3 and must not deny when no legacy store exists.
-  const legacyStore = legacyStoreOf(runtime);
-  if (legacyStore === undefined) return undefined;
-  const pending = await legacyStore.storage.get(pendingCompletionKey(runtime.projectID, marker.cellID));
-  const pendingRecord =
-    typeof pending === "object" && pending !== null ? (pending as Record<string, unknown>) : undefined;
-  return pendingRecord?.projectID === runtime.projectID &&
-    pendingRecord.parentSessionID === parentSessionID &&
-    pendingRecord.missionID === bindingMissionID &&
-    pendingRecord.taskID === marker.cellID
-    ? "pending_completion"
-    : undefined;
+  // Native SUBMITTED/IN_REVIEW denial above is authoritative; there is no
+  // raw-KV pending-completion overlay.
+  return undefined;
 }
 
 /** Optional seams, used by tests to prove the compaction hook calls no CLI. */

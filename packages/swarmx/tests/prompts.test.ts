@@ -26,6 +26,7 @@ import {
   readMission,
   resetMission,
   resolveAssignment,
+  setBudget,
 } from "../src/state";
 import type { ConsolidationStatus, SwarmxRuntime, ToolContextLike } from "../src/types";
 import { createFakeContext, type FakeAgentInfo, type FakeToolInfo } from "./helpers";
@@ -218,25 +219,6 @@ describe("local tool handlers", () => {
     expect(output.total).toBe(8);
   });
 
-  test("swarm_resolve_agent honors an explicit tier when its agent exists", async () => {
-    const { tool, store } = await setup();
-    const cells = [
-      { bead_id: "cell-heavy", title: "Design the migration", tier: "heavy" },
-      { bead_id: "cell-fast", title: "Locate the auth flow", tier: "fast" },
-    ];
-
-    const output = await outputOf(tool("swarm_resolve_agent"), { cells, apply: true });
-    const results = output.results as readonly { bead_id: string; agent: string | null; rationale: string }[];
-    expect(results.find((entry) => entry.bead_id === "cell-heavy")?.agent).toBe("heavy");
-    expect(results.find((entry) => entry.bead_id === "cell-fast")?.agent).toBe("fast");
-    expect(results[0]?.rationale).toContain("explicit tier heavy");
-    expect(await resolveAssignment(store, "adeo", "cell-heavy")).toBe("heavy");
-    expect(await resolveAssignment(store, "adeo", "cell-fast")).toBe("fast");
-    expect(await store.storage.get(assignmentKey("adeo", "cell-heavy"))).toMatchObject({
-      sessionID: "ses_test",
-    });
-  });
-
   test("swarm_resolve_agent rejects an unknown tier value", async () => {
     const { tool } = await setup();
     await expect(
@@ -271,21 +253,6 @@ describe("local tool handlers", () => {
     expect(results[0]?.agent).not.toBe("heavy");
   });
 
-  test("swarm_resolve_agent is deterministic and persists assignments on apply", async () => {
-    const { tool, store } = await setup();
-    const cells = [{ bead_id: "cell-ts", title: "Implement endpoint", files: ["src/a.ts"] }];
-
-    const first = await outputOf(tool("swarm_resolve_agent"), { cells });
-    const second = await outputOf(tool("swarm_resolve_agent"), { cells });
-    expect(second).toEqual(first);
-
-    const results = first.results as readonly { agent: string | null }[];
-    expect(results[0]?.agent).toBe("development/typescript-pro");
-
-    await outputOf(tool("swarm_resolve_agent"), { cells, apply: true });
-    expect(await resolveAssignment(store, "adeo", "cell-ts")).toBe("development/typescript-pro");
-  });
-
   test("swarm_resolve_agent reports arbitration instead of defaulting", async () => {
     const { tool } = await setup();
     const output = await outputOf(tool("swarm_resolve_agent"), {
@@ -299,36 +266,6 @@ describe("local tool handlers", () => {
     expect(results[0]?.agent).toBeNull();
     expect(results[0]?.needs_arbitration).toBe(true);
     expect(results[0]?.candidates).toEqual([]);
-  });
-
-  test("swarm_set_agent stores the assignment and rejects unknown agents", async () => {
-    const { tool, store } = await setup();
-    const output = await outputOf(tool("swarm_set_agent"), {
-      bead_id: "cell-vue",
-      agent: "vue",
-      rationale: "UI work",
-    });
-    expect(output.agent).toBe("vue");
-    expect(await resolveAssignment(store, "adeo", "cell-vue")).toBe("vue");
-    expect(await store.storage.get(assignmentKey("adeo", "cell-vue"))).toMatchObject({
-      sessionID: "ses_test",
-    });
-
-    const failure = tool("swarm_set_agent").execute(
-      { bead_id: "cell-vue", agent: "ghost" },
-      CALL_CONTEXT,
-    );
-    await expect(failure).rejects.toThrow(/agent_unknown/);
-  });
-
-  test("swarm_set_budget creates the mission and refuses a second budget", async () => {
-    const { tool } = await setup();
-    const first = await outputOf(tool("swarm_set_budget"), {});
-    expect(first.budget).toEqual({ maxSpawns: 20, maxIterations: 3, workerShare: 0.2 });
-    expect(first.active).toBe(true);
-
-    const second = tool("swarm_set_budget").execute({}, CALL_CONTEXT);
-    await expect(second).rejects.toThrow(/already set/);
   });
 
   test("swarm_subtask_prompt embeds the marker exactly once and keeps the agent", async () => {
@@ -421,7 +358,7 @@ describe("local tool handlers", () => {
         );
       },
     });
-    await outputOf(tool("swarm_set_budget"), {});
+    await setBudget(store, { projectID: "adeo", sessionID: "ses_test", mode: "dev", maxSpawns: 20, maxIterations: 3 });
 
     const output = await outputOf(tool("swarm_spawn_retry"), {
       bead_id: "cell-1",
@@ -459,46 +396,6 @@ describe("local tool handlers", () => {
     });
   });
 
-  test("swarm_agent_audit reports the mission, then swarm_finish closes it", async () => {
-    const { tool } = await setup();
-    await outputOf(tool("swarm_set_budget"), { mode: "audit" });
-
-    const auditBefore = await outputOf(tool("swarm_agent_audit"), {});
-    expect(auditBefore.active).toBe(true);
-    expect(auditBefore.workerSpawns).toBe(0);
-    expect(auditBefore.workerShare).toBe(0);
-
-    const finished = await outputOf(tool("swarm_finish"), { reason: "done" });
-    expect(finished.finished).toBe(true);
-    expect(finished.active).toBe(false);
-
-    const auditAfter = await outputOf(tool("swarm_agent_audit"), {});
-    expect(auditAfter.active).toBe(false);
-  });
-
-  test("swarm_reset clears the mission and allows a new budget", async () => {
-    const { tool } = await setup();
-    await outputOf(tool("swarm_set_budget"), { mode: "audit" });
-
-    const reset = await outputOf(tool("swarm_reset"), {});
-    expect(reset.reset).toBe(true);
-
-    const auditAfter = await outputOf(tool("swarm_agent_audit"), {});
-    expect(auditAfter.active).toBe(false);
-
-    const newBudget = await outputOf(tool("swarm_set_budget"), { mode: "dev" });
-    expect((newBudget.budget as { maxSpawns: number }).maxSpawns).toBe(20);
-  });
-
-  test("swarm_finish clears the budget and allows a new budget", async () => {
-    const { tool } = await setup();
-    await outputOf(tool("swarm_set_budget"), { mode: "audit" });
-    await outputOf(tool("swarm_finish"), { reason: "done" });
-
-    const newBudget = await outputOf(tool("swarm_set_budget"), { mode: "dev" });
-    expect((newBudget.budget as { maxSpawns: number }).maxSpawns).toBe(20);
-  });
-
   test("resetMission clears the budget document", async () => {
     const PROJECT = "adeo";
     const SESSION = "ses_test";
@@ -510,49 +407,6 @@ describe("local tool handlers", () => {
     expect(await store.storage.get(budgetKey(PROJECT, SESSION))).toBeUndefined();
   });
 
-  test("swarm_agent_audit counts canonical and legacy worker IDs", async () => {
-    const { tool, store } = await setup();
-    await outputOf(tool("swarm_set_budget"), { mode: "audit" });
-
-    const mission = await store.load("adeo", "ses_test");
-    if (mission === undefined) throw new Error("swarm_set_budget did not create a mission");
-    mission.counts.spawns = 2;
-    mission.counts.cells = 2;
-    mission.counts.attemptsByCell = { "cell-worker": 1, "cell-worker-legacy": 1 };
-    mission.counts.workerSpawns = 2;
-    await store.save(mission);
-    await putAttempt(store, "adeo", {
-      callID: "call-worker",
-      missionID: mission.missionID,
-      sessionID: "ses_test",
-      cellID: "cell-worker",
-      epicID: "epic-1",
-      agent: "swarm/swarm-worker",
-      status: "succeeded",
-      ts: "2026-01-01T00:00:00.000Z",
-    });
-    await putAttempt(store, "adeo", {
-      callID: "call-worker-legacy",
-      missionID: mission.missionID,
-      sessionID: "ses_test",
-      cellID: "cell-worker-legacy",
-      epicID: "epic-1",
-      agent: "swarm-worker",
-      status: "succeeded",
-      ts: "2026-01-01T00:00:01.000Z",
-    });
-
-    const output = await outputOf(tool("swarm_agent_audit"), {});
-
-    expect(output.workerSpawns).toBe(2);
-    expect(output.workerShare).toBe(1);
-  });
-
-  test("swarm_finish refuses when no mission exists", async () => {
-    const { tool } = await setup();
-    const failure = tool("swarm_finish").execute({}, CALL_CONTEXT);
-    await expect(failure).rejects.toThrow(/not_found/);
-  });
 });
 
 describe("consolidation detection", () => {
@@ -562,7 +416,7 @@ describe("consolidation detection", () => {
   /** Starts a mission so `maybePrepareConsolidation` has somewhere to persist. */
   async function setupMission() {
     const harness = await setup();
-    await outputOf(harness.tool("swarm_set_budget"), {});
+    await setBudget(harness.store, { projectID: "adeo", sessionID: "ses_test", mode: "dev", maxSpawns: 20, maxIterations: 3 });
     return harness;
   }
 
@@ -688,7 +542,7 @@ describe("consolidation completion", () => {
 
   async function setupMission() {
     const harness = await setup();
-    await outputOf(harness.tool("swarm_set_budget"), {});
+    await setBudget(harness.store, { projectID: "adeo", sessionID: "ses_test", mode: "dev", maxSpawns: 20, maxIterations: 3 });
     const mission = await readMission(harness.store, "adeo", "ses_test");
     if (mission === undefined) throw new Error("mission was not created");
     await harness.store.save({
@@ -743,7 +597,7 @@ describe("consolidation completion", () => {
 
   test("a mission without consolidation is a no-op", async () => {
     const harness = await setup();
-    await outputOf(harness.tool("swarm_set_budget"), {});
+    await setBudget(harness.store, { projectID: "adeo", sessionID: "ses_test", mode: "dev", maxSpawns: 20, maxIterations: 3 });
 
     const completed = await completeConsolidation(harness.store, {
       projectID: "adeo",
@@ -755,326 +609,36 @@ describe("consolidation completion", () => {
   });
 });
 
-describe("consolidation in swarm_agent_audit", () => {
-  const EPIC = "epic-1";
-
-  /** Starts a mission and forces its persisted consolidation pointer. */
-  async function seedConsolidation(
-    store: ReturnType<typeof createMissionStateStore>,
-    status: ConsolidationStatus,
-  ): Promise<void> {
-    const mission = await readMission(store, "adeo", "ses_test");
-    if (mission === undefined) throw new Error("mission was not created");
-    await store.save({
-      ...mission,
-      consolidation: {
-        epicID: EPIC,
-        cellID: "cell-consolidate",
-        status,
-        prompt: "merge and verify",
-        createdAt: 1_700_000_000_000,
-      },
+describe("lifecycle tools without a WorkUnit runtime", () => {
+  // CLI-only runtimes may omit WorkUnit; lifecycle tools must fail typed and
+  // never fall back to raw KV lifecycle keys.
+  const cases: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
+    ["swarm_set_budget", {}],
+    ["swarm_set_agent", { bead_id: "cell-a", agent: "fast" }],
+    ["swarm_resolve_agent", { cells: [{ bead_id: "cell-a", title: "Locate", tier: "fast" }], apply: true }],
+    ["swarm_agent_audit", {}],
+    ["swarm_mission_status", {}],
+    ["swarm_reset", {}],
+    ["swarm_finish", {}],
+    ["swarm_finish", { abandon: true, all_sessions: true }],
+    ["swarm_cancel_completion", { bead_id: "cell-a", reason: "stop" }],
+  ];
+  for (const [name, args] of cases) {
+    test(`${name} ${JSON.stringify(args)} fails runtime_unavailable without touching KV`, async () => {
+      const harness = await setup();
+      const writes: string[] = [];
+      const storage = harness.store.storage;
+      const originalSet = storage.set.bind(storage);
+      storage.set = (async (key: string, value: unknown) => {
+        writes.push(key);
+        return originalSet(key, value);
+      }) as typeof storage.set;
+      const error = await harness.tool(name).execute(args, CALL_CONTEXT).then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+      expect(String(error)).toContain(`${name} failed [runtime_unavailable]`);
+      expect(writes).toEqual([]);
     });
   }
-
-  test("a mission without consolidation audits as null", async () => {
-    const { tool } = await setup();
-    await outputOf(tool("swarm_set_budget"), {});
-
-    const audit = await outputOf(tool("swarm_agent_audit"), {});
-
-    expect(audit.consolidation).toBeNull();
-  });
-
-  test("the audit exposes the prepared prompt so the coordinator can dispatch it", async () => {
-    const { tool, store } = await setup();
-    await outputOf(tool("swarm_set_budget"), {});
-    await seedConsolidation(store, "ready");
-
-    const audit = await outputOf(tool("swarm_agent_audit"), {});
-
-    expect(audit.consolidation).toEqual({
-      status: "ready",
-      cellID: "cell-consolidate",
-      epicID: EPIC,
-      prompt: "merge and verify",
-    });
-  });
-
-  test("a completed consolidation audits as completed with no dispatch hint", async () => {
-    const { tool, store } = await setup();
-    await outputOf(tool("swarm_set_budget"), {});
-    await seedConsolidation(store, "completed");
-
-    const audit = await outputOf(tool("swarm_agent_audit"), {});
-
-    expect((audit.consolidation as { status: string }).status).toBe("completed");
-  });
-});
-
-describe("swarm_finish consolidation guard", () => {
-  const EPIC = "epic-1";
-
-  /** Rig whose `hive_cells` returns `children` (other tools answer `{}`). */
-  async function setupFinish(
-    children: readonly { id: string; status: string }[] | Error,
-  ): Promise<Harness> {
-    return setup({
-      runTool: (name: string) =>
-        name === "hive_cells"
-          ? children instanceof Error
-            ? Promise.reject(children)
-            : Promise.resolve({ cells: children })
-          : Promise.resolve({}),
-    });
-  }
-
-  /** Ledger entry carrying an epic but no open work (status `failed`). */
-  async function seedAttempt(
-    store: ReturnType<typeof createMissionStateStore>,
-    cellID: string,
-  ): Promise<void> {
-    const mission = await readMission(store, "adeo", "ses_test");
-    if (mission === undefined) throw new Error("mission was not created");
-    await putAttempt(store, "adeo", {
-      callID: `call-${cellID}`,
-      ...(mission.missionID === undefined ? {} : { missionID: mission.missionID }),
-      sessionID: "ses_test",
-      cellID,
-      epicID: EPIC,
-      agent: "swarm/swarm-worker",
-      status: "failed",
-      ts: new Date().toISOString(),
-    });
-  }
-
-  async function seedConsolidation(
-    store: ReturnType<typeof createMissionStateStore>,
-    status: ConsolidationStatus,
-  ): Promise<void> {
-    const mission = await readMission(store, "adeo", "ses_test");
-    if (mission === undefined) throw new Error("mission was not created");
-    await store.save({
-      ...mission,
-      consolidation: {
-        epicID: EPIC,
-        cellID: "cell-consolidate",
-        status,
-        prompt: "merge and verify",
-        createdAt: 1_700_000_000_000,
-      },
-    });
-  }
-
-  test("refuses to finish a multi-cell epic with no consolidation", async () => {
-    const harness = await setupFinish([
-      { id: "cell-a", status: "closed" },
-      { id: "cell-b", status: "closed" },
-    ]);
-    await outputOf(harness.tool("swarm_set_budget"), {});
-    await seedAttempt(harness.store, "cell-a");
-
-    await expect(
-      harness.tool("swarm_finish").execute({ reason: "done" }, CALL_CONTEXT),
-    ).rejects.toThrow(/consolidation required/);
-    expect((await readMission(harness.store, "adeo", "ses_test"))?.active).toBe(true);
-  });
-
-  test("refuses to finish while the consolidation is only ready", async () => {
-    const harness = await setupFinish([
-      { id: "cell-a", status: "closed" },
-      { id: "cell-b", status: "closed" },
-      { id: "cell-consolidate", status: "open" },
-    ]);
-    await outputOf(harness.tool("swarm_set_budget"), {});
-    await seedAttempt(harness.store, "cell-a");
-    await seedConsolidation(harness.store, "ready");
-
-    await expect(
-      harness.tool("swarm_finish").execute({ reason: "done" }, CALL_CONTEXT),
-    ).rejects.toThrow(/status=ready/);
-  });
-
-  test("allows finishing once the consolidation is completed", async () => {
-    const harness = await setupFinish([
-      { id: "cell-a", status: "closed" },
-      { id: "cell-b", status: "closed" },
-      { id: "cell-consolidate", status: "closed" },
-    ]);
-    await outputOf(harness.tool("swarm_set_budget"), {});
-    await seedAttempt(harness.store, "cell-a");
-    await seedConsolidation(harness.store, "completed");
-
-    const finished = await outputOf(harness.tool("swarm_finish"), { reason: "done" });
-
-    expect(finished.finished).toBe(true);
-  });
-
-  test("allows finishing a single-cell epic without consolidation", async () => {
-    const harness = await setupFinish([{ id: "cell-a", status: "closed" }]);
-    await outputOf(harness.tool("swarm_set_budget"), {});
-    await seedAttempt(harness.store, "cell-a");
-
-    const finished = await outputOf(harness.tool("swarm_finish"), { reason: "done" });
-
-    expect(finished.finished).toBe(true);
-  });
-
-  test("does not count the consolidation cell itself as work", async () => {
-    // One real cell plus the prepared consolidation cell: still a single-cell
-    // epic, so the guard must not demand a finished consolidation.
-    const harness = await setupFinish([
-      { id: "cell-a", status: "closed" },
-      { id: "cell-consolidate", status: "open" },
-    ]);
-    await outputOf(harness.tool("swarm_set_budget"), {});
-    await seedAttempt(harness.store, "cell-a");
-    await seedConsolidation(harness.store, "ready");
-
-    const finished = await outputOf(harness.tool("swarm_finish"), { reason: "done" });
-
-    expect(finished.finished).toBe(true);
-  });
-
-  test("an unreadable hive does not block the finish", async () => {
-    const harness = await setupFinish(new Error("hive unavailable"));
-    await outputOf(harness.tool("swarm_set_budget"), {});
-    await seedAttempt(harness.store, "cell-a");
-
-    const finished = await outputOf(harness.tool("swarm_finish"), { reason: "done" });
-
-    expect(finished.finished).toBe(true);
-  });
-
-  test("a consolidation cell closed in the hive counts as completed", async () => {
-    const harness = await setupFinish([
-      { id: "cell-a", status: "closed" },
-      { id: "cell-b", status: "closed" },
-      { id: "cell-consolidate", status: "closed" },
-    ]);
-    await outputOf(harness.tool("swarm_set_budget"), {});
-    await seedAttempt(harness.store, "cell-a");
-    // Persisted pointer still says `dispatched`: the hive status wins.
-    await seedConsolidation(harness.store, "dispatched");
-
-    const finished = await outputOf(harness.tool("swarm_finish"), { reason: "done" });
-
-    expect(finished.finished).toBe(true);
-  });
-
-  test("finishing an already finished mission stays a no-op", async () => {
-    const harness = await setupFinish([{ id: "cell-a", status: "closed" }]);
-    await outputOf(harness.tool("swarm_set_budget"), {});
-    await seedAttempt(harness.store, "cell-a");
-    await outputOf(harness.tool("swarm_finish"), { reason: "guarded" });
-
-    // The guard must not re-run on an inactive mission, otherwise the second
-    // call (a legitimate retry) would be refused forever.
-    const again = await outputOf(harness.tool("swarm_finish"), { reason: "retry" });
-
-    expect(again.finished).toBe(true);
-  });
-});
-
-describe("swarm_finish worktree cleanup", () => {
-  type CleanupCall = { readonly name: string; readonly args: Record<string, unknown> };
-
-  async function startMissionWithProject(
-    runTool: NonNullable<SwarmxRuntime["runTool"]>,
-  ): Promise<{ readonly harness: Harness; readonly projectRoot: string }> {
-    const projectRoot = await realpath(process.cwd());
-    const harness = await setup({ projectPath: projectRoot, runTool });
-    await outputOf(harness.tool("swarm_set_budget"), {});
-    return { harness, projectRoot };
-  }
-
-  async function seedFailedAttempt(
-    store: ReturnType<typeof createMissionStateStore>,
-    callID: string,
-    cellID: string,
-  ): Promise<void> {
-    const mission = await readMission(store, "adeo", "ses_test");
-    if (mission === undefined) throw new Error("mission was not created");
-    await putAttempt(store, "adeo", {
-      callID,
-      ...(mission.missionID === undefined ? {} : { missionID: mission.missionID }),
-      sessionID: "ses_test",
-      cellID,
-      agent: "swarm/swarm-worker",
-      status: "failed",
-      ts: new Date().toISOString(),
-    });
-  }
-
-  test("cleans each task worktree with the canonical project root", async () => {
-    const calls: CleanupCall[] = [];
-    const { harness, projectRoot } = await startMissionWithProject((name, args) => {
-      if (name === "swarm_worktree_cleanup") calls.push({ name, args });
-      return Promise.resolve({});
-    });
-    await seedFailedAttempt(harness.store, "call-a", "cell-a");
-    await seedFailedAttempt(harness.store, "call-b", "cell-b");
-
-    const finished = await outputOf(harness.tool("swarm_finish"), { reason: "done" });
-
-    expect(finished.finished).toBe(true);
-    calls.sort((left, right) => String(left.args.task_id).localeCompare(String(right.args.task_id)));
-    expect(calls).toEqual([
-      {
-        name: "swarm_worktree_cleanup",
-        args: { project_path: projectRoot, task_id: "cell-a" },
-      },
-      {
-        name: "swarm_worktree_cleanup",
-        args: { project_path: projectRoot, task_id: "cell-b" },
-      },
-    ]);
-  });
-
-  test("deduplicates worktree cleanup by cell ID", async () => {
-    const calls: CleanupCall[] = [];
-    const { harness } = await startMissionWithProject((name, args) => {
-      if (name === "swarm_worktree_cleanup") calls.push({ name, args });
-      return Promise.resolve({});
-    });
-    await seedFailedAttempt(harness.store, "call-a1", "cell-a");
-    await seedFailedAttempt(harness.store, "call-a2", "cell-a");
-    await seedFailedAttempt(harness.store, "call-b", "cell-b");
-
-    await outputOf(harness.tool("swarm_finish"), { reason: "done" });
-
-    expect(calls).toHaveLength(2);
-    expect(calls.map(({ args }) => args.task_id).sort()).toEqual(["cell-a", "cell-b"]);
-  });
-
-  test("reports cleanup failures as warnings without failing mission finish", async () => {
-    const calls: CleanupCall[] = [];
-    const { harness } = await startMissionWithProject((name, args) => {
-      if (name === "swarm_worktree_cleanup") {
-        calls.push({ name, args });
-        if (args.task_id === "cell-a") return Promise.reject(new Error("cleanup failed"));
-        if (args.task_id === "cell-b") {
-          return Promise.resolve({ success: false, error: "backend reported failure" });
-        }
-        return Promise.resolve({});
-      }
-      return Promise.resolve({});
-    });
-    await seedFailedAttempt(harness.store, "call-a", "cell-a");
-    await seedFailedAttempt(harness.store, "call-b", "cell-b");
-    await seedFailedAttempt(harness.store, "call-c", "cell-c");
-
-    const finished = await outputOf(harness.tool("swarm_finish"), { reason: "done" });
-
-    expect(finished.finished).toBe(true);
-    expect(calls).toHaveLength(3);
-    const warnings = finished.warnings as readonly { readonly taskID: string; readonly message: string }[];
-    expect(warnings.map(({ taskID }) => taskID).sort()).toEqual(["cell-a", "cell-b"]);
-    expect(warnings.find(({ taskID }) => taskID === "cell-a")).toMatchObject({
-      message: "cleanup failed",
-    });
-    expect(warnings.find(({ taskID }) => taskID === "cell-b")).toMatchObject({
-      message: "backend reported failure",
-    });
-  });
 });
