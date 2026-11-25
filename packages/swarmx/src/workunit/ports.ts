@@ -1,8 +1,8 @@
 /**
  * WorkUnit effect ports and the additive runtime seam.
  *
- * `setupWorkUnitRuntime` is opt-in: the default plugin setup leaves `runtime.workUnit`
- * undefined, never migrates legacy KV, writes no tombstone and keeps `runtime.store`.
+ * The default plugin setup calls `setupWorkUnitRuntime` with project-wide migration and
+ * installs the result as `runtime.store`/`runtime.workUnit` before tools are registered.
  */
 import { randomUUID } from "node:crypto";
 import { hostname as osHostname } from "node:os";

@@ -174,7 +174,8 @@ async function createRig(options: RigOptions = {}): Promise<Rig> {
       },
       resolveWorkerCell: async (sessionID) => workerCells.get(sessionID) ?? options.workerCell,
       resolveWorkerParentSession: async (sessionID) => workerParents.get(sessionID),
-      ...(options.workUnit === undefined ? {} : { workUnit: options.workUnit }),
+      // Explicit backend choice: legacy-branch rigs pass `workUnit: undefined` on purpose.
+      workUnit: options.workUnit,
       ...(options.workerProtocol === undefined ? {} : { workerProtocol: options.workerProtocol }),
     },
   });
@@ -3886,13 +3887,13 @@ describe("WorkUnit runtime setup (additive)", () => {
     }
   });
 
-  test("setup: default plugin keeps the legacy store and writes no tombstone; workUnit is injectable via the override seam", async () => {
+  test("setup: explicit runtime overrides (legacy or injected workUnit) skip default migration and write no tombstone", async () => {
     const { createLibSQLAdapter } = await import("swarm-mail");
     const { setupWorkUnitRuntime } = await import("../src/index");
     const db = await createLibSQLAdapter({ url: ":memory:" });
     try {
       const workUnit = await setupWorkUnitRuntime(db, { host: { hostInstanceId: "h", hostname: "box", pid: 42 }, isProcessAlive: () => true });
-      for (const overrides of [{}, { runtime: { workUnit } }]) {
+      for (const overrides of [{ runtime: { workUnit: undefined } }, { runtime: { workUnit } }]) {
         const ctx = createFakeContext({ projectId: PROJECT });
         const plugin = createSwarmxPlugin(overrides);
         await plugin.setup(ctx as unknown as Plugin.Context);

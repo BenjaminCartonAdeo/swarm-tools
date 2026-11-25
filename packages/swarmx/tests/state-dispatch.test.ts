@@ -11,7 +11,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { Plugin } from "@opencode/plugin";
 
-import swarmx from "../src/index";
+import swarmx, { createSwarmxPlugin } from "../src/index";
+
+/** Legacy-branch plugin: explicitly opts out of the default WorkUnit lifecycle. */
+const legacySwarmx = createSwarmxPlugin({ runtime: { workUnit: undefined } });
 import {
   DISPATCH_TOOL_NAME,
   extractCellMarker,
@@ -1225,7 +1228,7 @@ describe("plugin wiring", () => {
 
   test("setup wires execute.before/after to the mission store", async () => {
     const ctx = createFakeContext({ agents: AGENTS, projectId: PROJECT });
-    await swarmx.setup(ctx as unknown as Plugin.Context);
+    await legacySwarmx.setup(ctx as unknown as Plugin.Context);
 
     const beforeHooks = ctx.captures.toolHooks.get("execute.before") ?? [];
     const afterHooks = ctx.captures.toolHooks.get("execute.after") ?? [];
@@ -1251,7 +1254,7 @@ describe("plugin wiring", () => {
 
   test("runtime without WorkUnit preserves legacy dispatch reservation and settlement", async () => {
     const ctx = createFakeContext({ agents: AGENTS, projectId: PROJECT });
-    await swarmx.setup(ctx as unknown as Plugin.Context);
+    await legacySwarmx.setup(ctx as unknown as Plugin.Context);
 
     const beforeHooks = ctx.captures.toolHooks.get("execute.before") ?? [];
     const afterHooks = ctx.captures.toolHooks.get("execute.after") ?? [];

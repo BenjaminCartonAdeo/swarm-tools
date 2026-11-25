@@ -76,6 +76,8 @@ async function createRig(projectPath: string): Promise<Rig> {
   const plugin = createSwarmxPlugin({
     runtime: {
       runTool: async () => ({ ok: true }),
+      // Legacy-store assertions: explicitly opt out of the default WorkUnit lifecycle.
+      workUnit: undefined,
       sessionID: () => SESSION,
       sessionEvents: createSessionEventWriter(),
       workerProtocol: "",

@@ -386,7 +386,7 @@ describe("compaction hook wiring", () => {
       }),
     );
 
-    const swarmx = createSwarmxPlugin();
+    const swarmx = createSwarmxPlugin({ runtime: { workUnit: undefined } }); // legacy ledger path, explicit opt-out
     await swarmx.setup(ctx as unknown as Plugin.Context);
 
     const [hook] = ctx.captures.sessionHooks.get(COMPACTION_HOOK_NAME) ?? [];

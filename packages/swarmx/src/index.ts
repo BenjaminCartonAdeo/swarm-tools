@@ -43,9 +43,13 @@ import {
   selectPendingOrphans,
   type MissionStorageLike,
   legacyStoreOf,
+  createLegacyLifecycleStore,
 } from "./state";
 import type { DispatchAgentInfo, DispatchAgentList, SwarmxRuntime, ToolContextLike } from "./types";
+import { getSwarmMailDatabaseAdapter, type DatabaseAdapter } from "swarm-mail";
+import { setupWorkUnitRuntime, type WorkUnitRuntime } from "./workunit/ports";
 import { getMission } from "./workunit/mission";
+import { acquireWorkUnitLock, BUILD_LOCK_STALE_MS, buildLockName, releaseWorkUnitLock } from "./workunit/locks";
 import { listUnits } from "./workunit/mission";
 
 function isSwarmCliToolCommand(command: string): boolean {
@@ -296,6 +300,18 @@ export interface SwarmxPluginOverrides {
    * authoritative for the compaction path, which reads them directly.
    */
   readonly runtime?: Partial<SwarmxRuntime>;
+  /**
+   * WorkUnit DB resolver. Defaults to the canonical `getSwarmMailDatabaseAdapter()`
+   * (in-memory under tests via the `SWARM_DB_PATH=:memory:` preload).
+   */
+  readonly workUnitDatabase?: () => Promise<DatabaseAdapter>;
+  /** Test seam: observes WorkUnit setup steps in order. */
+  readonly workUnitTrace?: (step: string) => void;
+}
+
+/** True when the caller explicitly chose the lifecycle backend (legacy tests pass `workUnit: undefined`). */
+function hasExplicitWorkUnit(runtime: Partial<SwarmxRuntime> | undefined): boolean {
+  return runtime !== undefined && Object.prototype.hasOwnProperty.call(runtime, "workUnit");
 }
 
 /**
@@ -317,6 +333,21 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
           listAgents: () => ctx.agent.list() as unknown as Promise<DispatchAgentList>,
         },
       );
+      // Default lifecycle: schema -> project-wide idempotent migration/tombstone ->
+      // stale-effect recovery -> adapter/commands, all before hooks/tools exist.
+      // An explicit `overrides.runtime.workUnit` (even `undefined`) skips it.
+      let workUnit: WorkUnitRuntime | undefined;
+      if (!hasExplicitWorkUnit(overrides.runtime)) {
+        const legacyLifecycle = createLegacyLifecycleStore(store);
+        const db = await (overrides.workUnitDatabase ?? (() => getSwarmMailDatabaseAdapter()))();
+        workUnit = await setupWorkUnitRuntime(db, {
+          projectID,
+          migrate: { project: projectID, legacyStore: legacyLifecycle },
+          legacyReader: legacyLifecycle,
+          ...(overrides.workUnitTrace === undefined ? {} : { trace: overrides.workUnitTrace }),
+        });
+        overrides.workUnitTrace?.("runtime");
+      }
       const skills = await ctx.skill.list().catch(() => undefined);
       const catalogProtocol = skills?.data.find((skill) => skill.id === "swarm-worker-protocol")?.content;
       // Fall back to the bundled protocol so workers always receive the survival
@@ -349,7 +380,8 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
             return undefined;
           }
         },
-        store,
+        store: workUnit?.store ?? store,
+        ...(workUnit === undefined ? {} : { workUnit }),
         projectID,
         projectPath: ctx.location.project.canonical,
         sessionID: () => activeSessionID,
@@ -381,6 +413,31 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
       // the catalogue only needs the synchronous `tool.transform` surface.
       await registerTools(ctx as unknown as ToolContextLike, runtime);
 
+      // Build/test serialisation: SQL fenced lock once WorkUnit owns the lifecycle
+      // (legacy KV lock keys are tombstoned after migration); legacy KV otherwise.
+      const buildLockFences = new Map<string, number>();
+      const acquireShellBuildLock = async (sessionID: string, callID: string, command: string): Promise<boolean> => {
+        const native = runtime.workUnit;
+        if (native === undefined) return acquireBuildLock(store, projectID, sessionID, callID, command);
+        const result = await acquireWorkUnitLock(native.db, {
+          name: buildLockName(projectID),
+          token: callID,
+          ownerSession: sessionID,
+          now: Date.now(),
+          staleAfterMs: BUILD_LOCK_STALE_MS,
+        });
+        if (result.acquired) buildLockFences.set(callID, result.fence);
+        return result.acquired;
+      };
+      const releaseShellBuildLock = async (callID: string): Promise<boolean> => {
+        const native = runtime.workUnit;
+        if (native === undefined) return releaseBuildLock(store, projectID, callID);
+        const fence = buildLockFences.get(callID);
+        if (fence === undefined) return false;
+        buildLockFences.delete(callID);
+        return releaseWorkUnitLock(native.db, { name: buildLockName(projectID), token: callID, fence });
+      };
+
       const before = (event: {
         tool: string;
         sessionID: string;
@@ -404,13 +461,7 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
           if (typeof input === "object" && input !== null && "command" in input) {
             const command = input.command;
             if (typeof command === "string" && isBuildOrTestCommand(command)) {
-              const acquired = await acquireBuildLock(
-                store,
-                projectID,
-                event.sessionID,
-                event.id,
-                command,
-              ).catch(() => false);
+              const acquired = await acquireShellBuildLock(event.sessionID, event.id, command).catch(() => false);
               if (!acquired) {
                 throw new Error(
                   "another build/test is already running in this project; wait for it to finish before compiling again.",
@@ -424,7 +475,7 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
 
       await ctx.tool.hook("execute.after", async (event) => {
         if (event.tool === "shell") {
-          await releaseBuildLock(store, projectID, event.id).catch(() => undefined);
+          await releaseShellBuildLock(event.id).catch(() => undefined);
         }
         const base = before(event);
         const settled: DispatchAfterEvent =
