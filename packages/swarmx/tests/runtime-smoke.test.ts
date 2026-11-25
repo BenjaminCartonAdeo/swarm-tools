@@ -4532,3 +4532,135 @@ describe("WorkUnit completion lifecycle", () => {
     });
   });
 });
+
+describe("Task 13d3d1: remaining mission tools route through WorkUnits", () => {
+  async function bareNative(): Promise<WorkUnitRuntime> {
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    openedWorkUnitDatabases.push(db);
+    return setupWorkUnitRuntime(db, {
+      projectID: PROJECT,
+      host: { hostInstanceId: "runtime-smoke", hostname: "test-host", pid: 1 },
+    });
+  }
+
+  async function reserveUnit(runtime: WorkUnitRuntime, cellId: string, callId: string, sessionID = SESSION) {
+    return runtime.commands.reserve({ kind: "coordinator", sessionId: sessionID }, {
+      project: PROJECT, missionId: `work-${sessionID}`, workerAgent: "swarm/swarm-worker",
+      callId, dispatchToken: `token-${callId}`, cellId, budgetCharge: 1, idemKey: callId, attemptNo: 1,
+    });
+  }
+
+  test("native set_budget applies defaults, conflicts while active, and recreates after reset", async () => {
+    const native = await bareNative();
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native });
+    const dev = await rig.tools.get("swarm_set_budget")?.execute({}, toolContext());
+    expect(dev?.output).toEqual({ sessionID: SESSION, mode: "dev", active: true, budget: { maxSpawns: 20, maxIterations: 3, workerShare: expect.any(Number) } });
+    expect(dev?.content).toBe("Budget fixed: mode=dev max_spawns=20 max_iterations=3");
+    const first = await getMission(native.db, PROJECT, SESSION);
+    await expect(rig.tools.get("swarm_set_budget")?.execute({ mode: "audit" }, toolContext()))
+      .rejects.toThrow(/conflict/);
+    await rig.tools.get("swarm_reset")?.execute({}, toolContext());
+    const audit = await rig.tools.get("swarm_set_budget")?.execute({ mode: "audit" }, toolContext());
+    expect(audit?.output).toMatchObject({ sessionID: SESSION, mode: "audit", active: true, budget: { maxSpawns: 10, maxIterations: 3 } });
+    const second = await getMission(native.db, PROJECT, SESSION);
+    expect(second?.state).toBe("OPEN");
+    expect(second?.mission_id).not.toBe(first?.mission_id);
+    expect(await rig.ctx.storage.get(`mission:${PROJECT}:${SESSION}`)).toBeUndefined();
+  });
+
+  test("setBudget/recordRetryCause commands are actor-checked", async () => {
+    const native = await bareNative();
+    const policy = { total: 5, perCellIterations: 2, workerShare: null, version: 1 as const };
+    await expect(native.commands.setBudget({ kind: "worker", sessionId: SESSION }, { project: PROJECT, sessionId: SESSION, mode: "dev", budgetPolicy: policy }))
+      .rejects.toThrow(/worker actor/);
+    await expect(native.commands.setBudget({ kind: "coordinator", sessionId: "other" }, { project: PROJECT, sessionId: SESSION, mode: "dev", budgetPolicy: policy }))
+      .rejects.toThrow(/cannot budget/);
+    const mission = await native.commands.setBudget(nativeCoordinator, { project: PROJECT, sessionId: SESSION, mode: "dev", budgetPolicy: policy });
+    const cause = { cellID: "c", epicID: "e", attempt: 1, ts: "2026-01-01T00:00:00.000Z", failureReason: "boom" };
+    await expect(native.commands.recordRetryCause({ kind: "coordinator", sessionId: "other" }, { missionPk: mission.id, cause }))
+      .rejects.toThrow(/does not own/);
+    const updated = await native.commands.recordRetryCause(nativeCoordinator, { missionPk: mission.id, cause });
+    expect(JSON.parse(updated.retry_causes_json ?? "[]")).toEqual([cause]);
+  });
+
+  test("native mission_status projects unit counts, pending completions and orphan candidates", async () => {
+    const native = await createNativeMission({ total: 10 });
+    await reserveUnit(native.runtime, "cell-a", "call-a");
+    await reserveUnit(native.runtime, "cell-b", "call-b");
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime });
+    const result = await rig.tools.get("swarm_mission_status")?.execute({}, toolContext());
+    expect(result?.output).toMatchObject({
+      projectID: PROJECT,
+      missions: [{ sessionID: SESSION, active: true, mode: "dev", attempts: 2, unrevokedAttempts: 2, pendingCompletions: [] }],
+      orphanAttempts: 2,
+    });
+    expect(String(result?.content)).toContain("orphan attempts: 2");
+  });
+
+  test("native agent_audit derives attempts from units and reports orphan candidates without repair", async () => {
+    const native = await createNativeMission({ total: 10 });
+    await reserveUnit(native.runtime, "cell-a", "call-a");
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime });
+    const result = await rig.tools.get("swarm_agent_audit")?.execute({}, toolContext());
+    const output = result?.output as Record<string, unknown>;
+    expect(output).toMatchObject({ active: true, mode: "dev", sessionID: SESSION, pendingOrphans: 1, workerSpawns: 1, workerShare: 1, consolidation: null });
+    expect(output.attempts).toMatchObject([{ callID: "call-a", cellID: "cell-a", sessionID: SESSION, status: "pending" }]);
+    expect(Array.isArray(output.cells)).toBe(true);
+    expect(String(result?.content)).toContain("attempts: 1, pending orphan candidates: 1");
+    expect(String(result?.content)).not.toContain("repaired");
+    expect((await listUnits(native.runtime.db, native.missionPk))[0]?.state).toBe("RESERVED");
+  });
+
+  test("native spawn_retry persists the root cause through recordRetryCause", async () => {
+    const native = await createNativeMission();
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime, payload: { prompt: "retry" } });
+    await rig.tools.get("swarm_spawn_retry")?.execute(
+      { bead_id: "cell-a", epic_id: "epic-1", attempt: 2, original_prompt: "p", failure_reason: "tests failed", failed_command: "bun test", error_excerpt: "boom" },
+      toolContext(),
+    );
+    const mission = await getMission(native.runtime.db, PROJECT, SESSION);
+    expect(JSON.parse(mission?.retry_causes_json ?? "[]")).toMatchObject([{ cellID: "cell-a", epicID: "epic-1", attempt: 2, failureReason: "tests failed" }]);
+  });
+
+  test("native guards: hive_close and hive_update closed block on an active native mission", async () => {
+    const native = await createNativeMission();
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime });
+    await expect(rig.tools.get("hive_close")?.execute({ id: "cell-a", reason: "x" }, toolContext()))
+      .rejects.toThrow(/active swarmx cells close only through an approved swarm_complete call/);
+    await expect(rig.tools.get("hive_update")?.execute({ id: "cell-a", status: "closed" }, toolContext()))
+      .rejects.toThrow(/active swarmx cells close only through an approved swarm_complete call/);
+    expect(rig.runCalls.filter((call) => call.name === "hive_close" || call.name === "hive_update")).toHaveLength(0);
+  });
+
+  test("native guards: hive_close allowed with no live mission/unit; mission owner passes coordinator check", async () => {
+    const native = await bareNative();
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native });
+    await rig.tools.get("hive_close")?.execute({ id: "cell-z", reason: "done" }, toolContext());
+    expect(rig.runCalls.some((call) => call.name === "hive_close")).toBe(true);
+  });
+
+  test("native cleanup discovers missions from projection and refuses a live task unit", async () => {
+    const native = await createNativeMission();
+    await reserveUnit(native.runtime, "cell-a", "call-a");
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime, projectPath: process.cwd() });
+    await expect(rig.tools.get("swarm_worktree_cleanup")?.execute({ task_id: "cell-a", project_path: process.cwd() }, toolContext()))
+      .rejects.toThrow(/task cell-a has an unrevoked worker attempt/);
+    await expect(rig.tools.get("swarm_worktree_cleanup")?.execute({ cleanup_all: true, project_path: process.cwd() }, toolContext()))
+      .rejects.toThrow(/active swarmx cells close only through an approved swarm_complete call/);
+    expect(rig.runCalls.some((call) => call.name === "swarm_worktree_cleanup")).toBe(false);
+  });
+
+  test("compaction projects native MissionState with display-only orphan count", async () => {
+    const native = await createNativeMission({ total: 10 });
+    await reserveUnit(native.runtime, "cell-a", "call-a");
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime });
+    const [hook] = rig.ctx.captures.sessionHooks.get("compaction") ?? [];
+    const event = rig.ctx.createCompactionEvent({ sessionID: SESSION });
+    await hook!(event);
+    const text = event.system.at(-1)?.text ?? "";
+    expect(text).toContain("<swarmx_facts>");
+    expect(text).toContain("counts spawns=1");
+    expect(text).toContain("pendingOrphans=1");
+    expect((await listUnits(native.runtime.db, native.missionPk))[0]?.state).toBe("RESERVED");
+  });
+});

@@ -7,7 +7,11 @@
 import { createHash } from "node:crypto";
 import type { DatabaseAdapter } from "swarm-mail";
 import { drainWorkUnitEffects, type EffectHostIdentity, type WorkUnitEffectPorts } from "./effects.js";
-import { assignCell as assignMissionCell, type AssignmentRow, getMissionByPk, releaseAssignment as releaseMissionAssignment } from "./mission.js";
+import {
+  assignCell as assignMissionCell, type AssignmentRow, createMission, getMissionByPk, type MissionBudgetPolicy,
+  MissionConflictError, recordRetryCause as recordMissionRetryCause, releaseAssignment as releaseMissionAssignment,
+} from "./mission.js";
+import type { MissionMode, RetryCauseRecord } from "../types.js";
 import type { Mission, WorkUnit, WorkUnitEffect } from "./schema.js";
 import {
   applyReviewDecision,
@@ -103,6 +107,8 @@ export interface MissionCommands {
   amendCompletion(actor: MissionActor, input: { unitId: string; filesTouched: string[]; reason: string }): Promise<WorkUnit>;
   cancelCompletion(actor: MissionActor, input: { unitId: string; reason: string }): Promise<WorkUnit>;
   setConsolidation(actor: MissionActor, input: { missionPk: string; expectedFence: number; consolidation: unknown }): Promise<Mission>;
+  setBudget(actor: MissionActor, input: { project: string; sessionId: string; mode: MissionMode; budgetPolicy: MissionBudgetPolicy }): Promise<Mission>;
+  recordRetryCause(actor: MissionActor, input: { missionPk: string; cause: RetryCauseRecord }): Promise<Mission>;
 }
 
 export interface MissionCommandsOptions {
@@ -389,6 +395,26 @@ export function createMissionCommands(db: DatabaseAdapter, opts: MissionCommands
         missionPk: mission.id, expectedFence: input.expectedFence, ownerSessionId: actor.sessionId,
         consolidationJson: input.consolidation === null ? null : canonicalJson(input.consolidation),
       });
+    },
+    async setBudget(actor, input) {
+      if (actor.kind !== "coordinator") throw new MissionActorError("Coordinator command invoked by a worker actor");
+      if (input.sessionId !== actor.sessionId) throw new MissionActorError(`Session ${actor.sessionId} cannot budget session ${input.sessionId}`);
+      const live = await db.query(
+        "SELECT id FROM swarmx_missions WHERE project = ? AND session_id = ? AND state IN ('OPEN', 'CLOSING') LIMIT 1",
+        [input.project, input.sessionId],
+      );
+      if (live.rows.length > 0) throw new MissionConflictError(input.project, input.sessionId);
+      return createMission(db, { project: input.project, sessionId: input.sessionId, mode: input.mode, budgetPolicy: input.budgetPolicy });
+    },
+    async recordRetryCause(actor, input) {
+      for (let attempt = 0; ; attempt += 1) {
+        const mission = await ownedMission(actor, input.missionPk);
+        try {
+          return await recordMissionRetryCause(db, { missionPk: mission.id, expectedFence: Number(mission.fence), cause: input.cause });
+        } catch (error) {
+          if (attempt >= 4 || !(error instanceof Error) || error.name !== "MissionFenceConflictError") throw error;
+        }
+      }
     },
   };
 }

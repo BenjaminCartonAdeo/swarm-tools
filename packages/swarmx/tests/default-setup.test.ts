@@ -82,7 +82,7 @@ describe("default setup: WorkUnit lifecycle", () => {
     expect([...ctx.storage.map.keys()].filter((k) => k.startsWith("legacy-tombstone:"))).toHaveLength(1);
   });
 
-  test("runtime.store is the WorkUnit adapter: legacy-only tools fail typed and never write legacy KV", async () => {
+  test("runtime.store is the WorkUnit adapter: set_budget routes natively and never writes legacy KV", async () => {
     const db = await freshDb();
     const ctx = createFakeContext({
       projectId: P,
@@ -95,11 +95,16 @@ describe("default setup: WorkUnit lifecycle", () => {
     const budget = editor.list().find((tool) => tool.name === "swarm_set_budget");
     expect(budget).toBeDefined();
     const legacyBefore = JSON.stringify(ctx.storage.map.get(`mission:${P}:s1`));
-    // swarm_set_budget is still legacy-store-only (native routing lands later): with the WorkUnit
-    // adapter installed as runtime.store it must fail typed instead of writing legacy KV.
+    // The migrated s1 mission is still OPEN: native set_budget refuses it as a conflict
+    // (never runtime_unavailable) and writes neither SQL nor legacy KV.
     await expect(
       budget!.execute({ mode: "audit" }, { sessionID: "s1", agent: "swarm/swarm-coordinator", messageID: "m", id: "call-1" }),
-    ).rejects.toThrow("runtime_unavailable");
+    ).rejects.toThrow("[conflict]");
+    for (const name of ["swarm_mission_status", "swarm_agent_audit"]) {
+      const tool = editor.list().find((entry) => entry.name === name);
+      await expect(tool!.execute({}, { sessionID: "s1", agent: "swarm/swarm-coordinator", messageID: "m", id: `call-${name}` }))
+        .resolves.toBeDefined();
+    }
     const after = await db.query(`SELECT mode FROM swarmx_missions WHERE project = '${P}'`);
     expect((after.rows[0] as { mode: unknown }).mode).toBe("dev");
     expect(JSON.stringify(ctx.storage.map.get(`mission:${P}:s1`))).toBe(legacyBefore);

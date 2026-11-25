@@ -51,6 +51,7 @@ import { setupWorkUnitRuntime, type WorkUnitRuntime } from "./workunit/ports";
 import { getMission } from "./workunit/mission";
 import { acquireWorkUnitLock, BUILD_LOCK_STALE_MS, buildLockName, releaseWorkUnitLock } from "./workunit/locks";
 import { listUnits } from "./workunit/mission";
+import { projectMission, selectMissionOrphanCandidates } from "./workunit/projection";
 
 function isSwarmCliToolCommand(command: string): boolean {
   const decoded = command.replace(/\\x([0-9a-f]{2})/gi, (_escape, hex: string) =>
@@ -513,6 +514,25 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
       // never a log: the state may contain user data).
       await ctx.session.hook(COMPACTION_HOOK_NAME, async (event) => {
         try {
+          const native = runtime.workUnit;
+          if (native !== undefined) {
+            // Projected MissionState + loadCells; the orphan count is display-only.
+            const row = await getMission(native.db, projectID, event.sessionID);
+            if (row === null) return;
+            const units = await listUnits(native.db, row.id);
+            const state = projectMission({ mission: row, units, assignments: [] });
+            const cells = state.active ? await native.store.loadCells(projectID, event.sessionID) : [];
+            const contribution = buildCompactionContribution(state, {
+              cells,
+              pendingOrphans: selectMissionOrphanCandidates({
+                units,
+                now: runtime.now?.() ?? Date.now(),
+                orphanGraceMs: runtime.orphanGraceMs ?? 0,
+              }).length,
+            });
+            if (contribution !== undefined) event.system.push({ type: "text", text: contribution.text });
+            return;
+          }
           const mission = await readMission(store, projectID, event.sessionID);
           const [attempts, assignments] = await Promise.all([
             listAttempts(store, projectID, event.sessionID, mission),

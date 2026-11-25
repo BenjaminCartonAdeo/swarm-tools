@@ -56,6 +56,7 @@ import {
   resolveAssignment,
   sameMissionGeneration,
   selectCells,
+  DEFAULT_WORKER_SHARE,
   selectMissionSummary,
   selectReadyCells,
   setAssignment,
@@ -66,7 +67,8 @@ import {
   withMissionLock,
 } from "./state";
 import { legacyStoreOf, type LegacyMissionStateStore } from "./state";
-import { getMission, listUnits } from "./workunit/mission";
+import { getMission, listMissions, listUnits, MissionConflictError, MissionPolicyValidationError } from "./workunit/mission";
+import { projectMission, selectMissionOrphanCandidates } from "./workunit/projection";
 import type { Mission, WorkUnit } from "./workunit/schema";
 import { effectiveCompletionFiles, MissionNotDrainedError } from "./workunit/store";
 import {
@@ -84,6 +86,7 @@ import {
   type DispatchAgentInfo,
   type DispatchAgentList,
   type DispatchAttempt,
+  type MissionCellSnapshot,
   type MissionAudit,
   type MissionMode,
   type MissionState,
@@ -1189,6 +1192,53 @@ async function assignWorkUnitCell(
   await scope.runtime.commands.assignCell(actor, { missionPk: scope.mission.id, cellId: cellID, agent });
 }
 
+const LIVE_UNIT_STATES: ReadonlySet<string> = new Set([
+  "RESERVED", "BOUND", "SUBMITTED", "IN_REVIEW", "APPROVED", "PUBLISHING", "RETURNING",
+]);
+const APPROVED_UNIT_STATES: ReadonlySet<string> = new Set(["APPROVED", "PUBLISHING", "DONE"]);
+
+function isLiveMission(mission: Mission): boolean {
+  return mission.state === "OPEN" || mission.state === "CLOSING";
+}
+
+/** Read-only project scan: every mission generation with its units. */
+async function listProjectNative(
+  db: NonNullable<SwarmxRuntime["workUnit"]>["db"],
+  projectID: string,
+): Promise<{ readonly mission: Mission; readonly units: WorkUnit[] }[]> {
+  const missions = await listMissions(db, projectID);
+  return Promise.all(missions.map(async (mission) => ({ mission, units: await listUnits(db, mission.id) })));
+}
+
+function nativeOrphanCandidates(runtime: SwarmxRuntime, units: WorkUnit[]): WorkUnit[] {
+  return selectMissionOrphanCandidates({
+    units,
+    now: runtime.now?.() ?? Date.now(),
+    orphanGraceMs: runtime.orphanGraceMs ?? 0,
+  });
+}
+
+/** Display-only ledger view of a WorkUnit (never persisted). */
+function unitAttempt(mission: Mission, unit: WorkUnit): DispatchAttempt {
+  const status: DispatchAttempt["status"] = unit.state === "DONE"
+    ? "succeeded"
+    : LIVE_UNIT_STATES.has(unit.state)
+      ? "pending"
+      : unit.state === "FAILED" || unit.state === "REJECTED" ? "failed" : "aborted";
+  return {
+    callID: unit.call_id,
+    missionID: mission.mission_id,
+    sessionID: mission.session_id,
+    cellID: unit.cell_id ?? "",
+    ...(mission.epic_id === null ? {} : { epicID: mission.epic_id }),
+    agent: unit.worker_agent ?? "",
+    status,
+    ts: new Date(unit.created_at).toISOString(),
+    ...(unit.worker_session === null ? {} : { workerSessionID: unit.worker_session }),
+    ...(unit.state === "REVOKED" ? { revokedAt: new Date(unit.updated_at).toISOString() } : {}),
+  };
+}
+
 function requireStoreProject(tool: string, runtime: SwarmxRuntime): StoreScope {
   const store = legacyStoreOf(runtime);
   if (store === undefined) {
@@ -1667,7 +1717,16 @@ async function runSpawnRetry(
 
   const projectID = resolveProjectID(runtime);
   const legacyStore = legacyStoreOf(runtime);
-  if (legacyStore !== undefined && projectID !== undefined) {
+  const nativeRuntime = runtime.workUnit;
+  if (nativeRuntime !== undefined && projectID !== undefined) {
+    const mission = await getMission(nativeRuntime.db, projectID, sessionID);
+    if (mission !== null) {
+      await nativeRuntime.commands.recordRetryCause({ kind: "coordinator", sessionId: sessionID }, {
+        missionPk: mission.id,
+        cause: { ...cause, cellID, epicID, attempt, ts: new Date(runtime.now?.() ?? Date.now()).toISOString() },
+      });
+    }
+  } else if (legacyStore !== undefined && projectID !== undefined) {
     await recordRetryCause(legacyStore, {
       projectID,
       sessionID,
@@ -1694,6 +1753,9 @@ async function runSetBudget(
   const maxSpawns =
     optionalNumberInput("swarm_set_budget", input, "max_spawns") ?? (mode === "audit" ? 10 : 20);
   const maxIterations = optionalNumberInput("swarm_set_budget", input, "max_iterations") ?? 3;
+  if (runtime.workUnit !== undefined) {
+    return runNativeSetBudget(runtime, context, runtime.workUnit, mode, maxSpawns, maxIterations);
+  }
   const { store, projectID, sessionID } = await requireMissionScope("swarm_set_budget", runtime, context);
   try {
     const state = await setBudget(store, { projectID, sessionID, mode, maxSpawns, maxIterations });
@@ -1708,6 +1770,53 @@ async function runSetBudget(
     const code = message.includes("already set") ? "conflict" : "invalid_input";
     throw new LocalToolError("swarm_set_budget", code, message);
   }
+}
+
+async function runNativeSetBudget(
+  runtime: SwarmxRuntime,
+  context: ToolExecuteContextLike,
+  native: NonNullable<SwarmxRuntime["workUnit"]>,
+  mode: MissionMode,
+  maxSpawns: number,
+  maxIterations: number,
+): Promise<ToolExecuteResult> {
+  const tool = "swarm_set_budget";
+  const projectID = resolveProjectID(runtime);
+  const sessionID = resolveSessionID(runtime, context);
+  if (projectID === undefined) throw new LocalToolError(tool, "runtime_unavailable", "project id is not wired");
+  if (sessionID === undefined) throw new LocalToolError(tool, "runtime_unavailable", "no session id in the tool context");
+  let mission: Mission;
+  try {
+    mission = await native.commands.setBudget({ kind: "coordinator", sessionId: sessionID }, {
+      project: projectID,
+      sessionId: sessionID,
+      mode,
+      budgetPolicy: {
+        total: maxSpawns,
+        perCellIterations: maxIterations,
+        workerShare: { agent: "swarm-worker", maxFraction: DEFAULT_WORKER_SHARE },
+        version: 1,
+      },
+    });
+  } catch (error) {
+    if (error instanceof MissionConflictError) {
+      throw new LocalToolError(
+        tool,
+        "conflict",
+        `swarmx: mission budget already set for session ${sessionID}; ` +
+          "the budget is fixed once per mission — run swarm_finish before setting a new one",
+      );
+    }
+    if (error instanceof MissionPolicyValidationError) throw new LocalToolError(tool, "invalid_input", error.message);
+    throw error;
+  }
+  const state = projectMission({ mission, units: [], assignments: [] });
+  return {
+    output: { sessionID, mode: state.mode, active: state.active, budget: state.budget },
+    content:
+      `Budget fixed: mode=${state.mode} max_spawns=${state.budget.maxSpawns} ` +
+      `max_iterations=${state.budget.maxIterations}`,
+  };
 }
 
 /**
@@ -1768,6 +1877,9 @@ async function runMissionStatus(
 ): Promise<ToolExecuteResult> {
   const projectID = resolveProjectID(runtime);
   const legacyStore = legacyStoreOf(runtime);
+  if (runtime.workUnit !== undefined && projectID !== undefined) {
+    return runNativeMissionStatus(runtime, runtime.workUnit, projectID);
+  }
   if (legacyStore === undefined || projectID === undefined) {
     throw new LocalToolError("swarm_mission_status", "runtime_unavailable", "mission store is not available");
   }
@@ -1815,6 +1927,51 @@ async function runMissionStatus(
           `${row.active ? "ACTIVE" : "inactive"} ${row.sessionID} mode=${row.mode} spawns=${row.counts.spawns} unrevoked=${row.unrevokedAttempts} pending=${row.pendingCompletions.length}`,
       )
       .concat(`orphan attempts: ${orphanAttempts.length}`)
+      .join("\n"),
+  };
+}
+
+async function runNativeMissionStatus(
+  runtime: SwarmxRuntime,
+  native: NonNullable<SwarmxRuntime["workUnit"]>,
+  projectID: string,
+): Promise<ToolExecuteResult> {
+  const generations = await listProjectNative(native.db, projectID);
+  // One row per session: its live generation, else its latest (list is newest first).
+  const bySession = new Map<string, (typeof generations)[number]>();
+  for (const entry of generations) {
+    const current = bySession.get(entry.mission.session_id);
+    if (current === undefined || (!isLiveMission(current.mission) && isLiveMission(entry.mission))) {
+      bySession.set(entry.mission.session_id, entry);
+    }
+  }
+  const rows = [...bySession.values()].map(({ mission, units }) => {
+    const state = projectMission({ mission, units, assignments: [] });
+    return {
+      sessionID: state.sessionID,
+      active: state.active,
+      mode: state.mode,
+      createdAt: state.createdAt,
+      updatedAt: state.updatedAt,
+      counts: state.counts,
+      attempts: units.length,
+      unrevokedAttempts: units.filter(
+        (unit) => unit.state !== "REVOKED" && (LIVE_UNIT_STATES.has(unit.state) || unit.state === "DONE"),
+      ).length,
+      pendingCompletions: units
+        .filter((unit) => (unit.state === "SUBMITTED" || unit.state === "IN_REVIEW") && unit.cell_id !== null)
+        .map((unit) => unit.cell_id as string),
+    };
+  });
+  const orphanCount = nativeOrphanCandidates(runtime, generations.flatMap((entry) => entry.units)).length;
+  return {
+    output: { projectID, missions: rows, orphanAttempts: orphanCount },
+    content: rows
+      .map(
+        (row) =>
+          `${row.active ? "ACTIVE" : "inactive"} ${row.sessionID} mode=${row.mode} spawns=${row.counts.spawns} unrevoked=${row.unrevokedAttempts} pending=${row.pendingCompletions.length}`,
+      )
+      .concat(`orphan attempts: ${orphanCount}`)
       .join("\n"),
   };
 }
@@ -2342,16 +2499,56 @@ async function runProbe(
   };
 }
 
+/** Read-only native audit: attempts derive from units; orphans are counted, never repaired. */
+async function nativeAudit(
+  runtime: SwarmxRuntime,
+  context: ToolExecuteContextLike,
+  native: NonNullable<SwarmxRuntime["workUnit"]>,
+): Promise<{ result: MissionAudit; sessionID: string; mission: MissionState | undefined; cells: MissionCellSnapshot[] }> {
+  const tool = "swarm_agent_audit";
+  const projectID = resolveProjectID(runtime);
+  const sessionID = resolveSessionID(runtime, context);
+  if (projectID === undefined) throw new LocalToolError(tool, "runtime_unavailable", "project id is not wired");
+  if (sessionID === undefined) throw new LocalToolError(tool, "runtime_unavailable", "no session id in the tool context");
+  const row = await getMission(native.db, projectID, sessionID);
+  if (row === null) {
+    return { result: { active: false, attempts: [], pendingOrphans: 0 }, sessionID, mission: undefined, cells: [] };
+  }
+  const units = await listUnits(native.db, row.id);
+  const mission = projectMission({ mission: row, units, assignments: [] });
+  const result: MissionAudit = {
+    active: mission.active,
+    mode: mission.mode,
+    budget: mission.budget,
+    counts: mission.counts,
+    attempts: units.map((unit) => unitAttempt(row, unit)),
+    pendingOrphans: nativeOrphanCandidates(runtime, units).length,
+    ...(mission.consolidation === undefined ? {} : { consolidation: mission.consolidation }),
+  };
+  const cells = isLiveMission(row) ? await native.store.loadCells(projectID, sessionID) : [];
+  return { result, sessionID, mission, cells };
+}
+
 async function runAgentAudit(
   runtime: SwarmxRuntime,
   context: ToolExecuteContextLike,
 ): Promise<ToolExecuteResult> {
-  const { store, projectID, sessionID } = await requireMissionScope("swarm_agent_audit", runtime, context);
-  const result: MissionAudit = await audit(store, projectID, sessionID);
-  const mission = await readMission(store, projectID, sessionID);
-  const assignments = await listAssignments(store, projectID);
+  let result: MissionAudit;
+  let sessionID: string;
+  let mission: MissionState | undefined;
+  let cells: MissionCellSnapshot[];
+  if (runtime.workUnit !== undefined) {
+    ({ result, sessionID, mission, cells } = await nativeAudit(runtime, context, runtime.workUnit));
+  } else {
+    const scope = await requireMissionScope("swarm_agent_audit", runtime, context);
+    const { store, projectID } = scope;
+    sessionID = scope.sessionID;
+    result = await audit(store, projectID, sessionID);
+    mission = await readMission(store, projectID, sessionID);
+    const assignments = await listAssignments(store, projectID);
+    cells = selectCells({ ...(mission === undefined ? {} : { state: mission }), attempts: result.attempts, assignments });
+  }
   const summary = selectMissionSummary(mission);
-  const cells = selectCells({ ...(mission === undefined ? {} : { state: mission }), attempts: result.attempts, assignments });
   const readyCells = selectReadyCells(cells);
   const workerSpawns = result.attempts.filter((attempt) => isSwarmWorkerAgentID(attempt.agent)).length;
   const spawns = result.counts?.spawns ?? 0;
@@ -2363,7 +2560,7 @@ async function runAgentAudit(
       : "No active mission for this session.",
     `cells: ${cells.length} (ready ${readyCells.length})`,
     `swarm-worker spawns: ${workerSpawns} (${Math.round(workerShare * 100)}%)`,
-    `attempts: ${result.attempts.length}, pending orphans repaired: ${result.pendingOrphans}`,
+    `attempts: ${result.attempts.length}, pending orphan candidates: ${result.pendingOrphans}`,
     ...(consolidation === undefined
       ? []
       : [
@@ -5065,6 +5262,9 @@ async function requireHiveCloseAllowed(
   const cellID = typeof input.id === "string" ? input.id : "";
   const projectID = resolveProjectID(runtime);
   const legacyStore = legacyStoreOf(runtime);
+  if (runtime.workUnit !== undefined && projectID !== undefined && cellID.length > 0) {
+    return requireNativeHiveCloseAllowed(runtime.workUnit, projectID, cellID);
+  }
   if (legacyStore === undefined || projectID === undefined || cellID.length === 0) {
     throw new LocalToolError("hive_close", "runtime_unavailable", "cannot verify active project missions");
   }
@@ -5115,6 +5315,45 @@ async function requireHiveCloseAllowed(
   }
 }
 
+async function nativeProjectScan(
+  tool: string,
+  native: NonNullable<SwarmxRuntime["workUnit"]>,
+  projectID: string,
+  message = "cannot verify active project missions",
+) {
+  try {
+    return await listProjectNative(native.db, projectID);
+  } catch {
+    throw new LocalToolError(tool, "runtime_unavailable", message);
+  }
+}
+
+async function requireNativeHiveCloseAllowed(
+  native: NonNullable<SwarmxRuntime["workUnit"]>,
+  projectID: string,
+  cellID: string,
+): Promise<void> {
+  const generations = await nativeProjectScan("hive_close", native, projectID);
+  const active = generations.filter((entry) => isLiveMission(entry.mission));
+  for (const { units } of active) {
+    const cellUnits = units.filter((unit) => unit.cell_id === cellID);
+    if (cellUnits.length === 0) continue;
+    // Approved-completion exception: an approved/publishing/done unit for the cell.
+    if (cellUnits.some((unit) => APPROVED_UNIT_STATES.has(unit.state))) return;
+    throw new LocalToolError(
+      "hive_close",
+      "conflict",
+      "active swarmx cells close only through an approved swarm_complete call or an approved review receipt",
+    );
+  }
+  if (active.length > 0) {
+    throw new LocalToolError("hive_close", "conflict", "active swarmx cells close only through an approved swarm_complete call");
+  }
+  if (generations.some(({ units }) => units.some((unit) => unit.cell_id === cellID && LIVE_UNIT_STATES.has(unit.state)))) {
+    throw new LocalToolError("hive_close", "conflict", "the cell still has an unrevoked worker attempt");
+  }
+}
+
 async function restrictHiveUpdate(
   runtime: SwarmxRuntime,
   context: ToolExecuteContextLike,
@@ -5147,6 +5386,16 @@ async function restrictHiveUpdate(
 async function requireNoActiveProjectMission(runtime: SwarmxRuntime, tool: string): Promise<void> {
   const projectID = resolveProjectID(runtime);
   const legacyStore = legacyStoreOf(runtime);
+  if (runtime.workUnit !== undefined && projectID !== undefined) {
+    const generations = await nativeProjectScan(tool, runtime.workUnit, projectID);
+    if (generations.some((entry) => isLiveMission(entry.mission))) {
+      throw new LocalToolError(tool, "conflict", "active swarmx cells close only through an approved swarm_complete call");
+    }
+    if (generations.some(({ units }) => units.some((unit) => LIVE_UNIT_STATES.has(unit.state)))) {
+      throw new LocalToolError(tool, "conflict", "the project still has unrevoked worker attempts");
+    }
+    return;
+  }
   if (legacyStore === undefined || projectID === undefined) {
     throw new LocalToolError(tool, "runtime_unavailable", "cannot verify active project missions");
   }
@@ -5185,6 +5434,13 @@ async function requireNoActiveTaskAttempt(
 ): Promise<void> {
   const projectID = resolveProjectID(runtime);
   const legacyStore = legacyStoreOf(runtime);
+  if (runtime.workUnit !== undefined && projectID !== undefined) {
+    const generations = await nativeProjectScan(tool, runtime.workUnit, projectID, "cannot verify active task attempts");
+    if (generations.some(({ units }) => units.some((unit) => unit.cell_id === taskID && LIVE_UNIT_STATES.has(unit.state)))) {
+      throw new LocalToolError(tool, "conflict", `task ${taskID} has an unrevoked worker attempt`);
+    }
+    return;
+  }
   if (legacyStore === undefined || projectID === undefined) {
     throw new LocalToolError(tool, "runtime_unavailable", "cannot verify active task attempts");
   }
@@ -5209,7 +5465,7 @@ async function runWorktreeCleanup(
 ): Promise<ToolExecuteResult> {
   const projectID = resolveProjectID(runtime);
   const store = legacyStoreOf(runtime);
-  if (store === undefined || projectID === undefined) {
+  if ((store === undefined && runtime.workUnit === undefined) || projectID === undefined) {
     throw new LocalToolError(
       "swarm_worktree_cleanup",
       "runtime_unavailable",
@@ -5230,7 +5486,7 @@ async function runWorktreeCleanup(
   let lockFence: number | undefined;
   if (native === undefined) {
     // Explicit legacy runtimes keep the pre-WorkUnit claim until Task 13d3e.
-    await store.storage.set(claimKey, { taskID: claimTaskID, at: Date.now() });
+    await store!.storage.set(claimKey, { taskID: claimTaskID, at: Date.now() });
   } else {
     lockToken = randomUUID();
     const acquired = await acquireWorkUnitLock(native.db, {
@@ -5246,9 +5502,14 @@ async function runWorktreeCleanup(
     lockFence = acquired.fence;
   }
   try {
-    const missions = (await store.list())
-      .filter((mission) => mission.projectID === projectID)
-      .sort((left, right) => left.sessionID.localeCompare(right.sessionID));
+    // Native discovery reads the projected mission list while the SQL cleanup
+    // lock (held until `finally`) blocks every project dispatch.
+    const sessionIDs = native === undefined
+      ? (await store!.list())
+        .filter((mission) => mission.projectID === projectID)
+        .map((mission) => mission.sessionID)
+      : [...new Set((await listMissions(native.db, projectID)).map((mission) => mission.session_id))];
+    const missions = sessionIDs.sort((left, right) => left.localeCompare(right)).map((sessionID) => ({ sessionID }));
 
     const operation = async (): Promise<ToolExecuteResult> => {
       if (normalized.cleanup_all === true) {
@@ -5267,7 +5528,7 @@ async function runWorktreeCleanup(
     return await run();
   } finally {
     if (native === undefined) {
-      await store.storage.remove(claimKey).catch(() => undefined);
+      await store!.storage.remove(claimKey).catch(() => undefined);
     } else if (lockToken !== undefined && lockFence !== undefined) {
       await releaseWorkUnitLock(native.db, {
         name: cleanupLockName(projectID),
@@ -5397,11 +5658,17 @@ async function requireCoordinatorOrMissionOwner(
   const projectID = resolveProjectID(runtime);
   const sessionID = resolveSessionID(runtime, context);
   const legacyStore = legacyStoreOf(runtime);
-  if (legacyStore === undefined || projectID === undefined || sessionID === undefined) {
-    throw new LocalToolError(tool, "runtime_unavailable", "cannot verify the mission owner");
+  let ownsActiveMission: boolean;
+  if (runtime.workUnit !== undefined && projectID !== undefined && sessionID !== undefined) {
+    const mission = await getMission(runtime.workUnit.db, projectID, sessionID);
+    ownsActiveMission = mission !== null && isLiveMission(mission);
+  } else {
+    if (legacyStore === undefined || projectID === undefined || sessionID === undefined) {
+      throw new LocalToolError(tool, "runtime_unavailable", "cannot verify the mission owner");
+    }
+    const mission = await readMission(legacyStore, projectID, sessionID);
+    ownsActiveMission = mission !== undefined && mission.active;
   }
-  const mission = await readMission(legacyStore, projectID, sessionID);
-  const ownsActiveMission = mission !== undefined && mission.active;
   if (!ownsActiveMission || (await resolveCallerMode(runtime, context, tool)) !== "primary") {
     throw new LocalToolError(tool, "conflict", "only the canonical swarm coordinator may use this tool");
   }

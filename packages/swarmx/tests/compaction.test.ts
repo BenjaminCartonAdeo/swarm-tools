@@ -15,6 +15,10 @@ import { describe, expect, test } from "bun:test";
 import type { Plugin } from "@opencode/plugin";
 
 import { createSwarmxPlugin } from "../src/index";
+import { createLibSQLAdapter } from "swarm-mail";
+
+/** Isolated WorkUnit DB per hook test: the canonical in-memory DB is process-wide. */
+const freshDatabase = () => createLibSQLAdapter({ url: ":memory:" });
 import {
   COMPACTION_HOOK_NAME,
   MAX_FACTS_BYTES,
@@ -296,6 +300,7 @@ describe("compaction hook wiring", () => {
     const { ctx } = setup({ state: activeMission() });
     const runtimeCalls: string[] = [];
     const swarmx = createSwarmxPlugin({
+      workUnitDatabase: freshDatabase,
       runtime: {
         runTool: async (name) => {
           runtimeCalls.push(name);
@@ -323,7 +328,7 @@ describe("compaction hook wiring", () => {
 
   test("inactive mission pushes nothing", async () => {
     const { ctx } = setup({ state: activeMission({ active: false }) });
-    const swarmx = createSwarmxPlugin();
+    const swarmx = createSwarmxPlugin({ workUnitDatabase: freshDatabase });
     await swarmx.setup(ctx as unknown as Plugin.Context);
 
     const [hook] = ctx.captures.sessionHooks.get(COMPACTION_HOOK_NAME) ?? [];
@@ -337,7 +342,7 @@ describe("compaction hook wiring", () => {
 
   test("no mission document pushes nothing", async () => {
     const { ctx } = setup();
-    const swarmx = createSwarmxPlugin();
+    const swarmx = createSwarmxPlugin({ workUnitDatabase: freshDatabase });
     await swarmx.setup(ctx as unknown as Plugin.Context);
 
     const [hook] = ctx.captures.sessionHooks.get(COMPACTION_HOOK_NAME) ?? [];
@@ -350,7 +355,7 @@ describe("compaction hook wiring", () => {
 
   test("storage failure never escapes the hook", async () => {
     const { ctx } = setup();
-    const swarmx = createSwarmxPlugin();
+    const swarmx = createSwarmxPlugin({ workUnitDatabase: freshDatabase });
     await swarmx.setup(ctx as unknown as Plugin.Context);
     ctx.storage.get = async () => {
       throw new Error("storage offline");
