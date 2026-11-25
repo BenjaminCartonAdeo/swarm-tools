@@ -36,6 +36,9 @@ import {
   type MissionState,
 } from "./types";
 import { isSwarmWorkerAgentID } from "./roster";
+import type { WorkUnitRuntime } from "./workunit/ports";
+import { getMission } from "./workunit/mission";
+import { listUnits } from "./workunit/mission";
 
 /** Name of the V2 tool that dispatches a subtask to an agent. */
 export const DISPATCH_TOOL_NAME = "subagent";
@@ -370,7 +373,12 @@ async function reserveSpawn(
 export async function gateBefore(
   store: MissionStateStore,
   event: DispatchBeforeEvent,
+  workUnit?: WorkUnitRuntime,
 ): Promise<void> {
+  if (workUnit !== undefined) {
+    await gateBeforeWorkUnit(store, workUnit, event);
+    return;
+  }
   if (event.tool !== DISPATCH_TOOL_NAME) return;
   const projectID = event.projectID ?? store.projectID;
   if (projectID === undefined) return;
@@ -444,6 +452,107 @@ export async function gateBefore(
   }
 }
 
+async function gateBeforeWorkUnit(
+  legacyStore: MissionStateStore,
+  workUnit: WorkUnitRuntime,
+  event: DispatchBeforeEvent,
+): Promise<void> {
+  if (event.tool !== DISPATCH_TOOL_NAME) return;
+  const projectID = event.projectID ?? legacyStore.projectID;
+  if (projectID === undefined) return;
+  const missionState = await workUnit.store.load(projectID, event.sessionID);
+  if (missionState === undefined || !missionState.active) return;
+  await requireCoordinatorCaller(legacyStore, event.agent);
+  if (typeof asRecord(event.input)?.prompt !== "string") {
+    throw new DispatchGateError(
+      "dispatch_token_missing",
+      undefined,
+      "native subagent input must include a prompt string",
+    );
+  }
+  const marker = extractCellMarker(event.input);
+  const cleanupClaim = asRecord(await legacyStore.storage.get(`cleanup-claim:${projectID}`));
+  if (
+    cleanupClaim !== undefined &&
+    typeof cleanupClaim.at === "number" &&
+    Date.now() - cleanupClaim.at < 5 * 60_000 &&
+    (cleanupClaim.taskID === "*" || cleanupClaim.taskID === marker.cellID)
+  ) {
+    throw new DispatchGateError(
+      "cleanup_in_progress",
+      marker.cellID,
+      "retry after the worktree cleanup finishes",
+    );
+  }
+  const targetAgentID = asRecord(event.input)?.agent;
+  if (typeof targetAgentID !== "string" || targetAgentID.trim().length === 0) {
+    throw new DispatchGateError(
+      "agent_missing",
+      marker.cellID,
+      "subagent input must include a non-empty target agent ID",
+    );
+  }
+  if (targetAgentID !== targetAgentID.trim()) {
+    throw new DispatchGateError(
+      "agent_unknown",
+      marker.cellID,
+      "subagent input must use the exact V2 agent ID from the roster",
+    );
+  }
+  const agent = await requireDispatchableAgent(legacyStore, targetAgentID);
+  if (missionState.missionID === undefined) {
+    throw new DispatchGateError("mission_changed", marker.cellID, "native mission has no generation ID");
+  }
+  const nativeMission = await getMission(workUnit.db, projectID, event.sessionID);
+  if (nativeMission === null || nativeMission.mission_id !== missionState.missionID) {
+    throw new DispatchGateError("mission_changed", marker.cellID, "native mission changed while dispatch was validated");
+  }
+  const assignment = await workUnit.db.query(
+    `SELECT cell_id FROM swarmx_legacy_assignments
+     WHERE project = ? AND cell_id = ? AND mission_pk = ? AND owner = ? AND state = 'assigned' LIMIT 1`,
+    [projectID, marker.cellID, nativeMission.id, event.sessionID],
+  );
+  if (assignment.rows.length === 0) {
+    throw new DispatchGateError(
+      "cell_not_assigned",
+      marker.cellID,
+      "no assignment recorded; run swarm_set_agent before dispatching",
+    );
+  }
+  const inputRecord = asRecord(event.input);
+  const prompt = typeof inputRecord?.prompt === "string" ? inputRecord.prompt : "";
+  const countIteration = !(
+    inputRecord?.purpose === "followup" ||
+    inputRecord?.read_only === true ||
+    FOLLOWUP_MARKER_PATTERN.test(prompt)
+  );
+  const units = await listUnits(workUnit.db, nativeMission.id);
+  const priorCall = units.find((unit) => unit.call_id === event.id);
+  const dispatchToken = priorCall?.dispatch_token ?? marker.dispatchToken ?? randomUUID();
+  if (marker.dispatchToken !== undefined && priorCall === undefined) {
+    throw new DispatchGateError("dispatch_token_reused", marker.cellID, "a dispatch capability cannot be supplied in a new tool call");
+  }
+  const attemptNo = priorCall?.attempt_no ?? (
+    Math.max(0, ...units.filter((unit) => unit.cell_id === marker.cellID).map((unit) => unit.attempt_no)) + 1
+  );
+  const budgetCharge = countIteration ? 1 : 0;
+  const unit = await workUnit.commands.reserve(
+    { kind: "coordinator", sessionId: event.sessionID },
+    {
+      project: projectID,
+      missionId: missionState.missionID,
+      workerAgent: agent.id,
+      callId: event.id,
+      dispatchToken,
+      cellId: marker.cellID,
+      budgetCharge: priorCall?.budget_charge ?? budgetCharge,
+      idemKey: priorCall?.idem_key ?? `dispatch:${projectID}:${event.sessionID}:${event.id}`,
+      attemptNo,
+    },
+  );
+  attachDispatchToken(event.input, unit.dispatch_token ?? dispatchToken, marker.cellID);
+}
+
 /**
  * Settles the ledger entry after a `subagent` call.
  *
@@ -454,7 +563,12 @@ export async function gateBefore(
 export async function settleAfter(
   store: MissionStateStore,
   event: DispatchAfterEvent,
+  workUnit?: WorkUnitRuntime,
 ): Promise<void> {
+  if (workUnit !== undefined) {
+    await settleAfterWorkUnit(store, workUnit, event);
+    return;
+  }
   try {
     if (event.tool !== DISPATCH_TOOL_NAME) return;
     const projectID = event.projectID ?? store.projectID;
@@ -475,5 +589,51 @@ export async function settleAfter(
   } catch {
     // execute.after must never reject: a ledger write failure is not worth
     // failing the model's tool call.
+  }
+}
+
+function childSessionID(result: unknown): string | undefined {
+  const record = asRecord(result);
+  if (record === undefined) return undefined;
+  for (const key of ["sessionID", "sessionId", "session_id", "workerSessionID", "worker_session_id"]) {
+    if (typeof record[key] === "string" && record[key].length > 0) return record[key];
+  }
+  return undefined;
+}
+
+async function settleAfterWorkUnit(
+  legacyStore: MissionStateStore,
+  workUnit: WorkUnitRuntime,
+  event: DispatchAfterEvent,
+): Promise<void> {
+  try {
+    if (event.tool !== DISPATCH_TOOL_NAME) return;
+    const projectID = event.projectID ?? legacyStore.projectID;
+    if (projectID === undefined) return;
+    const mission = await workUnit.store.load(projectID, event.sessionID);
+    if (mission?.missionID === undefined) return;
+    const nativeMission = await getMission(workUnit.db, projectID, event.sessionID);
+    if (nativeMission === null || nativeMission.mission_id !== mission.missionID) return;
+    const unit = (await listUnits(workUnit.db, nativeMission.id)).find((candidate) => candidate.call_id === event.id);
+    if (unit === undefined || unit.state !== "RESERVED") return;
+    const actor = { kind: "coordinator" as const, sessionId: event.sessionID };
+    if (event.status === "error") {
+      await workUnit.commands.settleDispatch(actor, {
+        unitId: unit.id,
+        unitFence: unit.fence,
+        outcome: { ok: false, error: event.error },
+      });
+      return;
+    }
+    const workerSessionId = childSessionID(event.result);
+    if (workerSessionId === undefined || unit.worker_agent === null) return;
+    await workUnit.commands.bindWorker(actor, {
+      unitId: unit.id,
+      unitFence: unit.fence,
+      workerSessionId,
+      workerAgent: unit.worker_agent,
+    });
+  } catch {
+    // execute.after must never reject; a missing/contended WorkUnit leaves the reservation auditable.
   }
 }

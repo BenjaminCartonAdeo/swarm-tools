@@ -14,20 +14,22 @@
  *   - the compaction hook pushes one factual `{type:"text"}` part and never
  *     assigns `event.result`.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Plugin } from "@opencode/plugin";
+import { createLibSQLAdapter, type DatabaseAdapter } from "swarm-mail";
 
-import swarmx, { createSwarmxPlugin } from "../src/index";
+import swarmx, { createSwarmxPlugin, setupWorkUnitRuntime, type WorkUnitRuntime } from "../src/index";
 import { findToolSpec, listToolNames, pendingCompletionKey } from "../src/catalog";
 import { extractCellMarker } from "../src/dispatch";
 import {
   createMissionStateStore,
   getAttempt,
+  listAttempts,
   readMission,
   resolveAssignment,
   setAssignment,
@@ -35,6 +37,9 @@ import {
   type MissionStorageLike,
 } from "../src/state";
 import { UnsupportedToolError, type CellMarker } from "../src/types";
+import { createMission, listUnits } from "../src/workunit/mission";
+import type { MissionActor } from "../src/workunit/commands";
+import { AssignmentMismatchError, BudgetGateError } from "../src/workunit/store";
 import {
   createFakeContext,
   type FakeAgentInfo,
@@ -111,6 +116,7 @@ interface RigOptions {
   readonly payload?: unknown;
   readonly payloadFor?: (name: string, args: Record<string, unknown>) => unknown;
   readonly workerProtocol?: string;
+  readonly workUnit?: WorkUnitRuntime;
 }
 
 interface Rig {
@@ -168,6 +174,7 @@ async function createRig(options: RigOptions = {}): Promise<Rig> {
       },
       resolveWorkerCell: async (sessionID) => workerCells.get(sessionID) ?? options.workerCell,
       resolveWorkerParentSession: async (sessionID) => workerParents.get(sessionID),
+      ...(options.workUnit === undefined ? {} : { workUnit: options.workUnit }),
       ...(options.workerProtocol === undefined ? {} : { workerProtocol: options.workerProtocol }),
     },
   });
@@ -207,6 +214,41 @@ async function createRig(options: RigOptions = {}): Promise<Rig> {
     },
   };
 }
+
+const openedWorkUnitDatabases: DatabaseAdapter[] = [];
+
+afterEach(async () => {
+  for (const db of openedWorkUnitDatabases.splice(0)) await db.close?.();
+});
+
+async function createNativeMission(options: {
+  readonly sessionID?: string;
+  readonly total?: number;
+  readonly perCellIterations?: number;
+} = {}): Promise<{ readonly runtime: WorkUnitRuntime; readonly missionPk: string }> {
+  const sessionID = options.sessionID ?? SESSION;
+  const db = await createLibSQLAdapter({ url: ":memory:" });
+  openedWorkUnitDatabases.push(db);
+  const runtime = await setupWorkUnitRuntime(db, {
+    projectID: PROJECT,
+    host: { hostInstanceId: "runtime-smoke", hostname: "test-host", pid: 1 },
+  });
+  const mission = await createMission(db, {
+    project: PROJECT,
+    sessionId: sessionID,
+    missionId: `work-${sessionID}`,
+    mode: "dev",
+    budgetPolicy: {
+      total: options.total ?? 3,
+      perCellIterations: options.perCellIterations ?? 3,
+      workerShare: null,
+      version: 1,
+    },
+  });
+  return { runtime, missionPk: mission.id };
+}
+
+const nativeCoordinator: MissionActor = { kind: "coordinator", sessionId: SESSION };
 
 function missionStore(ctx: FakeContext) {
   return createMissionStateStore(ctx.storage as unknown as MissionStorageLike, {
@@ -526,6 +568,169 @@ describe("catalogue execution paths (fake runner, no model)", () => {
 });
 
 describe("mission gate → settle sequence", () => {
+  test("WorkUnit dispatch creates a bound unit without marking it DONE", async () => {
+    const native = await createNativeMission();
+    await native.runtime.commands.assignCell(nativeCoordinator, {
+      missionPk: native.missionPk,
+      cellId: "cell-a",
+      agent: "swarm/swarm-worker",
+    });
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime });
+    const payload = workerDispatchPayload("cell-a", "call-native-success");
+
+    await rig.before(payload);
+    const marker = extractCellMarker(payload.input);
+    expect(marker.dispatchToken).toMatch(/^[a-f0-9-]{36}$/);
+    await rig.after({ ...payload, status: "completed", result: { sessionID: "ses-native-worker" } });
+
+    const units = await listUnits(native.runtime.db, native.missionPk);
+    expect(units).toHaveLength(1);
+    expect(units[0]).toMatchObject({
+      state: "BOUND",
+      call_id: "call-native-success",
+      cell_id: "cell-a",
+      dispatch_token: marker.dispatchToken,
+      worker_agent: "swarm/swarm-worker",
+      worker_session: "ses-native-worker",
+      idem_key: "dispatch:adeo:ses-1:call-native-success",
+      attempt_no: 1,
+      budget_charge: 1,
+    });
+    expect(units[0]?.state).not.toBe("DONE");
+    expect(await listAttempts(missionStore(rig.ctx), PROJECT, SESSION)).toEqual([]);
+  });
+
+  test("WorkUnit dispatch failure settles the reservation as FAILED", async () => {
+    const native = await createNativeMission();
+    await native.runtime.commands.assignCell(nativeCoordinator, {
+      missionPk: native.missionPk,
+      cellId: "cell-failed",
+      agent: "swarm/swarm-worker",
+    });
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime });
+    const payload = workerDispatchPayload("cell-failed", "call-native-failure");
+
+    await rig.before(payload);
+    await rig.after({ ...payload, status: "error", error: new Error("spawn failed") });
+
+    expect(await listUnits(native.runtime.db, native.missionPk)).toMatchObject([
+      { state: "FAILED", call_id: "call-native-failure" },
+    ]);
+  });
+
+  test("WorkUnit duplicate dispatch is idempotent by call ID", async () => {
+    const native = await createNativeMission({ total: 1 });
+    await native.runtime.commands.assignCell(nativeCoordinator, {
+      missionPk: native.missionPk,
+      cellId: "cell-replay",
+      agent: "swarm/swarm-worker",
+    });
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime });
+    const payload = workerDispatchPayload("cell-replay", "call-native-replay");
+
+    await rig.before(payload);
+    await rig.before(payload);
+
+    const units = await listUnits(native.runtime.db, native.missionPk);
+    expect(units).toHaveLength(1);
+    expect(units[0]).toMatchObject({ state: "RESERVED", call_id: "call-native-replay" });
+  });
+
+  test("WorkUnit assignment and budget gates reject invalid dispatches", async () => {
+    const native = await createNativeMission({ total: 1 });
+    await native.runtime.commands.assignCell(nativeCoordinator, {
+      missionPk: native.missionPk,
+      cellId: "cell-a",
+      agent: "development/typescript-pro",
+    });
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime });
+    await expect(rig.before(workerDispatchPayload("cell-a", "call-wrong-assignment")))
+      .rejects.toBeInstanceOf(AssignmentMismatchError);
+
+    await native.runtime.commands.assignCell(nativeCoordinator, {
+      missionPk: native.missionPk,
+      cellId: "cell-a",
+      agent: "swarm/swarm-worker",
+    });
+    await native.runtime.commands.assignCell(nativeCoordinator, {
+      missionPk: native.missionPk,
+      cellId: "cell-b",
+      agent: "swarm/swarm-worker",
+    });
+    await rig.before(workerDispatchPayload("cell-a", "call-within-budget"));
+    await expect(rig.before(workerDispatchPayload("cell-b", "call-over-budget")))
+      .rejects.toBeInstanceOf(BudgetGateError);
+    expect(await listUnits(native.runtime.db, native.missionPk)).toHaveLength(1);
+  });
+
+  test("WorkUnit dispatch rejects a caller that is not the coordinator", async () => {
+    const native = await createNativeMission();
+    await native.runtime.commands.assignCell(nativeCoordinator, {
+      missionPk: native.missionPk,
+      cellId: "cell-a",
+      agent: "swarm/swarm-worker",
+    });
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime });
+    const payload = workerDispatchPayload("cell-a", "call-wrong-coordinator");
+
+    await expect(rig.before({ ...payload, agent: "swarm/swarm-worker" }))
+      .rejects.toThrow(/only a coordinator primary/);
+    expect(await listUnits(native.runtime.db, native.missionPk)).toEqual([]);
+  });
+
+  test("WorkUnit worker-session binding uses the actor-checked command", async () => {
+    const native = await createNativeMission();
+    await native.runtime.commands.assignCell(nativeCoordinator, {
+      missionPk: native.missionPk,
+      cellId: "cell-bind",
+      agent: "swarm/swarm-worker",
+    });
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      workUnit: native.runtime,
+      workerCell: { cellID: "cell-bind", epicID: "epic-1" },
+    });
+    const payload = workerDispatchPayload("cell-bind", "call-native-bind");
+    await rig.before(payload);
+    const marker = extractCellMarker(payload.input);
+    rig.bindWorkerSession("ses-native-bound", marker, SESSION);
+
+    await expect(rig.ctx.permission.assert({
+      sessionID: "ses-native-bound",
+      agent: "swarm/swarm-worker",
+      source: { type: "tool", messageID: "msg-native-bind", id: "call-native-bind-edit" },
+      action: "edit",
+      resources: ["src/handler.ts"],
+    })).resolves.toBeUndefined();
+
+    expect(await listUnits(native.runtime.db, native.missionPk)).toMatchObject([
+      { state: "BOUND", worker_session: "ses-native-bound", worker_agent: "swarm/swarm-worker" },
+    ]);
+  });
+
+  test("WorkUnit assignment tools use actor-checked mission commands", async () => {
+    const native = await createNativeMission();
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime });
+
+    await rig.tools.get("swarm_set_agent")?.execute(
+      { bead_id: "cell-set", agent: "swarm-worker" },
+      toolContext(),
+    );
+    await rig.tools.get("swarm_resolve_agent")?.execute(
+      { apply: true, cells: [{ bead_id: "cell-resolve", title: "TypeScript API implementation", files: ["src/handler.ts"] }] },
+      toolContext(),
+    );
+
+    const assignments = await native.runtime.db.query(
+      "SELECT cell_id, agent, owner, state FROM swarmx_legacy_assignments ORDER BY cell_id",
+    );
+    expect(assignments.rows).toEqual([
+      { cell_id: "cell-resolve", agent: "development/typescript-pro", owner: SESSION, state: "assigned" },
+      { cell_id: "cell-set", agent: "swarm/swarm-worker", owner: SESSION, state: "assigned" },
+    ]);
+    expect(await resolveAssignment(missionStore(rig.ctx), PROJECT, "cell-set")).toBeUndefined();
+  });
+
   test("read-only follow-up dispatch does not consume a cell iteration", async () => {
     const rig = await createRig({ agents: GATE_AGENTS });
     await dispatchWorker(rig, "cell-a", "call-dispatch-first");

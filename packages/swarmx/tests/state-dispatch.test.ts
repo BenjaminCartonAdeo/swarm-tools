@@ -1248,6 +1248,26 @@ describe("plugin wiring", () => {
       Promise.resolve(beforeHooks[0]?.(beforeEvent({ id: "call-2", prompt: "no marker" }))),
     ).rejects.toBeInstanceOf(DispatchGateError);
   });
+
+  test("runtime without WorkUnit preserves legacy dispatch reservation and settlement", async () => {
+    const ctx = createFakeContext({ agents: AGENTS, projectId: PROJECT });
+    await swarmx.setup(ctx as unknown as Plugin.Context);
+
+    const beforeHooks = ctx.captures.toolHooks.get("execute.before") ?? [];
+    const afterHooks = ctx.captures.toolHooks.get("execute.after") ?? [];
+    const legacy = createMissionStateStore(ctx.storage as unknown as MissionStorageLike);
+    await startMission(legacy);
+    await setAssignment(legacy, PROJECT, "cell-a", "development/typescript-pro");
+
+    const event = beforeEvent({ id: "native-call" });
+    await Promise.resolve(beforeHooks[0]?.(event));
+    await Promise.resolve(afterHooks[0]?.({ ...event, status: "completed", result: { sessionID: "worker-session" } }));
+
+    expect(await listAttempts(legacy, PROJECT, SESSION)).toMatchObject([
+      { callID: "native-call", status: "succeeded", agent: "development/typescript-pro" },
+    ]);
+    expect((await readMission(legacy, PROJECT, SESSION))?.counts.spawns).toBe(1);
+  });
 });
 
 

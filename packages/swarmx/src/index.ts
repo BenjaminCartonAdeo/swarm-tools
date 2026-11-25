@@ -44,6 +44,8 @@ import {
   type MissionStorageLike,
 } from "./state";
 import type { DispatchAgentInfo, DispatchAgentList, SwarmxRuntime, ToolContextLike } from "./types";
+import { getMission } from "./workunit/mission";
+import { listUnits } from "./workunit/mission";
 
 function isSwarmCliToolCommand(command: string): boolean {
   const decoded = command.replace(/\\x([0-9a-f]{2})/gi, (_escape, hex: string) =>
@@ -170,7 +172,7 @@ async function workerMutationDenial(
   if (caller === undefined) return "token_missing";
   if (caller.mode === "primary") return undefined;
   if (
-    runtime.store === undefined ||
+    (runtime.store === undefined && runtime.workUnit === undefined) ||
     runtime.projectID === undefined ||
     runtime.resolveWorkerParentSession === undefined ||
     runtime.resolveWorkerCell === undefined
@@ -191,38 +193,87 @@ async function workerMutationDenial(
   if (parentSessionID === undefined) return "token_missing";
   let mission;
   try {
-    mission = await readMission(runtime.store, runtime.projectID, parentSessionID);
+    if (runtime.workUnit === undefined) {
+      if (runtime.store === undefined) return "token_missing";
+      mission = await readMission(runtime.store, runtime.projectID, parentSessionID);
+    } else {
+      mission = await runtime.workUnit.store.load(runtime.projectID, parentSessionID);
+    }
   } catch {
     return "token_missing";
   }
   if (mission === undefined) return undefined;
   if (!mission.active) return marker !== undefined ? "mission_inactive" : undefined;
   if (marker?.dispatchToken === undefined || agentID === undefined) return "token_missing";
-  let binding;
+  let bindingStatus: "bound" | "already_bound" | "not_owner" | "revoked" | "inactive" | "token_missing";
+  let followup: boolean;
+  let bindingMissionID: string | undefined;
   try {
-    binding = await bindWorkerAttemptSession(
-      runtime.store,
-      runtime.projectID,
-      parentSessionID,
-      sessionID,
-      marker,
-      agentID,
-    );
+    if (runtime.workUnit === undefined) {
+      const binding = await bindWorkerAttemptSession(
+        runtime.store!,
+        runtime.projectID,
+        parentSessionID,
+        sessionID,
+        marker,
+        agentID,
+      );
+      bindingStatus = binding.status === "not_found" || binding.status === "invalid_status" ? "token_missing" : binding.status;
+      bindingMissionID = binding.status === "bound" || binding.status === "already_bound"
+        ? binding.missionID
+        : undefined;
+      followup = binding.status === "bound" || binding.status === "already_bound"
+        ? binding.attempt.followup === true
+        : false;
+    } else {
+      const missionRow = await getMission(runtime.workUnit.db, runtime.projectID, parentSessionID);
+      if (missionRow === null || missionRow.mission_id !== mission.missionID) {
+        bindingStatus = "inactive";
+        bindingMissionID = undefined;
+        followup = false;
+      } else {
+        bindingMissionID = mission.missionID;
+        const unit = (await listUnits(runtime.workUnit.db, missionRow.id)).find((candidate) =>
+          candidate.dispatch_token === marker?.dispatchToken &&
+          candidate.cell_id === marker.cellID &&
+          candidate.worker_agent === agentID,
+        );
+        if (unit === undefined) {
+          bindingStatus = "token_missing";
+          followup = false;
+        } else if (unit.state === "BOUND") {
+          bindingStatus = unit.worker_session === sessionID ? "already_bound" : "not_owner";
+          followup = unit.budget_charge === 0;
+        } else if (unit.state === "RESERVED") {
+          const bound = await runtime.workUnit.commands.bindWorker(
+            { kind: "coordinator", sessionId: parentSessionID },
+            { unitId: unit.id, unitFence: unit.fence, workerSessionId: sessionID, workerAgent: agentID },
+          );
+          bindingStatus = "bound";
+          followup = bound.budget_charge === 0;
+        } else {
+          bindingStatus = unit.state === "REVOKED" ? "revoked" : "token_missing";
+          followup = false;
+        }
+      }
+    }
   } catch {
     return "token_missing";
   }
-  if (binding.status === "not_owner") return "not_owner";
-  if (binding.status === "revoked") return "revoked";
-  if (binding.status === "inactive") return "mission_inactive";
-  if (binding.status !== "bound" && binding.status !== "already_bound") return "token_missing";
-  const attempt = binding.attempt;
-  if (attempt.followup === true) return "read_only_followup";
+  if (bindingStatus === "not_owner") return "not_owner";
+  if (bindingStatus === "revoked") return "revoked";
+  if (bindingStatus === "inactive") return "mission_inactive";
+  if (bindingStatus !== "bound" && bindingStatus !== "already_bound") return "token_missing";
+  if (followup) return "read_only_followup";
+  // Native binding is authoritative; legacy pending-completion is an optional
+  // overlay until Task 13d3 and must not deny when no legacy store exists.
+  if (runtime.store === undefined) return undefined;
   const pending = await runtime.store.storage.get(pendingCompletionKey(runtime.projectID, marker.cellID));
   const pendingRecord =
     typeof pending === "object" && pending !== null ? (pending as Record<string, unknown>) : undefined;
   return pendingRecord?.projectID === runtime.projectID &&
     pendingRecord.parentSessionID === parentSessionID &&
-    pendingRecord.missionID === binding.missionID &&
+    pendingRecord.missionID === bindingMissionID &&
     pendingRecord.taskID === marker.cellID
     ? "pending_completion"
     : undefined;
@@ -359,7 +410,7 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
             }
           }
         }
-        await gateBefore(store, before(event));
+        await gateBefore(store, before(event), runtime.workUnit);
       });
 
       await ctx.tool.hook("execute.after", async (event) => {
@@ -371,7 +422,7 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
           event.status === "completed"
             ? { ...base, status: "completed", result: event.result }
             : { ...base, status: "error", error: event.error };
-        await settleAfter(store, settled);
+        await settleAfter(store, settled, runtime.workUnit);
       });
 
       // Context-pressure watchdog: before every model request, read the

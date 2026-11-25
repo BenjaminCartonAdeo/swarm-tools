@@ -66,6 +66,8 @@ import {
   withMissionLock,
 } from "./state";
 import type { MissionStateStore } from "./state";
+import { getMission, listUnits } from "./workunit/mission";
+import type { Mission } from "./workunit/schema";
 import { emitDecision, emitViolation } from "./session-events";
 import {
   LocalToolError,
@@ -1131,6 +1133,55 @@ interface MissionScope extends StoreScope {
   readonly projectRoot?: string;
 }
 
+interface WorkUnitMissionScope {
+  readonly mission: Mission;
+  readonly projectID: string;
+  readonly sessionID: string;
+  readonly runtime: NonNullable<SwarmxRuntime["workUnit"]>;
+}
+
+async function requireWorkUnitMissionScope(
+  tool: string,
+  runtime: SwarmxRuntime,
+  context: ToolExecuteContextLike,
+): Promise<WorkUnitMissionScope> {
+  const workUnit = runtime.workUnit;
+  const projectID = resolveProjectID(runtime);
+  const sessionID = resolveSessionID(runtime, context);
+  if (workUnit === undefined || projectID === undefined || sessionID === undefined) {
+    throw new LocalToolError(tool, "runtime_unavailable", "WorkUnit mission runtime or session is not wired");
+  }
+  const mission = await getMission(workUnit.db, projectID, sessionID);
+  if (mission === null) {
+    throw new LocalToolError(tool, "runtime_unavailable", "native mission is not available for this session");
+  }
+  return { runtime: workUnit, mission, projectID, sessionID };
+}
+
+async function assignWorkUnitCell(
+  tool: string,
+  runtime: SwarmxRuntime,
+  context: ToolExecuteContextLike,
+  cellID: string,
+  agent: string,
+): Promise<void> {
+  const scope = await requireWorkUnitMissionScope(tool, runtime, context);
+  const actor = { kind: "coordinator" as const, sessionId: scope.sessionID };
+  const existingResult = await scope.runtime.db.query(
+    "SELECT agent, state FROM swarmx_legacy_assignments WHERE project = ? AND cell_id = ? AND mission_pk = ?",
+    [scope.projectID, cellID, scope.mission.id],
+  );
+  const existing: unknown = existingResult.rows[0];
+  if (
+    typeof existing === "object" && existing !== null && "state" in existing &&
+    existing.state === "assigned" && "agent" in existing && typeof existing.agent === "string" &&
+    existing.agent !== agent
+  ) {
+    await scope.runtime.commands.releaseAssignment(actor, { missionPk: scope.mission.id, cellId: cellID });
+  }
+  await scope.runtime.commands.assignCell(actor, { missionPk: scope.mission.id, cellId: cellID, agent });
+}
+
 function requireStoreProject(tool: string, runtime: SwarmxRuntime): StoreScope {
   const store = runtime.store;
   if (store === undefined) {
@@ -1356,19 +1407,33 @@ async function runResolveAgent(
   });
 
   if (apply) {
-    const { store, projectID } = requireStoreProject("swarm_resolve_agent", runtime);
-    const sessionID = resolveSessionID(runtime, context);
-    const owner = sessionID === undefined ? undefined : { sessionID };
-    for (const result of results) {
-      if (result.agent === null) continue;
-      if (result.bead_id === undefined) {
-        throw new LocalToolError(
-          "swarm_resolve_agent",
-          "invalid_input",
-          `cannot persist the assignment of "${result.title}": bead_id is required when apply=true`,
-        );
+    if (runtime.workUnit !== undefined) {
+      for (const result of results) {
+        if (result.agent === null) continue;
+        if (result.bead_id === undefined) {
+          throw new LocalToolError(
+            "swarm_resolve_agent",
+            "invalid_input",
+            `cannot persist the assignment of "${result.title}": bead_id is required when apply=true`,
+          );
+        }
+        await assignWorkUnitCell("swarm_resolve_agent", runtime, context, result.bead_id, result.agent);
       }
-      await setAssignment(store, projectID, result.bead_id, result.agent, owner);
+    } else {
+      const { store, projectID } = requireStoreProject("swarm_resolve_agent", runtime);
+      const sessionID = resolveSessionID(runtime, context);
+      const owner = sessionID === undefined ? undefined : { sessionID };
+      for (const result of results) {
+        if (result.agent === null) continue;
+        if (result.bead_id === undefined) {
+          throw new LocalToolError(
+            "swarm_resolve_agent",
+            "invalid_input",
+            `cannot persist the assignment of "${result.title}": bead_id is required when apply=true`,
+          );
+        }
+        await setAssignment(store, projectID, result.bead_id, result.agent, owner);
+      }
     }
   }
 
@@ -1417,15 +1482,19 @@ async function runSetAgent(
       `agent "${entry.id}" is ${entry.hidden ? "hidden" : "primary"} and cannot receive subtasks`,
     );
   }
-  const { store, projectID } = requireStoreProject("swarm_set_agent", runtime);
-  const sessionID = resolveSessionID(runtime, context);
-  await setAssignment(
-    store,
-    projectID,
-    beadID,
-    entry.id,
-    sessionID === undefined ? undefined : { sessionID },
-  );
+  if (runtime.workUnit !== undefined) {
+    await assignWorkUnitCell("swarm_set_agent", runtime, context, beadID, entry.id);
+  } else {
+    const { store, projectID } = requireStoreProject("swarm_set_agent", runtime);
+    const sessionID = resolveSessionID(runtime, context);
+    await setAssignment(
+      store,
+      projectID,
+      beadID,
+      entry.id,
+      sessionID === undefined ? undefined : { sessionID },
+    );
+  }
   return {
     output: { bead_id: beadID, agent: entry.id, rationale, persisted: true },
     content: `Assignment stored for ${beadID}: agent=${entry.id}`,
@@ -4280,6 +4349,45 @@ async function resolveParentMissionForWorker(
   workerSessionID: string,
   tool: string,
 ): Promise<{ readonly parentMission: MissionState; readonly attemptCallID: string }> {
+  if (runtime.workUnit !== undefined) {
+    const projectID = resolveProjectID(runtime);
+    if (projectID === undefined) {
+      throw new LocalToolError(tool, "runtime_unavailable", "project id is not wired");
+    }
+    const parentMission = await runtime.workUnit.store.load(projectID, parentSessionID);
+    if (parentMission === undefined || !parentMission.active || parentMission.missionID === undefined) {
+      throw new LocalToolError(tool, "conflict", "the worker session's parent has no active swarmx mission");
+    }
+    const nativeMission = await getMission(runtime.workUnit.db, projectID, parentSessionID);
+    if (nativeMission === null || nativeMission.mission_id !== parentMission.missionID) {
+      throw new LocalToolError(tool, "conflict", "the worker session's parent has no active swarmx mission");
+    }
+    const unit = (await listUnits(runtime.workUnit.db, nativeMission.id)).find((candidate) =>
+      candidate.dispatch_token === worker.marker.dispatchToken &&
+      candidate.cell_id === worker.marker.cellID &&
+      candidate.worker_agent === worker.agent.id,
+    );
+    if (unit === undefined) {
+      throw new LocalToolError(tool, "conflict", "the worker prompt is not bound to a dispatched cell in its parent mission");
+    }
+    if (unit.state === "BOUND") {
+      if (unit.worker_session !== workerSessionID) {
+        throw new LocalToolError(tool, "conflict", "the dispatch capability is already bound to another worker session");
+      }
+    } else if (unit.state === "RESERVED") {
+      try {
+        await runtime.workUnit.commands.bindWorker(
+          { kind: "coordinator", sessionId: parentSessionID },
+          { unitId: unit.id, unitFence: unit.fence, workerSessionId: workerSessionID, workerAgent: worker.agent.id },
+        );
+      } catch {
+        throw new LocalToolError(tool, "conflict", "the dispatch capability is no longer active");
+      }
+    } else {
+      throw new LocalToolError(tool, "conflict", "the dispatch capability is no longer active");
+    }
+    return { parentMission, attemptCallID: unit.call_id };
+  }
   const { store, projectID } = requireStoreProject(tool, runtime);
   const mission = await readMission(store, projectID, parentSessionID);
   if (mission === undefined || !mission.active) {
