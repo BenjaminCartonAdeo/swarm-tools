@@ -49,7 +49,9 @@ const mockContext = {
  * Helper to parse JSON response from tool execute
  */
 function parseResponse<T>(response: string): T {
-  return JSON.parse(response) as T;
+  // hive_cells may append a non-JSON cross-project hint when the shared DB holds other projects.
+  const hint = response.indexOf("\n---\nOther projects with cells:");
+  return JSON.parse(hint === -1 ? response : response.slice(0, hint)) as T;
 }
 
 /**
@@ -2085,6 +2087,7 @@ describe("beads integration", () => {
       expect(cells).toHaveLength(1);
       expect(cells[0].id).toBe(testCellId);
       expect(cells[0].title).toBe("Cells tool test");
+      expect(cells[0]).toHaveProperty("completion_operation_id", null);
     });
 
     it("throws error for non-existent ID", async () => {

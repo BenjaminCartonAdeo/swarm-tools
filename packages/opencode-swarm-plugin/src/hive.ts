@@ -612,6 +612,8 @@ function formatCellForOutput(adapterCell: AdapterCell): Record<string, unknown> 
       ? new Date(Number(adapterCell.closed_at)).toISOString()
       : undefined,
     parent_id: adapterCell.parent_id || undefined,
+    completion_operation_id:
+      (adapterCell as { completion_operation_id?: string | null }).completion_operation_id ?? null,
     dependencies: [], // TODO: fetch from adapter if needed
     metadata: {},
   };

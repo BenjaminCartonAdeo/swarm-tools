@@ -51,6 +51,13 @@ export class ReviewReceiptRequiredError extends Error {
   }
 }
 
+export class ReviewPayloadError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReviewPayloadError";
+  }
+}
+
 export type ReviewStatus = "approved" | "unverifiable" | "needs_changes" | "rejected";
 
 export interface ReviewInput {
@@ -59,6 +66,8 @@ export interface ReviewInput {
   receipt?: Record<string, unknown>;
   feedback?: unknown;
   reason?: string;
+  /** Completion summary forwarded to the backend `summary` (required for approvals). */
+  summary?: string;
   completionArgs?: Record<string, unknown>;
 }
 
@@ -138,14 +147,24 @@ export function reviewEffectPlan(
   }
   if (input.receipt !== undefined && !isRecord(input.receipt)) throw new ReviewReceiptRequiredError(unit.id);
   const receiptJson = approval && input.receipt !== undefined ? canonicalJson(input.receipt) : null;
+  const workerAgent = unit.worker_agent;
+  if ((approval || input.status === "needs_changes") && (workerAgent === null || workerAgent.length === 0)) {
+    throw new ReviewPayloadError(`WorkUnit ${unit.id} has no bound worker agent for the backend effect`);
+  }
   if (approval) {
+    const summary = input.summary ?? input.completionArgs?.summary;
+    if (typeof summary !== "string" || summary.trim().length === 0) {
+      throw new ReviewPayloadError(`WorkUnit ${unit.id} approval requires a nonempty completion summary`);
+    }
     const operationId = `op:${unit.id}:backend_complete`;
     return {
       intent: { verdict: input.status, reviewer, receiptJson, feedbackJson: null },
       decision: { kind: "approve", verdict: input.status },
       effects: [{
         effectId: `effect:${unit.id}:backend_complete`, kind: "backend_complete", mandatory: true, operationId,
-        requestJson: canonicalJson({ project_key: unit.project, bead_id: unit.cell_id, ...input.completionArgs }),
+        requestJson: canonicalJson({
+          ...input.completionArgs, project_key: unit.project, bead_id: unit.cell_id, agent_name: workerAgent, summary,
+        }),
         unitFence: reviewFence + 2,
       }],
     };
@@ -164,7 +183,12 @@ export function reviewEffectPlan(
     effects: [{
       effectId: `effect:${unit.id}:backend_feedback`, kind: "backend_feedback", mandatory: true,
       operationId: `op:${unit.id}:backend_feedback`,
-      requestJson: canonicalJson({ project_key: unit.project, task_id: unit.cell_id, status: "needs_changes", issues: input.feedback ?? null }),
+      requestJson: canonicalJson({
+        project_key: unit.project, task_id: unit.cell_id, worker_id: workerAgent, status: "needs_changes",
+        ...(input.feedback === undefined ? {} : {
+          issues: typeof input.feedback === "string" ? input.feedback : JSON.stringify(input.feedback),
+        }),
+      }),
       unitFence: reviewFence + 1,
     }],
   };
