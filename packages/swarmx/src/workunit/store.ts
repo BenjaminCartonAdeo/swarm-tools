@@ -12,7 +12,7 @@ import {
 export type WorkUnitPatch =
   | { kind: "bind"; workerSession: string; workerAgent: string }
   | { kind: "submit"; evidenceHash: string; diffHash: string; evidenceJson: string }
-  | { kind: "begin_review"; reviewBy: string }
+  | { kind: "begin_review"; reviewBy: string; reviewDiffHash?: string | null }
   | { kind: "approve"; reviewVerdict: string }
   | { kind: "request_changes"; reviewVerdict: string; reviewFeedbackJson: string }
   | { kind: "reject"; reviewVerdict: string; reason: string }
@@ -184,7 +184,7 @@ function patchAssignments(patch: WorkUnitPatch): { sql: string[]; values: unknow
         values: [patch.evidenceHash, patch.diffHash, patch.evidenceJson],
       };
     case "begin_review":
-      return { sql: ["review_by = ?"], values: [patch.reviewBy] };
+      return { sql: ["review_by = ?", "review_diff_hash = ?"], values: [patch.reviewBy, patch.reviewDiffHash ?? null] };
     case "approve":
       return { sql: ["review_verdict = ?"], values: [patch.reviewVerdict] };
     case "request_changes":
@@ -754,17 +754,17 @@ export async function submitWorkUnit(db: DatabaseAdapter, input: SubmitWorkUnitI
 /** Fenced SUBMITTED -> IN_REVIEW. Replay by the same reviewer returns the IN_REVIEW row. */
 export async function beginReviewWorkUnit(
   db: DatabaseAdapter,
-  input: { unitId: string; unitFence: number; reviewBy: string },
+  input: { unitId: string; unitFence: number; reviewBy: string; reviewDiffHash?: string | null },
 ): Promise<WorkUnit> {
   try {
     return await transitionWorkUnit(db, {
       unitId: input.unitId, expectedState: "SUBMITTED", unitFence: input.unitFence,
-      nextState: "IN_REVIEW", patch: { kind: "begin_review", reviewBy: input.reviewBy },
+      nextState: "IN_REVIEW", patch: { kind: "begin_review", reviewBy: input.reviewBy, reviewDiffHash: input.reviewDiffHash ?? null },
     });
   } catch (error) {
     const current = await getWorkUnit(db, input.unitId);
     if (current !== null && current.state === "IN_REVIEW" && current.fence === input.unitFence + 1
-      && current.review_by === input.reviewBy) {
+      && current.review_by === input.reviewBy && (current.review_diff_hash ?? null) === (input.reviewDiffHash ?? null)) {
       return current;
     }
     throw error;

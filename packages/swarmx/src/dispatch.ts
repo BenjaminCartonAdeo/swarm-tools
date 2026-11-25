@@ -12,7 +12,7 @@
  * Refusal throws from `execute.before` (the only hook allowed to reject).
  * `settleAfter` never throws: a rejection there would corrupt the host call.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import {
   DEFAULT_WORKER_SHARE,
@@ -536,8 +536,49 @@ async function gateBeforeWorkUnit(
     Math.max(0, ...units.filter((unit) => unit.cell_id === marker.cellID).map((unit) => unit.attempt_no)) + 1
   );
   const budgetCharge = countIteration ? 1 : 0;
+  const coordinator = { kind: "coordinator" as const, sessionId: event.sessionID };
+  const retryIdemKey = (attempt: number): string => createHash("sha256")
+    .update(`${projectID}|${missionState.missionID}|${marker.cellID}|${attempt}`)
+    .digest("hex");
+  if (priorCall !== undefined && priorCall.retry_of !== null) {
+    // Replay of a retry dispatch: reuse only when every identity field still matches.
+    const prior = units.find((unit) => unit.id === priorCall.retry_of);
+    if (
+      marker.dispatchToken !== priorCall.dispatch_token ||
+      priorCall.cell_id !== marker.cellID ||
+      priorCall.worker_agent !== agent.id ||
+      prior === undefined ||
+      prior.state !== "CHANGES_REQUESTED" ||
+      prior.cell_id !== marker.cellID ||
+      priorCall.attempt_no !== prior.attempt_no + 1 ||
+      priorCall.idem_key !== retryIdemKey(priorCall.attempt_no)
+    ) {
+      throw new DispatchGateError("dispatch_token_reused", marker.cellID, "retry dispatch replay does not match the reserved retry unit");
+    }
+    attachDispatchToken(event.input, priorCall.dispatch_token ?? dispatchToken, marker.cellID);
+    return;
+  }
+  if (priorCall === undefined) {
+    const cellUnits = units.filter((unit) => unit.cell_id === marker.cellID);
+    const latest = cellUnits.reduce<(typeof cellUnits)[number] | undefined>(
+      (best, unit) => (best === undefined || unit.attempt_no > best.attempt_no ? unit : best),
+      undefined,
+    );
+    if (latest?.state === "CHANGES_REQUESTED") {
+      // The native dispatch gate is the sole creator of retry units.
+      const retried = await workUnit.commands.retry(coordinator, {
+        priorUnitId: latest.id,
+        workerAgent: agent.id,
+        callId: event.id,
+        dispatchToken,
+        budgetCharge,
+      });
+      attachDispatchToken(event.input, retried.dispatch_token ?? dispatchToken, marker.cellID);
+      return;
+    }
+  }
   const unit = await workUnit.commands.reserve(
-    { kind: "coordinator", sessionId: event.sessionID },
+    coordinator,
     {
       project: projectID,
       missionId: missionState.missionID,

@@ -75,6 +75,8 @@ export interface ReviewInput {
   /** Completion summary forwarded to the backend `summary` (required for approvals). */
   summary?: string;
   completionArgs?: Record<string, unknown>;
+  /** Filesystem project path forwarded as backend `project_key` (never the OpenCode project id). */
+  projectPath?: string;
 }
 
 export interface ReviewResult {
@@ -91,7 +93,7 @@ export interface MissionCommands {
   settleDispatch(actor: MissionActor, input: { unitId: string; unitFence: number; outcome: DispatchOutcome }): Promise<WorkUnit>;
   bindWorker(actor: MissionActor, input: { unitId: string; unitFence: number; workerSessionId: string; workerAgent: string }): Promise<WorkUnit>;
   submit(actor: MissionActor, input: { unitId: string; evidence: unknown; diff?: string }): Promise<WorkUnit>;
-  beginReview(actor: MissionActor, input: { unitId: string }): Promise<WorkUnit>;
+  beginReview(actor: MissionActor, input: { unitId: string; reviewDiffHash?: string }): Promise<WorkUnit>;
   review(actor: MissionActor, input: ReviewInput): Promise<ReviewResult>;
   cancel(actor: MissionActor, input: { missionPk: string }): Promise<Mission>;
   finish(actor: MissionActor, input: { missionPk: string }): Promise<Mission>;
@@ -154,6 +156,10 @@ export function reviewEffectPlan(
   if ((approval || input.status === "needs_changes") && (workerAgent === null || workerAgent.length === 0)) {
     throw new ReviewPayloadError(`WorkUnit ${unit.id} has no bound worker agent for the backend effect`);
   }
+  const projectKey = input.projectPath;
+  if ((approval || input.status === "needs_changes") && (typeof projectKey !== "string" || projectKey.length === 0)) {
+    throw new ReviewPayloadError(`WorkUnit ${unit.id} review requires the project path for the backend effect`);
+  }
   if (approval) {
     const summary = input.summary ?? input.completionArgs?.summary;
     if (typeof summary !== "string" || summary.trim().length === 0) {
@@ -166,7 +172,7 @@ export function reviewEffectPlan(
       effects: [{
         effectId: `effect:${unit.id}:backend_complete`, kind: "backend_complete", mandatory: true, operationId,
         requestJson: canonicalJson({
-          ...input.completionArgs, project_key: unit.project, bead_id: unit.cell_id, agent_name: workerAgent, summary,
+          ...input.completionArgs, project_key: projectKey, bead_id: unit.cell_id, agent_name: workerAgent, summary,
         }),
         unitFence: reviewFence + 2,
       }],
@@ -187,7 +193,7 @@ export function reviewEffectPlan(
       effectId: `effect:${unit.id}:backend_feedback`, kind: "backend_feedback", mandatory: true,
       operationId: `op:${unit.id}:backend_feedback`,
       requestJson: canonicalJson({
-        project_key: unit.project, task_id: unit.cell_id, worker_id: workerAgent, status: "needs_changes",
+        project_key: projectKey, task_id: unit.cell_id, worker_id: workerAgent, status: "needs_changes",
         ...(input.feedback === undefined ? {} : {
           issues: typeof input.feedback === "string" ? input.feedback : JSON.stringify(input.feedback),
         }),
@@ -242,10 +248,17 @@ export function createMissionCommands(db: DatabaseAdapter, opts: MissionCommands
     }
   }
 
-  async function beginReview(actor: MissionActor, input: { unitId: string }): Promise<WorkUnit> {
+  async function beginReview(actor: MissionActor, input: { unitId: string; reviewDiffHash?: string }): Promise<WorkUnit> {
     const { unit } = await ownedUnit(actor, input.unitId);
-    if (unit.state === "IN_REVIEW" && unit.review_by === actor.sessionId) return unit;
-    return beginReviewWorkUnit(db, { unitId: unit.id, unitFence: unit.fence, reviewBy: actor.sessionId });
+    if (unit.state === "IN_REVIEW" && unit.review_by === actor.sessionId) {
+      if (input.reviewDiffHash !== undefined && unit.review_diff_hash !== input.reviewDiffHash) {
+        throw new FenceConflictError(unit.id, "SUBMITTED", unit.fence);
+      }
+      return unit;
+    }
+    return beginReviewWorkUnit(db, {
+      unitId: unit.id, unitFence: unit.fence, reviewBy: actor.sessionId, reviewDiffHash: input.reviewDiffHash ?? null,
+    });
   }
 
   async function drain(unitId: string): Promise<void> {

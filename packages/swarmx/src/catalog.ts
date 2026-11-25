@@ -4529,7 +4529,10 @@ async function recordNativeScopedReview(
     );
   }
   try {
-    await scope.runtime.commands.beginReview({ kind: "coordinator", sessionId: scope.sessionID }, { unitId: unit.id });
+    await scope.runtime.commands.beginReview(
+      { kind: "coordinator", sessionId: scope.sessionID },
+      { unitId: unit.id, reviewDiffHash: createHash("sha256").update(check.diff).digest("hex") },
+    );
   } catch (error) {
     throw nativeConflict("swarm_review", error);
   }
@@ -4632,6 +4635,9 @@ async function executeNativeReviewFeedback(
     diff = check.diff;
   }
   const diffHash = createHash("sha256").update(diff).digest("hex");
+  if (unit.review_diff_hash === null || unit.review_diff_hash !== diffHash) {
+    throw new LocalToolError(tool, "conflict", "the diff changed after review; request a fresh review before feedback");
+  }
   const docOnly = files.every(isDocOnlyPath);
   const approval = status === "approved" || status === "unverifiable";
   let verification = evidence.verification;
@@ -4664,6 +4670,7 @@ async function executeNativeReviewFeedback(
       ...(status === "needs_changes" && args.issues !== undefined ? { feedback: args.issues } : {}),
       ...(typeof args.reason === "string" ? { reason: args.reason } : {}),
       summary: evidence.summary,
+      projectPath: evidence.projectPath,
       completionArgs: {
         project_key: evidence.projectPath,
         start_time: evidence.startTime,

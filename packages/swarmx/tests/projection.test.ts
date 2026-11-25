@@ -22,7 +22,7 @@ function unit(overrides: Partial<WorkUnit> = {}): WorkUnit {
     id: "unit-1", project: "p", mission_pk: "mission:p:s:m1", call_id: "call-1", cell_id: "cell-1", idem_key: "idem-1",
     attempt_no: 1, retry_of: null, state: "DONE", fence: 1, dispatch_token: null, worker_session: null,
     worker_agent: "swarm-worker", budget_charge: 1, evidence_hash: null, diff_hash: null, evidence_json: null,
-    review_verdict: null, review_by: null, review_feedback_json: null, verification_receipt_json: null, completion_amendment_json: null,
+    review_verdict: null, review_by: null, review_feedback_json: null, verification_receipt_json: null, completion_amendment_json: null, review_diff_hash: null,
     reason: null, error_json: null, legacy_source: null, created_at: 100, updated_at: 150, ...overrides,
   };
 }

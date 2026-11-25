@@ -3917,12 +3917,15 @@ interface NativeRig {
   readonly native: { readonly runtime: WorkUnitRuntime; readonly missionPk: string };
   readonly project: NativeProject;
   readonly hive: Map<string, { status: string; completion_operation_id?: string }>;
+  /** When set, swarm_review returns a different diff body (simulates drift after review). */
+  drift: boolean;
 }
 
 async function createNativeRig(options: { readonly feedbackSucceeds?: boolean } = {}): Promise<NativeRig> {
   const native = await createNativeMission();
   const project = await createNativeProject();
   const hive = new Map<string, { status: string; completion_operation_id?: string }>();
+  const state = { drift: false };
   const rig = await createRig({
     agents: GATE_AGENTS,
     projectPath: project.path,
@@ -3930,7 +3933,7 @@ async function createNativeRig(options: { readonly feedbackSucceeds?: boolean } 
     payloadFor: (name, args) => {
       if (name === "swarm_review") {
         const files = (args.files_touched as string[]) ?? [];
-        return scopedReviewPayload(files, files.map(fileDiff).join("\n"));
+        return scopedReviewPayload(files, files.map((file) => (state.drift ? fileDiff(file).replace("+new", "+drifted") : fileDiff(file))).join("\n"));
       }
       if (name === "swarm_complete") {
         const cell = String(args.bead_id);
@@ -3949,7 +3952,11 @@ async function createNativeRig(options: { readonly feedbackSucceeds?: boolean } 
       return { ok: true };
     },
   });
-  return { rig, native, project, hive };
+  return {
+    rig, native, project, hive,
+    get drift() { return state.drift; },
+    set drift(value: boolean) { state.drift = value; },
+  };
 }
 
 async function nativeDispatch(n: NativeRig, cellID: string, callID: string, workerSessionID = "ses-worker"): Promise<void> {
@@ -4195,6 +4202,90 @@ describe("WorkUnit completion lifecycle", () => {
       .rejects.toThrow(/does not own/);
     await expect(nativeFeedback(n, "cell-a", "approved")).rejects.toThrow(/scoped review receipt/);
     expect((await nativeUnit(n, "cell-a")).state).toBe("SUBMITTED");
+  });
+
+  test("native dispatch preserves retry_of for a CHANGES_REQUESTED cell", async () => {
+    const n = await nativeRig();
+    await nativeDispatch(n, "cell-a", "call-a");
+    await nativeSubmit(n, "cell-a", ["src/a.ts"]);
+    await nativeReview(n, "cell-a", ["src/a.ts"]);
+    await nativeFeedback(n, "cell-a", "needs_changes", { issues: "again" });
+    const prior = await nativeUnit(n, "cell-a");
+    expect(prior.state).toBe("CHANGES_REQUESTED");
+
+    const payload = workerDispatchPayload("cell-a", "call-a-retry");
+    await n.rig.before(payload);
+    const token = extractCellMarker(payload.input).dispatchToken;
+    await n.rig.before(payload); // replay with the attached token
+    const units = (await listUnits(n.native.runtime.db, n.native.missionPk)).filter((unit) => unit.cell_id === "cell-a");
+    expect(units).toHaveLength(2);
+    expect(units[1]).toMatchObject({
+      state: "RESERVED", call_id: "call-a-retry", dispatch_token: token, retry_of: prior.id,
+      attempt_no: 2, worker_agent: "swarm/swarm-worker", budget_charge: 1,
+    });
+  });
+
+  test("native review effects pass project path instead of project id", async () => {
+    const n = await nativeRig();
+    await nativeDispatch(n, "cell-a", "call-a");
+    await nativeSubmit(n, "cell-a", ["docs/guide.md"]);
+    await nativeReview(n, "cell-a", ["docs/guide.md"]);
+    await nativeFeedback(n, "cell-a", "approved");
+    const [complete] = await nativeEffects(n, (await nativeUnit(n, "cell-a")).id);
+    expect(JSON.parse(String(complete?.request_json)).project_key).toBe(n.project.path);
+    expect(n.rig.runCalls.find((call) => call.name === "swarm_complete")?.args.project_key).toBe(n.project.path);
+
+    await nativeDispatch(n, "cell-b", "call-b", "ses-worker-b");
+    await nativeSubmit(n, "cell-b", ["src/a.ts"], {}, "ses-worker-b");
+    await nativeReview(n, "cell-b", ["src/a.ts"]);
+    await nativeFeedback(n, "cell-b", "needs_changes", { issues: "x" });
+    const [feedback] = await nativeEffects(n, (await nativeUnit(n, "cell-b")).id);
+    expect(JSON.parse(String(feedback?.request_json)).project_key).toBe(n.project.path);
+  });
+
+  test("native review persists the scoped review diff hash", async () => {
+    const n = await nativeRig();
+    await nativeDispatch(n, "cell-a", "call-a");
+    await nativeSubmit(n, "cell-a", ["src/a.ts"], { verification: WORKER_VERIFICATION });
+    await nativeReview(n, "cell-a", ["src/a.ts"]);
+    const reviewed = await nativeUnit(n, "cell-a");
+    expect(reviewed.state).toBe("IN_REVIEW");
+    expect(reviewed.review_diff_hash).toMatch(/^[a-f0-9]{64}$/);
+    await nativeFeedback(n, "cell-a", "approved");
+    const done = await nativeUnit(n, "cell-a");
+    expect(done.review_diff_hash).toBe(reviewed.review_diff_hash);
+    expect(JSON.parse(String(done.verification_receipt_json)).diff_hash).toBe(reviewed.review_diff_hash);
+  });
+
+  test("native feedback rejects a diff changed after review", async () => {
+    const n = await nativeRig();
+    await nativeDispatch(n, "cell-a", "call-a");
+    await nativeSubmit(n, "cell-a", ["src/a.ts"], { verification: WORKER_VERIFICATION });
+    await nativeReview(n, "cell-a", ["src/a.ts"]);
+    n.drift = true;
+    await expect(nativeFeedback(n, "cell-a", "approved")).rejects.toThrow(/diff changed after review/);
+    const unit = await nativeUnit(n, "cell-a");
+    expect(unit).toMatchObject({ state: "IN_REVIEW", review_verdict: null });
+    expect(await nativeEffects(n, unit.id)).toEqual([]);
+  });
+
+  test("native pending completion is denied without a legacy store", async () => {
+    const n = await nativeRig();
+    await nativeDispatch(n, "cell-a", "call-a");
+    const edit = () => n.rig.ctx.permission.assert({
+      sessionID: "ses-worker",
+      agent: "swarm/swarm-worker",
+      source: { type: "tool", messageID: "msg-pending", id: `call-edit-${Math.random()}` },
+      action: "edit",
+      resources: ["src/a.ts"],
+    });
+    await expect(edit()).resolves.toBeUndefined();
+    await nativeSubmit(n, "cell-a", ["src/a.ts"]);
+    // The native path never writes the legacy pending-completion key.
+    expect(await n.rig.ctx.storage.get(pendingCompletionKey(PROJECT, "cell-a"))).toBeUndefined();
+    await expect(edit()).rejects.toThrow(/pending_completion/);
+    await nativeReview(n, "cell-a", ["src/a.ts"]);
+    await expect(edit()).rejects.toThrow(/pending_completion/);
   });
 
   test("legacyRuntimeWithoutWorkUnitKeepsCompletionBehavior", async () => {

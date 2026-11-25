@@ -251,6 +251,12 @@ async function workerMutationDenial(
           );
           bindingStatus = "bound";
           followup = bound.budget_charge === 0;
+        } else if (
+          (unit.state === "SUBMITTED" || unit.state === "IN_REVIEW") &&
+          unit.worker_session === sessionID
+        ) {
+          // Native pending completion: authoritative without any legacy store.
+          return "pending_completion";
         } else {
           bindingStatus = unit.state === "REVOKED" ? "revoked" : "token_missing";
           followup = false;

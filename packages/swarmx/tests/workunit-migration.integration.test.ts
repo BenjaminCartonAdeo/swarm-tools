@@ -563,7 +563,7 @@ describe("schema upgrade", () => {
     await db.query("INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, idem_key, attempt_no, state, evidence_json, created_at, updated_at) VALUES ('u', 'p', 'm', 'c', 'i', 1, 'SUBMITTED', '{}', 1, 1)");
     await ensureWorkUnitSchema(db);
     await ensureWorkUnitSchema(db);
-    expect((await db.query("SELECT id, evidence_json, completion_amendment_json FROM swarmx_work_units")).rows)
-      .toEqual([{ id: "u", evidence_json: "{}", completion_amendment_json: null }]);
+    expect((await db.query("SELECT id, evidence_json, completion_amendment_json, review_diff_hash FROM swarmx_work_units")).rows)
+      .toEqual([{ id: "u", evidence_json: "{}", completion_amendment_json: null, review_diff_hash: null }]);
   });
 });

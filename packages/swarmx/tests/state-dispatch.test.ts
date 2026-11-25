@@ -1352,7 +1352,7 @@ describe("WorkUnit actor-checked mission commands", () => {
     expect(replay).toEqual(first);
     await expect(r.commands.submit({ kind: "worker", sessionId: "w1" }, { unitId: first.id, evidence: { summary: "changed" }, diff: "diff" })).rejects.toThrow(SubmissionConflictError);
     await expect(r.commands.submit({ kind: "worker", sessionId: "w1" }, { unitId: first.id, evidence: { summary: "ok", filesTouched: ["src/a.ts"] }, diff: "other" })).rejects.toThrow(SubmissionConflictError);
-    await r.commands.review(owner, { unitId: first.id, status: "approved", summary: "done", receipt: { filesTouched: ["src/a.ts"], passed: true } });
+    await r.commands.review(owner, { projectPath: "/proj/p", unitId: first.id, status: "approved", summary: "done", receipt: { filesTouched: ["src/a.ts"], passed: true } });
     const later = await r.commands.submit({ kind: "worker", sessionId: "w1" }, { unitId: first.id, evidence: { summary: "ok", filesTouched: ["src/a.ts"] }, diff: "diff" });
     expect(later.state).toBe("DONE");
     expect(later).toEqual((await getWorkUnit(r.db, first.id)) as WorkUnit);
@@ -1361,26 +1361,26 @@ describe("WorkUnit actor-checked mission commands", () => {
   test("review approval requires a receipt for non-doc work and drains completion with fence reviewFence + 2", async () => {
     const r = await rig();
     const unit = await submitted(r);
-    await expect(r.commands.review(owner, { unitId: unit.id, status: "approved", summary: "done" })).rejects.toThrow(ReviewReceiptRequiredError);
-    await expect(r.commands.review(owner, { unitId: unit.id, status: "unverifiable", summary: "done" })).rejects.toThrow(ReviewReceiptRequiredError);
-    await expect(r.commands.review({ kind: "coordinator", sessionId: "other" }, { unitId: unit.id, status: "approved", summary: "done", receipt: { filesTouched: [] } })).rejects.toThrow(MissionActorError);
+    await expect(r.commands.review(owner, { projectPath: "/proj/p", unitId: unit.id, status: "approved", summary: "done" })).rejects.toThrow(ReviewReceiptRequiredError);
+    await expect(r.commands.review(owner, { projectPath: "/proj/p", unitId: unit.id, status: "unverifiable", summary: "done" })).rejects.toThrow(ReviewReceiptRequiredError);
+    await expect(r.commands.review({ kind: "coordinator", sessionId: "other" }, { projectPath: "/proj/p", unitId: unit.id, status: "approved", summary: "done", receipt: { filesTouched: [] } })).rejects.toThrow(MissionActorError);
     expect((await getWorkUnit(r.db, unit.id))?.state).toBe("SUBMITTED");
-    const result = await r.commands.review(owner, { unitId: unit.id, status: "approved", summary: "done", receipt: { filesTouched: ["src/a.ts"], passed: true } });
+    const result = await r.commands.review(owner, { projectPath: "/proj/p", unitId: unit.id, status: "approved", summary: "done", receipt: { filesTouched: ["src/a.ts"], passed: true } });
     const reviewFence = unit.fence + 1;
     const effect = result.effects.find((e) => e.kind === "backend_complete");
     expect(effect).toMatchObject({ effect_id: `effect:${unit.id}:backend_complete`, unit_fence: reviewFence + 2, state: "succeeded", mandatory: 1 });
     expect(result.unit).toMatchObject({ state: "DONE", review_verdict: "approved", review_by: "coord" });
     expect(JSON.parse(result.unit.verification_receipt_json ?? "null")).toEqual({ filesTouched: ["src/a.ts"], passed: true });
     expect(r.calls).toEqual([{ name: "swarm_complete", args: {
-      project_key: "p", bead_id: "c1", agent_name: "coder", summary: "done", operation_id: `op:${unit.id}:backend_complete`,
+      project_key: "/proj/p", bead_id: "c1", agent_name: "coder", summary: "done", operation_id: `op:${unit.id}:backend_complete`,
     } }]);
   });
 
   test("review approval rejects a missing completion summary before any write", async () => {
     const r = await rig();
     const unit = await submitted(r);
-    await expect(r.commands.review(owner, { unitId: unit.id, status: "approved", receipt: { filesTouched: [] } })).rejects.toThrow(ReviewPayloadError);
-    await expect(r.commands.review(owner, { unitId: unit.id, status: "approved", summary: " ", receipt: { filesTouched: [] } })).rejects.toThrow(ReviewPayloadError);
+    await expect(r.commands.review(owner, { projectPath: "/proj/p", unitId: unit.id, status: "approved", receipt: { filesTouched: [] } })).rejects.toThrow(ReviewPayloadError);
+    await expect(r.commands.review(owner, { projectPath: "/proj/p", unitId: unit.id, status: "approved", summary: " ", receipt: { filesTouched: [] } })).rejects.toThrow(ReviewPayloadError);
     expect(await getWorkUnit(r.db, unit.id)).toEqual(unit);
     expect((await r.db.query("SELECT effect_id FROM swarmx_effects")).rows).toEqual([]);
   });
@@ -1388,9 +1388,9 @@ describe("WorkUnit actor-checked mission commands", () => {
   test("review unverifiable approves doc-only and empty-file work without a receipt", async () => {
     const r = await rig();
     const docs = await submitted(r, "c-doc", { filesTouched: ["README.md", "docs/guide.txt", "assets/logo.svg"] });
-    expect((await r.commands.review(owner, { unitId: docs.id, status: "unverifiable", summary: "done" })).unit).toMatchObject({ state: "DONE", review_verdict: "unverifiable", verification_receipt_json: null });
+    expect((await r.commands.review(owner, { projectPath: "/proj/p", unitId: docs.id, status: "unverifiable", summary: "done" })).unit).toMatchObject({ state: "DONE", review_verdict: "unverifiable", verification_receipt_json: null });
     const empty = await submitted(r, "c-empty", { filesTouched: [] });
-    expect((await r.commands.review(owner, { unitId: empty.id, status: "unverifiable", summary: "done" })).unit.state).toBe("DONE");
+    expect((await r.commands.review(owner, { projectPath: "/proj/p", unitId: empty.id, status: "unverifiable", summary: "done" })).unit.state).toBe("DONE");
   });
 
   test("review needs_changes revokes the worker, drains feedback at reviewFence + 1, then CHANGES_REQUESTED", async () => {
@@ -1405,13 +1405,13 @@ describe("WorkUnit actor-checked mission commands", () => {
       },
     });
     const unit = await submitted(r);
-    const result = await r.commands.review(owner, { unitId: unit.id, status: "needs_changes", feedback: ["fix it"] });
+    const result = await r.commands.review(owner, { projectPath: "/proj/p", unitId: unit.id, status: "needs_changes", feedback: ["fix it"] });
     expect(order).toEqual(["swarm_review_feedback:RETURNING:null"]);
     const reviewFence = unit.fence + 1;
     expect(result.effects).toEqual([expect.objectContaining({ effect_id: `effect:${unit.id}:backend_feedback`, unit_fence: reviewFence + 1, state: "succeeded" })]);
     expect(result.unit).toMatchObject({ state: "CHANGES_REQUESTED", worker_session: null, review_verdict: "needs_changes" });
     expect(r.calls[0]?.args).toEqual({
-      project_key: "p", task_id: "c1", worker_id: "coder", status: "needs_changes", issues: '["fix it"]',
+      project_key: "/proj/p", task_id: "c1", worker_id: "coder", status: "needs_changes", issues: '["fix it"]',
       operation_id: `op:${unit.id}:backend_feedback`,
     });
     await expect(r.commands.retry(owner, { priorUnitId: unit.id, workerAgent: "", callId: "c2", dispatchToken: "t2", budgetCharge: 1 })).rejects.toThrow(RetryNotAllowedError);
@@ -1422,7 +1422,7 @@ describe("WorkUnit actor-checked mission commands", () => {
   test("review needs_changes stays RETURNING when the mandatory feedback effect is definitely rejected", async () => {
     const r = await rig({ runBackendTool: async () => { throw new DefiniteEffectError("nope"); } });
     const unit = await submitted(r);
-    const result = await r.commands.review(owner, { unitId: unit.id, status: "needs_changes", feedback: ["fix"] });
+    const result = await r.commands.review(owner, { projectPath: "/proj/p", unitId: unit.id, status: "needs_changes", feedback: ["fix"] });
     expect(result.unit.state).toBe("RETURNING");
     expect(result.effects[0]?.state).toBe("failed_mandatory");
     await expect(r.commands.retry(owner, { priorUnitId: unit.id, workerAgent: "coder", callId: "c2", dispatchToken: "t2", budgetCharge: 1 })).rejects.toThrow(RetryNotAllowedError);
@@ -1436,13 +1436,13 @@ describe("WorkUnit actor-checked mission commands", () => {
     await recordReviewIntent(r.db, { unitId: unit.id, reviewFence: begun.fence, intent });
     await recordReviewIntent(r.db, { unitId: unit.id, reviewFence: begun.fence, intent });
     await expect(recordReviewIntent(r.db, { unitId: unit.id, reviewFence: begun.fence, intent: { ...intent, verdict: "needs_changes", receiptJson: null, feedbackJson: '["x"]' } })).rejects.toThrow(ReviewIntentConflictError);
-    await expect(r.commands.review(owner, { unitId: unit.id, status: "needs_changes", feedback: ["x"] })).rejects.toThrow(ReviewIntentConflictError);
+    await expect(r.commands.review(owner, { projectPath: "/proj/p", unitId: unit.id, status: "needs_changes", feedback: ["x"] })).rejects.toThrow(ReviewIntentConflictError);
   });
 
   test("review crash replay: intent-only and intent+effects states complete by exact replay", async () => {
     const r = await rig();
     const unit = await submitted(r);
-    const input = { unitId: unit.id, status: "approved" as const, summary: "done", receipt: { filesTouched: ["src/a.ts"] } };
+    const input = { projectPath: "/proj/p", unitId: unit.id, status: "approved" as const, summary: "done", receipt: { filesTouched: ["src/a.ts"] } };
     const begun = await r.commands.beginReview(owner, { unitId: unit.id });
     const plan = reviewEffectPlan(begun, input);
     await recordReviewIntent(r.db, { unitId: unit.id, reviewFence: begun.fence, intent: plan.intent });
@@ -1462,7 +1462,7 @@ describe("WorkUnit actor-checked mission commands", () => {
   test("review effects are never inserted before IN_REVIEW", async () => {
     const r = await rig();
     const unit = await submitted(r);
-    const plan = reviewEffectPlan({ ...unit, state: "IN_REVIEW", fence: unit.fence + 1 }, { unitId: unit.id, status: "approved", summary: "done", receipt: {} });
+    const plan = reviewEffectPlan({ ...unit, state: "IN_REVIEW", fence: unit.fence + 1 }, { projectPath: "/proj/p", unitId: unit.id, status: "approved", summary: "done", receipt: {} });
     await expect(insertReviewEffects(r.db, { unitId: unit.id, reviewFence: unit.fence + 1, effects: plan.effects })).rejects.toThrow();
     expect((await r.db.query("SELECT effect_id FROM swarmx_effects")).rows).toEqual([]);
   });
