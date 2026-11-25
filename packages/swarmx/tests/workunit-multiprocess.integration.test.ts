@@ -244,6 +244,7 @@ describe("WorkUnit process fencing", () => {
   test("missionCloseRacesReserve", async () => {
     await withProcesses("mission-close", (db) => seedMission(db), async ({ db, results }) => {
       const winner = expectOneWinner(results);
+      expectLoserError(results, winner.unitId === undefined ? "MissionClosedError" : "MissionNotDrainedError");
       if (winner.unitId !== undefined) {
         expect(await liveUnitCount(db)).toBe(1);
       } else {

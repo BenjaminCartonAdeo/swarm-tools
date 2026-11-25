@@ -43,3 +43,43 @@ Additional required checks, after the final test changes:
 ## Commit
 
 Requested commit message: `test(swarmx): verify WorkUnit process fencing`
+
+## Fix round 1 — Pin close-race loser errors
+
+### Contract verified
+
+The exported store implementations establish two legal outcomes for this race:
+
+- If close wins, `beginMissionClose` moves the mission through CLOSING and `finishMissionClose` completes it. The losing `reserveWorkUnit` cannot insert because reservations require OPEN and its diagnostic path throws `MissionClosedError` (`store.ts:332, 398–428`).
+- If reservation wins, `beginMissionClose` can still move the mission to CLOSING, but `finishMissionClose` sees the live WorkUnit and throws `MissionNotDrainedError` (`store.ts:585–601, 633–656`).
+- `beginMissionClose` may throw `MissionFenceConflictError` for a stale fence/owner/state, but the race fixture supplies the current fence and owner and has no competing closer. That is not a legal loser outcome for these two operations.
+
+### Change and characterization
+
+Strengthened `missionCloseRacesReserve` to select the expected loser error from the winner's result: a closer winner requires `MissionClosedError`; a reserver winner requires `MissionNotDrainedError`. These are exact serialized error names from the child process, so infrastructure failures such as `SQLITE_BUSY` are rejected. The assertion passed immediately against the existing store and is a characterization of its intended race contract. No production code, fault-injection switch, or additional named test was added.
+
+### Verification evidence
+
+Three consecutive focused runs after the assertion change:
+
+1. `bun test tests/workunit-multiprocess.integration.test.ts` — 4 pass, 0 fail, 27 expectations (1.53s).
+2. `bun test tests/workunit-multiprocess.integration.test.ts` — 4 pass, 0 fail, 27 expectations (1.51s).
+3. `bun test tests/workunit-multiprocess.integration.test.ts` — 4 pass, 0 fail, 27 expectations (1.56s).
+
+Required checks:
+
+- `bun test tests/workunit-multiprocess.integration.test.ts tests/workunit-store.test.ts` — 45 pass, 0 fail, 496 expectations.
+- `bun test tests/` — 452 pass, 5 skipped, 0 fail; 457 tests across 24 files.
+- `bun run typecheck` — passed (`$ tsc --noEmit`).
+- `bun run build` — passed; bundled 22 modules for `index.js` and 13 modules for `swarmx.js`.
+
+### Files and self-review
+
+- Changed `packages/swarmx/tests/workunit-multiprocess.integration.test.ts` and this report only.
+- The branch preserves both legal race orderings and asserts the exact named typed loser for whichever ordering occurs. A generic/infrastructure error cannot satisfy either expected string.
+- `tests/helpers.ts`, the child fixture, store code, plan/ledger, and lockfiles were not changed in this round.
+- Build output remains ignored/untracked as established in the initial report; no generated bundle is part of the change.
+
+### Commit
+
+Requested commit message: `test(swarmx): pin close race loser errors`
