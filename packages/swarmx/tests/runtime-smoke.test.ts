@@ -2241,6 +2241,31 @@ describe("WorkUnit completion lifecycle", () => {
     expect((await nativeUnit(n, cellID)).state).toBe("DONE");
   }
 
+  test("WorkUnit dispatch allows a zero-charge follow-up after the first unit is terminal", async () => {
+    const n = await nativeRig();
+    await nativeApprove(n, "cell-a", "call-first", "ses-worker");
+    const units = () => listUnits(n.native.runtime.db, n.native.missionPk);
+    const charged = async () => (await units()).reduce((sum, unit) => sum + (unit.budget_charge ?? 0), 0);
+    const chargedBefore = await charged();
+    expect(chargedBefore).toBe(1);
+
+    const followup = workerDispatchPayload("cell-a", "call-followup");
+    (followup.input as Record<string, unknown>).purpose = "followup";
+    await expect(n.rig.before(followup)).resolves.toBeUndefined();
+    const reserved = (await units()).find((unit) => unit.call_id === "call-followup");
+    const first = (await units()).find((unit) => unit.call_id === "call-first");
+    expect(reserved).toMatchObject({ state: "RESERVED", cell_id: "cell-a", budget_charge: 0 });
+    expect(reserved?.id).not.toBe(first?.id);
+    expect(first?.state).toBe("DONE");
+
+    await expect(
+      n.rig.after({ ...followup, status: "completed", result: { sessionID: "ses-followup-worker" } }),
+    ).resolves.toBeUndefined();
+    const bound = (await units()).find((unit) => unit.call_id === "call-followup");
+    expect(bound).toMatchObject({ state: "BOUND", worker_session: "ses-followup-worker", budget_charge: 0 });
+    expect(await charged()).toBe(chargedBefore);
+  });
+
   function nativeFinish(n: NativeRig) {
     return n.rig.tools.get("swarm_finish")!.execute({}, toolContext("swarm/swarm-coordinator", "call-finish"));
   }
