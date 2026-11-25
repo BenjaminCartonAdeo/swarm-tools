@@ -549,7 +549,7 @@ describe("work unit effect runner", () => {
 });
 
 describe("forced mission close", () => {
-  const owner = { missionId: "mission-1", ownerSessionId: "session" };
+  const owner = { missionPk: "mission-1", ownerSessionId: "session" };
 
   async function seedForced(): Promise<DatabaseAdapter> {
     const db = await seedEffect({ effectId: "pub-mandatory", unitId: "pub", unitState: "PUBLISHING", unitFence: 7 });
@@ -596,6 +596,36 @@ describe("forced mission close", () => {
     await expect(recordEffectResult(db, { effectId: "pub-mandatory", claimToken: claim!.claimToken, state: "succeeded" }))
       .rejects.toBeInstanceOf(EffectClaimConflictError);
     expect(await readEffect(db, "pub-mandatory")).toMatchObject({ state: "orphaned", claim_token: null });
+  });
+
+  test("forcedCloseCrashAfterOrphaningConvergesOnRetry", async () => {
+    const db = await seedForced();
+    await db.query(
+      "INSERT INTO swarmx_effects (effect_id, unit_id, kind, mandatory, unit_fence, state, attempt, updated_at) VALUES ('pub-failed', 'pub', 'hive_close', 1, 7, 'failed_mandatory', 1, 0)",
+    );
+    const claim = await claimEffect(db, {
+      effectId: "pub-mandatory", unitId: "pub", expectedUnitState: "PUBLISHING", unitFence: 7,
+      hostInstanceId: "host", hostname: "h", pid: 1,
+    });
+    expect(claim).not.toBeNull();
+    // Simulated crash: step 1 (orphan + clear claims) committed, step 2 (units FAILED) never ran.
+    await db.query(
+      "UPDATE swarmx_effects SET state = 'orphaned', claim_token = NULL, host_instance_id = NULL, claimed_hostname = NULL, claimed_by_pid = NULL, claimed_at = NULL WHERE effect_id = 'pub-mandatory'",
+    );
+    expect(await states(db, "units")).toEqual({ pub: "PUBLISHING", ret: "RETURNING" });
+    expect(await forceMissionClose(db, { ...owner, expectedFence: 2 })).toMatchObject({ state: "FINISHED", fence: 3 });
+    expect(await states(db, "units")).toEqual({ pub: "FAILED", ret: "FAILED" });
+    await expect(recordEffectResult(db, { effectId: "pub-mandatory", claimToken: claim!.claimToken, state: "succeeded" }))
+      .rejects.toBeInstanceOf(EffectClaimConflictError);
+    expect(await forceMissionClose(db, { ...owner, expectedFence: 2 })).toMatchObject({ state: "FINISHED", fence: 3 });
+  });
+
+  test("approvedUnitWithEffectsIsNotForceClosable (documented limitation)", async () => {
+    const db = await seedForced();
+    await db.query("UPDATE swarmx_effects SET state = 'failed_mandatory' WHERE effect_id = 'pub-mandatory'");
+    await db.query("UPDATE swarmx_work_units SET state = 'APPROVED' WHERE id = 'ret'");
+    await expect(forceMissionClose(db, { ...owner, expectedFence: 2 })).rejects.toBeInstanceOf(ForcedCloseNotAllowedError);
+    expect(await states(db, "units")).toEqual({ pub: "PUBLISHING", ret: "APPROVED" });
   });
 
   test("mandatoryFailureAllowsCoordinatorForcedClose idempotently and leaves no live units", async () => {

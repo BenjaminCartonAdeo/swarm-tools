@@ -412,13 +412,13 @@ export class MissionNotDrainedError extends Error {
 }
 
 export interface MissionCloseFence {
-  missionId: string;
+  missionPk: string;
   expectedFence: number;
   ownerSessionId: string;
 }
 
-export const LIVE_WORK_UNIT_STATES_SQL =
-  "('RESERVED', 'BOUND', 'SUBMITTED', 'IN_REVIEW', 'APPROVED', 'PUBLISHING', 'RETURNING')";
+export const TERMINAL_WORK_UNIT_STATES_SQL =
+  "('DONE', 'CHANGES_REQUESTED', 'REJECTED', 'CANCELLED', 'ABANDONED', 'REVOKED', 'FAILED')";
 
 export async function getMission(db: DatabaseAdapter, missionId: string): Promise<Mission | null> {
   const result = await db.query("SELECT * FROM swarmx_missions WHERE id = ?", [missionId]);
@@ -428,7 +428,7 @@ export async function getMission(db: DatabaseAdapter, missionId: string): Promis
 
 async function countLiveUnits(db: DatabaseAdapter, missionId: string): Promise<number> {
   const result = await db.query(
-    `SELECT COUNT(id) AS n FROM swarmx_work_units WHERE mission_pk = ? AND state IN ${LIVE_WORK_UNIT_STATES_SQL}`,
+    `SELECT COUNT(id) AS n FROM swarmx_work_units WHERE mission_pk = ? AND state NOT IN ${TERMINAL_WORK_UNIT_STATES_SQL}`,
     [missionId],
   );
   const row: unknown = result.rows[0];
@@ -443,16 +443,16 @@ export async function beginMissionClose(
   const result = await db.query(
     `UPDATE swarmx_missions SET state = 'CLOSING', close_intent = ?, fence = fence + 1, updated_at = ?
      WHERE id = ? AND session_id = ? AND fence = ? AND state = 'OPEN' RETURNING *`,
-    [input.intent, Date.now(), input.missionId, input.ownerSessionId, input.expectedFence],
+    [input.intent, Date.now(), input.missionPk, input.ownerSessionId, input.expectedFence],
   );
   const row: unknown = result.rows[0];
   if (isRecord(row)) return row as unknown as Mission;
-  const current = await getMission(db, input.missionId);
+  const current = await getMission(db, input.missionPk);
   if (current !== null && current.session_id === input.ownerSessionId && current.state === "CLOSING"
     && current.close_intent === input.intent && Number(current.fence) === input.expectedFence + 1) {
     return current;
   }
-  throw new MissionFenceConflictError(input.missionId, input.expectedFence);
+  throw new MissionFenceConflictError(input.missionPk, input.expectedFence);
 }
 
 /** Idempotent cancel/abandon cascade; PUBLISHING/RETURNING and APPROVED-with-effects are left to drain. */
@@ -471,14 +471,14 @@ export async function cascadeMissionClose(
          SELECT 1 FROM swarmx_missions m WHERE m.id = swarmx_work_units.mission_pk
            AND m.session_id = ? AND m.fence = ? AND m.state = 'CLOSING' AND m.close_intent = ?)
      RETURNING id`,
-    [nextState, `mission_${input.intent}`, Date.now(), input.missionId, input.ownerSessionId, input.expectedFence, input.intent],
+    [nextState, `mission_${input.intent}`, Date.now(), input.missionPk, input.ownerSessionId, input.expectedFence, input.intent],
   );
   const unitIds = result.rows.flatMap((row) => (isRecord(row) && typeof row.id === "string" ? [row.id] : []));
   if (unitIds.length > 0) return { unitIds };
-  const mission = await getMission(db, input.missionId);
+  const mission = await getMission(db, input.missionPk);
   if (mission === null || mission.session_id !== input.ownerSessionId || mission.state !== "CLOSING"
     || mission.close_intent !== input.intent || Number(mission.fence) !== input.expectedFence) {
-    throw new MissionFenceConflictError(input.missionId, input.expectedFence);
+    throw new MissionFenceConflictError(input.missionPk, input.expectedFence);
   }
   return { unitIds };
 }
@@ -491,21 +491,21 @@ export async function finishMissionClose(db: DatabaseAdapter, input: MissionClos
          fence = fence + 1, updated_at = ?
      WHERE id = ? AND session_id = ? AND fence = ? AND state = 'CLOSING'
        AND NOT EXISTS (SELECT 1 FROM swarmx_work_units u
-         WHERE u.mission_pk = swarmx_missions.id AND u.state IN ${LIVE_WORK_UNIT_STATES_SQL})
+         WHERE u.mission_pk = swarmx_missions.id AND u.state NOT IN ${TERMINAL_WORK_UNIT_STATES_SQL})
      RETURNING *`,
-    [Date.now(), input.missionId, input.ownerSessionId, input.expectedFence],
+    [Date.now(), input.missionPk, input.ownerSessionId, input.expectedFence],
   );
   const row: unknown = result.rows[0];
   if (isRecord(row)) return row as unknown as Mission;
-  const mission = await getMission(db, input.missionId);
+  const mission = await getMission(db, input.missionPk);
   if (mission !== null && mission.session_id === input.ownerSessionId) {
     const fence = Number(mission.fence);
     if (["FINISHED", "CANCELLED", "ABANDONED"].includes(mission.state) && fence === input.expectedFence + 1) {
       return mission;
     }
-    if (mission.state === "CLOSING" && fence === input.expectedFence && (await countLiveUnits(db, input.missionId)) > 0) {
-      throw new MissionNotDrainedError(input.missionId);
+    if (mission.state === "CLOSING" && fence === input.expectedFence && (await countLiveUnits(db, input.missionPk)) > 0) {
+      throw new MissionNotDrainedError(input.missionPk);
     }
   }
-  throw new MissionFenceConflictError(input.missionId, input.expectedFence);
+  throw new MissionFenceConflictError(input.missionPk, input.expectedFence);
 }

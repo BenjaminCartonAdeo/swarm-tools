@@ -598,7 +598,7 @@ async function terminalMissionsWithLiveUnits(db: DatabaseAdapter): Promise<numbe
 }
 
 describe("mission close barrier", () => {
-  const owner = { missionId: "mission-pk-mission", ownerSessionId: "session" };
+  const owner = { missionPk: "mission-pk-mission", ownerSessionId: "session" };
 
   test("closeBlocksNewReservations immediately after OPEN -> CLOSING", async () => {
     await withWorkUnitDb(async (db) => {
