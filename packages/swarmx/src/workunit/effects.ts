@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { DatabaseAdapter } from "swarm-mail";
 import type { EffectState, Mission, WorkUnit, WorkUnitEffect } from "./schema.js";
 import { getWorkUnit } from "./store.js";
@@ -152,7 +152,13 @@ export async function recoverStaleEffects(
   return { recovered, foreignHostCandidates };
 }
 
-/** Thrown by ports when an external tool definitively rejected the request (no side effect happened). */
+/**
+ * Port error contract: a port MUST throw `DefiniteEffectError` when the external
+ * tool definitively rejected the request (no side effect happened or can happen).
+ * Any other thrown value is treated as ambiguous: the side effect may or may not
+ * have happened, so mandatory effects are recorded as `unknown` and reconciled
+ * on the next run. A port that resolves (does not throw) signals acceptance.
+ */
 export class DefiniteEffectError extends Error {
   constructor(message: string) {
     super(message);
@@ -170,10 +176,13 @@ export interface HiveCellSnapshot {
   status: string;
   operationId?: string;
   result?: unknown;
-  receiptHash?: string;
+  /** Hive `completion_operation_id` persisted when the cell was closed idempotently. */
+  completionOperationId?: string | null;
 }
 
+/** External ports used by the effect runner. See `DefiniteEffectError` for the error contract. */
 export interface WorkUnitEffectPorts {
+  /** Returns null when the cell does not exist. */
   readHiveCell(projectKey: string, cellId: string): Promise<HiveCellSnapshot | null>;
   runBackendTool(name: string, args: Record<string, unknown>): Promise<unknown>;
   prepareConsolidation(input: { projectKey: string; epicId: string; unitId: string }): Promise<unknown>;
@@ -181,8 +190,10 @@ export interface WorkUnitEffectPorts {
 
 type Outcome = { state: RecordEffectResultInput["state"]; result?: unknown; error?: unknown };
 
-const COMPLETE_TOOL = ["swarm", "complete"].join("_");
-const FEEDBACK_TOOL = ["swarm", "review", "feedback"].join("_");
+const SWARM_COMPLETE_TOOL = "swarm_complete";
+const SWARM_REVIEW_FEEDBACK_TOOL = "swarm_review_feedback";
+const HIVE_CREATE_TOOL = "hive_create";
+const HIVE_START_TOOL = "hive_start";
 
 async function getEffect(db: DatabaseAdapter, effectId: string): Promise<WorkUnitEffect | null> {
   const result = await db.query("SELECT * FROM swarmx_effects WHERE effect_id = ?", [effectId]);
@@ -195,10 +206,15 @@ async function getMission(db: DatabaseAdapter, missionPk: string): Promise<Missi
   return isRecord(row) ? (row as unknown as Mission) : null;
 }
 
-function parseRequest(effect: WorkUnitEffect): Record<string, unknown> {
-  if (effect.request_json === null || effect.request_json === undefined) return {};
-  const parsed: unknown = JSON.parse(effect.request_json);
-  return isRecord(parsed) ? parsed : {};
+/** Returns the stored request object, or null when missing, malformed, or not a JSON object. */
+function parseRequest(effect: WorkUnitEffect): Record<string, unknown> | null {
+  if (typeof effect.request_json !== "string") return null;
+  try {
+    const parsed: unknown = JSON.parse(effect.request_json);
+    return isRecord(parsed) && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 function errorPayload(error: unknown): unknown {
@@ -211,39 +227,42 @@ function ambiguousOrDefinite(error: unknown): Outcome {
     : { state: "unknown", error: errorPayload(error) };
 }
 
-/** Verification receipt hash = sha256 hex of the unit's stored verification_receipt_json. */
-function receiptHash(unit: WorkUnit): string | null {
-  return unit.verification_receipt_json === null
-    ? null
-    : createHash("sha256").update(unit.verification_receipt_json).digest("hex");
-}
-
 function isClosed(cell: HiveCellSnapshot | null): cell is HiveCellSnapshot {
   return cell !== null && cell.status === "closed";
 }
 
-function reconcileClosedCell(cell: HiveCellSnapshot, expected: string | null): Outcome {
-  if (expected !== null && cell.receiptHash === expected) {
-    return { state: "succeeded", result: { status: cell.status, receiptHash: cell.receiptHash } };
+function reconcileClosedCell(cell: HiveCellSnapshot, operationId: string): Outcome {
+  if (cell.completionOperationId === operationId) {
+    return { state: "succeeded", result: { status: cell.status, completionOperationId: operationId } };
   }
   return {
     state: "failed_mandatory",
-    error: { message: "Hive cell closed without matching verification receipt", expected, actual: cell.receiptHash ?? null },
+    error: {
+      message: "Hive cell closed without matching completion identity",
+      expected: operationId,
+      actual: cell.completionOperationId ?? null,
+    },
   };
 }
 
-async function runBackendComplete(unit: WorkUnit, effect: WorkUnitEffect, ports: WorkUnitEffectPorts): Promise<Outcome> {
-  const expected = receiptHash(unit);
-  const cellId = unit.cell_id ?? "";
-  const before = await ports.readHiveCell(unit.project, cellId);
-  if (isClosed(before)) return reconcileClosedCell(before, expected);
+async function runBackendComplete(
+  unit: WorkUnit,
+  request: Record<string, unknown>,
+  operationId: string,
+  ports: WorkUnitEffectPorts,
+): Promise<Outcome> {
+  if (typeof unit.cell_id !== "string" || unit.cell_id.length === 0) {
+    return { state: "failed_mandatory", error: { message: "WorkUnit has no cell_id to complete" } };
+  }
+  const before = await ports.readHiveCell(unit.project, unit.cell_id);
+  if (isClosed(before)) return reconcileClosedCell(before, operationId);
   try {
-    await ports.runBackendTool(COMPLETE_TOOL, parseRequest(effect));
+    await ports.runBackendTool(SWARM_COMPLETE_TOOL, { ...request, operation_id: operationId });
   } catch (error) {
     return ambiguousOrDefinite(error);
   }
-  const after = await ports.readHiveCell(unit.project, cellId);
-  if (isClosed(after)) return reconcileClosedCell(after, expected);
+  const after = await ports.readHiveCell(unit.project, unit.cell_id);
+  if (isClosed(after)) return reconcileClosedCell(after, operationId);
   return { state: "unknown", error: { message: "Hive cell not closed after completion" } };
 }
 
@@ -260,25 +279,29 @@ async function runOptional(
   unit: WorkUnit,
   mission: Mission,
   effect: WorkUnitEffect,
-  request: Record<string, unknown>,
+  request: Record<string, unknown> | null,
   operationId: string,
   ports: WorkUnitEffectPorts,
 ): Promise<Outcome> {
   try {
     if (effect.kind === "consolidate") {
+      const stored = request ?? {};
       const result = await ports.prepareConsolidation({
-        projectKey: typeof request.projectKey === "string" ? request.projectKey : unit.project,
-        epicId: typeof request.epicId === "string" ? request.epicId : (mission.epic_id ?? ""),
-        unitId: typeof request.unitId === "string" ? request.unitId : unit.id,
+        projectKey: typeof stored.projectKey === "string" ? stored.projectKey : unit.project,
+        epicId: typeof stored.epicId === "string" ? stored.epicId : (mission.epic_id ?? ""),
+        unitId: typeof stored.unitId === "string" ? stored.unitId : unit.id,
       });
       return { state: "succeeded", result };
     }
+    if (request === null) {
+      return { state: "failed_optional", error: { message: "Missing or malformed request_json" } };
+    }
     if (effect.kind.startsWith("followup:")) {
-      const result = await ports.runBackendTool("hive_create", { ...request, operation_id: operationId });
+      const result = await ports.runBackendTool(HIVE_CREATE_TOOL, { ...request, operation_id: operationId });
       return { state: "succeeded", result: { cellId: cellIdFrom(result) } };
     }
     if (effect.kind === "hive_start") {
-      return { state: "succeeded", result: await ports.runBackendTool("hive_start", request) };
+      return { state: "succeeded", result: await ports.runBackendTool(HIVE_START_TOOL, request) };
     }
     return { state: "failed_optional", error: { message: `Unknown effect kind ${effect.kind}` } };
   } catch (error) {
@@ -293,16 +316,24 @@ async function executeEffect(
   ports: WorkUnitEffectPorts,
 ): Promise<Outcome> {
   const request = parseRequest(effect);
-  const operationId = effect.operation_id ?? effect.effect_id;
-  if (effect.kind === "backend_complete") return runBackendComplete(unit, effect, ports);
-  if (effect.kind === "backend_feedback") {
-    try {
-      return { state: "succeeded", result: await ports.runBackendTool(FEEDBACK_TOOL, { ...request, operation_id: operationId }) };
-    } catch (error) {
-      return ambiguousOrDefinite(error);
-    }
+  const isMandatoryKind = effect.kind === "backend_complete" || effect.kind === "backend_feedback";
+  if (!isMandatoryKind) {
+    return runOptional(unit, mission, effect, request, effect.operation_id ?? effect.effect_id, ports);
   }
-  return runOptional(unit, mission, effect, request, operationId, ports);
+  // Mandatory effects never call out with an empty/guessed request or identity.
+  if (request === null) {
+    return { state: "failed_mandatory", error: { message: "Missing or malformed request_json" } };
+  }
+  if (typeof effect.operation_id !== "string" || effect.operation_id.length === 0) {
+    return { state: "failed_mandatory", error: { message: "Mandatory effect has no operation_id" } };
+  }
+  if (effect.kind === "backend_complete") return runBackendComplete(unit, request, effect.operation_id, ports);
+  try {
+    const result = await ports.runBackendTool(SWARM_REVIEW_FEEDBACK_TOOL, { ...request, operation_id: effect.operation_id });
+    return { state: "succeeded", result };
+  } catch (error) {
+    return ambiguousOrDefinite(error);
+  }
 }
 
 async function orphanEffect(db: DatabaseAdapter, effect: WorkUnitEffect): Promise<WorkUnitEffect> {

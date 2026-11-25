@@ -251,9 +251,7 @@ describe("work unit effect journal claims", () => {
 });
 
 const HOST = { hostInstanceId: "host-1", hostname: "worker-a", pid: 321 };
-// sha256('{"tests":"passed"}') computed by hand with `printf '{"tests":"passed"}' | sha256sum`
 const RECEIPT_JSON = '{"tests":"passed"}';
-const RECEIPT_HASH = "46ef157866dc6cc874adcc9f868330c33356f8bc3cf0bd2cb903f596912ae56b";
 
 interface EffectSeed {
   effectId: string;
@@ -378,7 +376,7 @@ describe("work unit effect runner", () => {
 
   test("completeReconcilesCellAndReceiptAfterUnknown", async () => {
     const db = await seedUnit([{ effectId: "eff-c", kind: "backend_complete", mandatory: true, request: COMPLETE_ARGS, state: "unknown" }]);
-    const ports = fakePorts({ cells: [{ status: "closed", receiptHash: RECEIPT_HASH }] });
+    const ports = fakePorts({ cells: [{ status: "closed", completionOperationId: "eff-c" }] });
     const effect = await runWorkUnitEffect(db, { effectId: "eff-c", host: HOST, ports });
     expect(effect.state).toBe("succeeded");
     expect(ports.calls).toEqual([]);
@@ -387,9 +385,9 @@ describe("work unit effect runner", () => {
 
   test("openCellRetriesComplete", async () => {
     const db = await seedUnit([{ effectId: "eff-c", kind: "backend_complete", mandatory: true, request: COMPLETE_ARGS, state: "unknown" }]);
-    const ports = fakePorts({ cells: [{ status: "open" }, { status: "closed", receiptHash: RECEIPT_HASH }] });
+    const ports = fakePorts({ cells: [{ status: "open" }, { status: "closed", completionOperationId: "eff-c" }] });
     const effect = await runWorkUnitEffect(db, { effectId: "eff-c", host: HOST, ports });
-    expect(ports.calls).toEqual([{ name: "swarm_complete", args: COMPLETE_ARGS }]);
+    expect(ports.calls).toEqual([{ name: "swarm_complete", args: { ...COMPLETE_ARGS, operation_id: "eff-c" } }]);
     expect(ports.order).toEqual(["read:proj:cell-1", "tool:swarm_complete", "read:proj:cell-1"]);
     expect(effect.state).toBe("succeeded");
   });
@@ -402,8 +400,8 @@ describe("work unit effect runner", () => {
     expect(effect.state).toBe("unknown");
   });
 
-  test("closedCellWithoutMatchingReceiptFailsMandatory", async () => {
-    for (const cell of [{ status: "closed" }, { status: "closed", receiptHash: "deadbeef" }]) {
+  test("closedCellWithoutMatchingCompletionIdentityFailsMandatory", async () => {
+    for (const cell of [{ status: "closed" }, { status: "closed", completionOperationId: "other-identity" }]) {
       const db = await seedUnit([{ effectId: "eff-c", kind: "backend_complete", mandatory: true, request: COMPLETE_ARGS }]);
       const ports = fakePorts({ cells: [cell] });
       const effect = await runWorkUnitEffect(db, { effectId: "eff-c", host: HOST, ports });
@@ -411,6 +409,34 @@ describe("work unit effect runner", () => {
       expect(ports.calls).toEqual([]);
       expect(effect.error_json).not.toBeNull();
     }
+  });
+
+  test("mandatory effects with null or malformed request_json never call a port", async () => {
+    const cases: Array<[string, "PUBLISHING" | "RETURNING", string | null]> = [
+      ["backend_complete", "PUBLISHING", null],
+      ["backend_complete", "PUBLISHING", "{not json"],
+      ["backend_complete", "PUBLISHING", "[1,2]"],
+      ["backend_feedback", "RETURNING", null],
+      ["backend_feedback", "RETURNING", "\"string\""],
+    ];
+    for (const [kind, unitState, raw] of cases) {
+      const db = await seedUnit([{ effectId: "eff-m", kind, mandatory: true, request: {} }], { unitState });
+      await db.query("UPDATE swarmx_effects SET request_json = ? WHERE effect_id = 'eff-m'", [raw]);
+      const ports = fakePorts({ cells: [{ status: "open" }] });
+      const effect = await runWorkUnitEffect(db, { effectId: "eff-m", host: HOST, ports });
+      expect(effect.state).toBe("failed_mandatory");
+      expect(ports.order).toEqual([]);
+    }
+  });
+
+  test("missing cell_id fails backend_complete deterministically without calling ports", async () => {
+    const db = await seedUnit([{ effectId: "eff-c", kind: "backend_complete", mandatory: true, request: COMPLETE_ARGS }]);
+    await db.query("UPDATE swarmx_work_units SET cell_id = NULL WHERE id = 'unit-1'");
+    const ports = fakePorts();
+    const effect = await runWorkUnitEffect(db, { effectId: "eff-c", host: HOST, ports });
+    expect(effect.state).toBe("failed_mandatory");
+    expect(JSON.parse(effect.error_json!)).toEqual({ message: "WorkUnit has no cell_id to complete" });
+    expect(ports.order).toEqual([]);
   });
 
   test("feedbackUsesOperationIdAfterUnknown", async () => {
@@ -473,7 +499,7 @@ describe("work unit effect runner", () => {
       { effectId: "e-cons", kind: "consolidate", mandatory: false, request: { projectKey: "proj", epicId: "epic-9", unitId: "unit-1" } },
       { effectId: "e-complete", kind: "backend_complete", mandatory: true, request: COMPLETE_ARGS },
     ]);
-    const ports = fakePorts({ cells: [{ status: "closed", receiptHash: RECEIPT_HASH }], tool: async () => ({ id: "c" }) });
+    const ports = fakePorts({ cells: [{ status: "closed", completionOperationId: "e-complete" }], tool: async () => ({ id: "c" }) });
     const result = await drainWorkUnitEffects(db, { unitId: "unit-1", host: HOST, ports });
     expect(ports.order).toEqual(["read:proj:cell-1", "consolidate", "tool:hive_create", "tool:hive_create", "tool:hive_start"]);
     expect(ports.calls.map((call) => call.args)).toEqual([{ t: 2, operation_id: "e-f2" }, { t: 10, operation_id: "e-f10" }, { s: 1 }]);
@@ -487,7 +513,7 @@ describe("work unit effect runner", () => {
       { effectId: "e-cons", kind: "consolidate", mandatory: false, request: {} },
       { effectId: "e-start", kind: "hive_start", mandatory: false, request: {} },
     ]);
-    const ports = fakePorts({ cells: [{ status: "closed", receiptHash: "mismatch" }] });
+    const ports = fakePorts({ cells: [{ status: "closed", completionOperationId: "other-identity" }] });
     const result = await drainWorkUnitEffects(db, { unitId: "unit-1", host: HOST, ports });
     expect(ports.order).toEqual(["read:proj:cell-1"]);
     const states = Object.fromEntries(result.effects.map((effect) => [effect.effect_id, effect.state]));
@@ -501,7 +527,7 @@ describe("work unit effect runner", () => {
       { effectId: "e-start", kind: "hive_start", mandatory: false, request: {} },
     ]);
     const ports = fakePorts({
-      cells: [{ status: "closed", receiptHash: RECEIPT_HASH }],
+      cells: [{ status: "closed", completionOperationId: "e-complete" }],
       tool: async () => { throw new Error("hive down"); },
     });
     const result = await drainWorkUnitEffects(db, { unitId: "unit-1", host: HOST, ports });
