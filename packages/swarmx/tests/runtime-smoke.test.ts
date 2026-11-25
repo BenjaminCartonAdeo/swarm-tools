@@ -39,7 +39,8 @@ import {
 import { UnsupportedToolError, type CellMarker } from "../src/types";
 import { createMission, getMission, listUnits } from "../src/workunit/mission";
 import type { MissionActor } from "../src/workunit/commands";
-import { AssignmentMismatchError, BudgetGateError, getWorkUnit } from "../src/workunit/store";
+import { AssignmentMismatchError, BudgetGateError, getWorkUnit, MissionNotDrainedError } from "../src/workunit/store";
+import { acquireWorkUnitLock, CLEANUP_LOCK_STALE_MS, cleanupLockName } from "../src/workunit/locks";
 import {
   createFakeContext,
   type FakeAgentInfo,
@@ -1632,6 +1633,196 @@ describe("mission gate → settle sequence", () => {
       ),
     ).rejects.toThrow(/cleanup backend boom/);
     expect(await rig.ctx.storage.get("cleanup-claim:adeo")).toBeUndefined();
+  });
+
+  test("native cleanup holds a SQL lock that blocks dispatch until release", async () => {
+    const projectPath = await realpath(process.cwd());
+    const native = await createNativeMission();
+    await native.runtime.commands.assignCell(nativeCoordinator, {
+      missionPk: native.missionPk,
+      cellId: "cell-cleanup-lock",
+      agent: "swarm/swarm-worker",
+    });
+    let announceBackend!: () => void;
+    let finishBackend!: () => void;
+    const backendStarted = new Promise<void>((resolve) => { announceBackend = resolve; });
+    const backendGate = new Promise<void>((resolve) => { finishBackend = resolve; });
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workUnit: native.runtime,
+      payloadFor: async (name) => {
+        if (name === "swarm_worktree_cleanup") {
+          announceBackend();
+          await backendGate;
+        }
+        return { ok: true };
+      },
+    });
+
+    const cleanup = rig.tools.get("swarm_worktree_cleanup")?.execute(
+      { project_path: projectPath, task_id: "cell-cleanup-lock" },
+      toolContext(),
+    );
+    await backendStarted;
+    expect((await native.runtime.db.query("SELECT name FROM swarmx_locks WHERE name = ?", [cleanupLockName(PROJECT)])).rows)
+      .toEqual([{ name: "cleanup:adeo" }]);
+    expect(rig.ctx.storage.map.has("cleanup-claim:adeo")).toBe(false);
+    await expect(rig.tools.get("swarm_worktree_cleanup")?.execute(
+      { project_path: projectPath, task_id: "cell-cleanup-lock" },
+      toolContext("swarm/swarm-coordinator", "call-contending-cleanup"),
+    )).rejects.toThrow(/cleanup.*progress|cleanup.*already in progress/i);
+
+    await expect(rig.before(workerDispatchPayload("cell-cleanup-lock", "call-blocked-by-cleanup")))
+      .rejects.toThrow(/cleanup.*progress|cleanup_in_progress/i);
+    finishBackend();
+    await cleanup;
+    expect((await native.runtime.db.query("SELECT name FROM swarmx_locks WHERE name = ?", [cleanupLockName(PROJECT)])).rows)
+      .toEqual([]);
+    await expect(rig.before(workerDispatchPayload("cell-cleanup-lock", "call-after-cleanup"))).resolves.toBeUndefined();
+  });
+
+  test("native dispatch ignores an expired SQL cleanup lock and cleanup never touches KV", async () => {
+    const native = await createNativeMission();
+    await native.runtime.commands.assignCell(nativeCoordinator, {
+      missionPk: native.missionPk,
+      cellId: "cell-expired-cleanup",
+      agent: "swarm/swarm-worker",
+    });
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime });
+    await rig.ctx.storage.set("cleanup-claim:adeo", { taskID: "*", at: Date.now() });
+    await acquireWorkUnitLock(native.runtime.db, {
+      name: cleanupLockName(PROJECT),
+      token: "expired-cleanup",
+      ownerSession: SESSION,
+      now: 0,
+      staleAfterMs: CLEANUP_LOCK_STALE_MS,
+    });
+
+    await expect(rig.before(workerDispatchPayload("cell-expired-cleanup", "call-after-lock-expiry")))
+      .resolves.toBeUndefined();
+    expect(await rig.ctx.storage.get("cleanup-claim:adeo")).toEqual({ taskID: "*", at: expect.any(Number) });
+  });
+
+  test("a stale native cleanup owner cannot release its replacement lock", async () => {
+    const projectPath = await realpath(process.cwd());
+    const native = await createNativeMission();
+    let announceBackend!: () => void;
+    let finishBackend!: () => void;
+    const backendStarted = new Promise<void>((resolve) => { announceBackend = resolve; });
+    const backendGate = new Promise<void>((resolve) => { finishBackend = resolve; });
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workUnit: native.runtime,
+      payloadFor: async (name) => {
+        if (name === "swarm_worktree_cleanup") {
+          announceBackend();
+          await backendGate;
+        }
+        return { ok: true };
+      },
+    });
+    const cleanup = rig.tools.get("swarm_worktree_cleanup")?.execute(
+      { project_path: projectPath, task_id: "cell-stale-owner" },
+      toolContext(),
+    );
+    await backendStarted;
+    await native.runtime.db.query("UPDATE swarmx_locks SET acquired_at = 0 WHERE name = ?", [cleanupLockName(PROJECT)]);
+    const replacement = await acquireWorkUnitLock(native.runtime.db, {
+      name: cleanupLockName(PROJECT),
+      token: "replacement-owner",
+      ownerSession: "replacement-session",
+      now: CLEANUP_LOCK_STALE_MS,
+      staleAfterMs: CLEANUP_LOCK_STALE_MS,
+    });
+    expect(replacement).toEqual({ acquired: true, fence: 2 });
+
+    finishBackend();
+    await cleanup;
+    expect((await native.runtime.db.query("SELECT token, fence FROM swarmx_locks WHERE name = ?", [cleanupLockName(PROJECT)])).rows)
+      .toEqual([{ token: "replacement-owner", fence: 2 }]);
+  });
+
+  test("native reset cancels through WorkUnit and preserves terminal unit history", async () => {
+    const native = await createNativeMission();
+    const reserved = await native.runtime.commands.reserve(nativeCoordinator, {
+      project: PROJECT,
+      missionId: `work-${SESSION}`,
+      workerAgent: "swarm/swarm-worker",
+      callId: "call-reset-history",
+      dispatchToken: "token-reset-history",
+      cellId: "cell-reset-history",
+      budgetCharge: 1,
+      idemKey: "reset-history",
+      attemptNo: 1,
+    });
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime });
+
+    await rig.tools.get("swarm_reset")?.execute({}, toolContext());
+
+    expect(await getMission(native.runtime.db, PROJECT, SESSION)).toMatchObject({ state: "CANCELLED" });
+    expect(await listUnits(native.runtime.db, native.missionPk)).toMatchObject([
+      { id: reserved.id, state: "CANCELLED", cell_id: "cell-reset-history" },
+    ]);
+    expect(await native.runtime.db.query("SELECT COUNT(id) AS count FROM swarmx_missions WHERE id = ?", [native.missionPk]))
+      .toMatchObject({ rows: [{ count: 1 }] });
+  });
+
+  test("native reset refuses a non-owner session and leaves the mission open", async () => {
+    const native = await createNativeMission();
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime });
+
+    await expect(rig.tools.get("swarm_reset")?.execute({}, toolContext("swarm/swarm-coordinator", "call-wrong-reset-owner", "ses-other")))
+      .rejects.toThrow(/native mission is not available|does not own mission/i);
+    expect(await getMission(native.runtime.db, PROJECT, SESSION)).toMatchObject({ state: "OPEN" });
+  });
+
+  test("native reset leaves the mission closing when a mandatory effect has not drained", async () => {
+    const native = await createNativeMission();
+    const reserved = await native.runtime.commands.reserve(nativeCoordinator, {
+      project: PROJECT,
+      missionId: `work-${SESSION}`,
+      workerAgent: "swarm/swarm-worker",
+      callId: "call-reset-drain",
+      dispatchToken: "token-reset-drain",
+      cellId: "cell-reset-drain",
+      budgetCharge: 1,
+      idemKey: "reset-drain",
+      attemptNo: 1,
+    });
+    const bound = await native.runtime.commands.settleDispatch(nativeCoordinator, {
+      unitId: reserved.id,
+      unitFence: reserved.fence,
+      outcome: { ok: true, workerSessionId: "ses-reset-worker", workerAgent: "swarm/swarm-worker" },
+    });
+    const submitted = await native.runtime.commands.submit(
+      { kind: "worker", sessionId: "ses-reset-worker" },
+      { unitId: bound.id, evidence: { filesTouched: ["src/a.ts"], summary: "done" }, diff: "diff" },
+    );
+    await native.runtime.commands.review(nativeCoordinator, {
+      unitId: submitted.id,
+      status: "approved",
+      summary: "done",
+      receipt: { filesTouched: ["src/a.ts"], passed: true },
+      projectPath: process.cwd(),
+    });
+    expect(await getWorkUnit(native.runtime.db, reserved.id)).toMatchObject({ state: "PUBLISHING" });
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime });
+
+    await expect(rig.tools.get("swarm_reset")?.execute({}, toolContext())).rejects.toBeInstanceOf(MissionNotDrainedError);
+
+    expect(await getMission(native.runtime.db, PROJECT, SESSION)).toMatchObject({ state: "CLOSING", close_intent: "cancel" });
+    expect(await getWorkUnit(native.runtime.db, reserved.id)).toMatchObject({ state: "PUBLISHING" });
+  });
+
+  test("explicit legacy runtime override keeps destructive reset semantics", async () => {
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: undefined });
+    await rig.tools.get("swarm_set_budget")?.execute({ mode: "dev", max_spawns: 2 }, toolContext());
+
+    await rig.tools.get("swarm_reset")?.execute({}, toolContext());
+
+    expect(await readMission(missionStore(rig.ctx), PROJECT, SESSION)).toBeUndefined();
   });
 
   test("an inactive mission with unrevoked worker attempts cannot cleanup its worktrees", async () => {

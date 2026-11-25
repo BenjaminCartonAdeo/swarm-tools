@@ -16,7 +16,7 @@
  * in-process handler (typed `LocalToolError` when a dependency is missing).
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { lstat, realpath, stat } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
@@ -69,6 +69,12 @@ import { legacyStoreOf, type LegacyMissionStateStore } from "./state";
 import { getMission, listUnits } from "./workunit/mission";
 import type { Mission, WorkUnit } from "./workunit/schema";
 import { effectiveCompletionFiles, MissionNotDrainedError } from "./workunit/store";
+import {
+  acquireWorkUnitLock,
+  CLEANUP_LOCK_STALE_MS,
+  cleanupLockName,
+  releaseWorkUnitLock,
+} from "./workunit/locks";
 import { emitDecision, emitViolation } from "./session-events";
 import {
   LocalToolError,
@@ -2154,6 +2160,17 @@ async function runReset(
   runtime: SwarmxRuntime,
   context: ToolExecuteContextLike,
 ): Promise<ToolExecuteResult> {
+  if (runtime.workUnit !== undefined) {
+    const scope = await requireWorkUnitMissionScope("swarm_reset", runtime, context);
+    await scope.runtime.commands.cancel(
+      { kind: "coordinator", sessionId: scope.sessionID },
+      { missionPk: scope.mission.id },
+    );
+    return {
+      output: { sessionID: scope.sessionID, reset: true },
+      content: `Mission ${scope.sessionID} reset. Call swarm_set_budget to start a new mission.`,
+    };
+  }
   const { store, projectID, sessionID } = await requireMissionScope("swarm_reset", runtime, context);
   await resetMission(store, { projectID, sessionID });
   return {
@@ -5208,9 +5225,26 @@ async function runWorktreeCleanup(
       ? "*"
       : requireStringInput("swarm_worktree_cleanup", normalized, "task_id");
   const claimKey = `cleanup-claim:${projectID}`;
-  // Short-lived marker: gateBefore ignores it after 5 minutes, so a crash
-  // fails closed only briefly. The key is reused per project.
-  await store.storage.set(claimKey, { taskID: claimTaskID, at: Date.now() });
+  const native = runtime.workUnit;
+  let lockToken: string | undefined;
+  let lockFence: number | undefined;
+  if (native === undefined) {
+    // Explicit legacy runtimes keep the pre-WorkUnit claim until Task 13d3e.
+    await store.storage.set(claimKey, { taskID: claimTaskID, at: Date.now() });
+  } else {
+    lockToken = randomUUID();
+    const acquired = await acquireWorkUnitLock(native.db, {
+      name: cleanupLockName(projectID),
+      token: lockToken,
+      ownerSession: sessionID,
+      now: Date.now(),
+      staleAfterMs: CLEANUP_LOCK_STALE_MS,
+    });
+    if (!acquired.acquired) {
+      throw new LocalToolError("swarm_worktree_cleanup", "conflict", "another worktree cleanup is already in progress");
+    }
+    lockFence = acquired.fence;
+  }
   try {
     const missions = (await store.list())
       .filter((mission) => mission.projectID === projectID)
@@ -5232,7 +5266,15 @@ async function runWorktreeCleanup(
     }
     return await run();
   } finally {
-    await store.storage.remove(claimKey).catch(() => undefined);
+    if (native === undefined) {
+      await store.storage.remove(claimKey).catch(() => undefined);
+    } else if (lockToken !== undefined && lockFence !== undefined) {
+      await releaseWorkUnitLock(native.db, {
+        name: cleanupLockName(projectID),
+        token: lockToken,
+        fence: lockFence,
+      }).catch(() => false);
+    }
   }
 }
 

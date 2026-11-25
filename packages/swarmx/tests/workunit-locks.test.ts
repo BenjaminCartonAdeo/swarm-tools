@@ -45,6 +45,17 @@ describe("WorkUnit SQL lock", () => {
     expect(reclaimed).toEqual({ acquired: true, fence: 2 });
   });
 
+  test("lock is stale and reclaimable at the exact stale boundary", async () => {
+    await acquireWorkUnitLock(db, { name, token: "a", ownerSession: "s1", now: 0, staleAfterMs: CLEANUP_LOCK_STALE_MS });
+    expect(await isWorkUnitLockActive(db, { name, now: CLEANUP_LOCK_STALE_MS, staleAfterMs: CLEANUP_LOCK_STALE_MS })).toBe(false);
+    expect(await acquireWorkUnitLock(db, { name, token: "b", ownerSession: "s2", now: CLEANUP_LOCK_STALE_MS, staleAfterMs: CLEANUP_LOCK_STALE_MS })).toEqual({ acquired: true, fence: 2 });
+  });
+
+  test("releasing an unheld lock is a no-op", async () => {
+    expect(await releaseWorkUnitLock(db, { name, token: "missing", fence: 1 })).toBe(false);
+    expect(await isWorkUnitLockActive(db, { name, now: 1, staleAfterMs: CLEANUP_LOCK_STALE_MS })).toBe(false);
+  });
+
   test("lock stale owner release is a lost-ownership no-op", async () => {
     await acquireWorkUnitLock(db, { name, token: "a", ownerSession: "s1", now: 0, staleAfterMs: CLEANUP_LOCK_STALE_MS });
     await acquireWorkUnitLock(db, { name, token: "b", ownerSession: "s2", now: CLEANUP_LOCK_STALE_MS + 1, staleAfterMs: CLEANUP_LOCK_STALE_MS });

@@ -39,6 +39,7 @@ import { isSwarmWorkerAgentID } from "./roster";
 import type { WorkUnitRuntime } from "./workunit/ports";
 import { getMission } from "./workunit/mission";
 import { listUnits } from "./workunit/mission";
+import { CLEANUP_LOCK_STALE_MS, cleanupLockName, isWorkUnitLockActive } from "./workunit/locks";
 
 /** Name of the V2 tool that dispatches a subtask to an agent. */
 export const DISPATCH_TOOL_NAME = "subagent";
@@ -471,13 +472,11 @@ async function gateBeforeWorkUnit(
     );
   }
   const marker = extractCellMarker(event.input);
-  const cleanupClaim = asRecord(await legacyStore.storage.get(`cleanup-claim:${projectID}`));
-  if (
-    cleanupClaim !== undefined &&
-    typeof cleanupClaim.at === "number" &&
-    Date.now() - cleanupClaim.at < 5 * 60_000 &&
-    (cleanupClaim.taskID === "*" || cleanupClaim.taskID === marker.cellID)
-  ) {
+  if (await isWorkUnitLockActive(workUnit.db, {
+    name: cleanupLockName(projectID),
+    now: Date.now(),
+    staleAfterMs: CLEANUP_LOCK_STALE_MS,
+  })) {
     throw new DispatchGateError(
       "cleanup_in_progress",
       marker.cellID,
