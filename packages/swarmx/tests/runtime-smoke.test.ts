@@ -629,11 +629,47 @@ describe("mission gate → settle sequence", () => {
     const payload = workerDispatchPayload("cell-replay", "call-native-replay");
 
     await rig.before(payload);
+    const token = extractCellMarker(payload.input).dispatchToken;
     await rig.before(payload);
 
     const units = await listUnits(native.runtime.db, native.missionPk);
     expect(units).toHaveLength(1);
-    expect(units[0]).toMatchObject({ state: "RESERVED", call_id: "call-native-replay" });
+    expect(units[0]).toMatchObject({
+      state: "RESERVED",
+      call_id: "call-native-replay",
+      dispatch_token: token,
+      attempt_no: 1,
+      budget_charge: 1,
+      idem_key: "dispatch:adeo:ses-1:call-native-replay",
+    });
+    expect(units.reduce((sum, unit) => sum + (unit.budget_charge ?? 0), 0)).toBe(1);
+  });
+
+  test("concurrent native bind returns the same bound unit for the same worker", async () => {
+    const native = await createNativeMission();
+    await native.runtime.commands.assignCell(nativeCoordinator, {
+      missionPk: native.missionPk,
+      cellId: "cell-race",
+      agent: "swarm/swarm-worker",
+    });
+    const rig = await createRig({ agents: GATE_AGENTS, workUnit: native.runtime });
+    await rig.before(workerDispatchPayload("cell-race", "call-race"));
+    const [unit] = await listUnits(native.runtime.db, native.missionPk);
+    const args = { unitId: unit!.id, unitFence: unit!.fence };
+    const [a, b] = await Promise.all([
+      native.runtime.commands.settleDispatch(nativeCoordinator, {
+        ...args,
+        outcome: { ok: true, workerSessionId: "ses-race", workerAgent: "swarm/swarm-worker" },
+      }),
+      native.runtime.commands.bindWorker(nativeCoordinator, {
+        ...args, workerSessionId: "ses-race", workerAgent: "swarm/swarm-worker",
+      }),
+    ]);
+    expect(a).toMatchObject({ id: unit!.id, state: "BOUND", worker_session: "ses-race" });
+    expect(b).toMatchObject({ id: unit!.id, state: "BOUND", worker_session: "ses-race" });
+    await expect(native.runtime.commands.bindWorker(nativeCoordinator, {
+      ...args, workerSessionId: "ses-other", workerAgent: "swarm/swarm-worker",
+    })).rejects.toThrow();
   });
 
   test("WorkUnit assignment and budget gates reject invalid dispatches", async () => {

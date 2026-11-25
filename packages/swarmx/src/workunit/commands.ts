@@ -221,10 +221,22 @@ export function createMissionCommands(db: DatabaseAdapter, opts: MissionCommands
 
   async function bindWorker(actor: MissionActor, input: { unitId: string; unitFence: number; workerSessionId: string; workerAgent: string }) {
     await ownedUnit(actor, input.unitId);
-    return bindWorkUnit(db, {
-      unitId: input.unitId, expectedState: "RESERVED", unitFence: input.unitFence,
-      workerSessionId: input.workerSessionId, workerAgent: input.workerAgent,
-    });
+    try {
+      return await bindWorkUnit(db, {
+        unitId: input.unitId, expectedState: "RESERVED", unitFence: input.unitFence,
+        workerSessionId: input.workerSessionId, workerAgent: input.workerAgent,
+      });
+    } catch (error) {
+      if (!(error instanceof FenceConflictError)) throw error;
+      // A concurrent bind for the exact same worker identity already won: idempotent success.
+      const current = await getWorkUnit(db, input.unitId);
+      if (
+        current?.state === "BOUND" &&
+        current.worker_session === input.workerSessionId &&
+        current.worker_agent === input.workerAgent
+      ) return current;
+      throw error;
+    }
   }
 
   async function beginReview(actor: MissionActor, input: { unitId: string }): Promise<WorkUnit> {
