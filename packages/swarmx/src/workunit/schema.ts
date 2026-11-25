@@ -56,6 +56,7 @@ export interface Mission {
   project: string;
   session_id: string;
   mission_id: string;
+  epic_id: string | null;
   state: MissionState;
   close_intent: CloseIntent | null;
   fence: number;
@@ -119,6 +120,7 @@ const schemaStatements = [
     project TEXT NOT NULL,
     session_id TEXT NOT NULL,
     mission_id TEXT NOT NULL,
+    epic_id TEXT,
     state TEXT NOT NULL CHECK (state IN ('OPEN', 'CLOSING', 'FINISHED', 'CANCELLED', 'ABANDONED')),
     close_intent TEXT CHECK (close_intent IS NULL OR close_intent IN ('finish', 'cancel', 'abandon')),
     fence INTEGER NOT NULL DEFAULT 0,
@@ -203,5 +205,12 @@ const schemaStatements = [
 export async function ensureWorkUnitSchema(db: DatabaseAdapter): Promise<void> {
   for (const statement of schemaStatements) {
     await db.exec(statement);
+  }
+  const missionColumns = await db.query("PRAGMA table_info(swarmx_missions)");
+  const hasEpicId = missionColumns.rows.some(
+    (row) => typeof row === "object" && row !== null && "name" in row && Reflect.get(row, "name") === "epic_id",
+  );
+  if (!hasEpicId) {
+    await db.exec("ALTER TABLE swarmx_missions ADD COLUMN epic_id TEXT");
   }
 }
