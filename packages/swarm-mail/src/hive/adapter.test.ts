@@ -66,6 +66,52 @@ describe("Beads Adapter", () => {
     ).rejects.toMatchObject({ name: "OperationIdConflictError" });
   });
 
+  test("manual close vs identity close race: one event and a coherent identity", async () => {
+    for (let round = 0; round < 6; round++) {
+      const cell = await adapter.createCell(projectKey, { title: `Mixed race ${round}`, type: "task" });
+      const identity = `mixed-${round}`;
+      const calls = [
+        adapter.closeCell(projectKey, cell.id, "manual"),
+        adapter.closeCell(projectKey, cell.id, "identity", { completion_operation_id: identity }),
+      ];
+      if (round % 2 === 1) calls.reverse();
+      const [manualOrIdentity, other] = await Promise.allSettled(calls);
+      const results = round % 2 === 1 ? [other, manualOrIdentity] : [manualOrIdentity, other];
+      const [manual, identityClose] = results;
+      const final = await adapter.getCell(projectKey, cell.id);
+      const events = await db.query<{ data: string }>("SELECT data FROM events WHERE type = 'cell_closed'");
+      expect(events.rows.filter((row) => JSON.parse(row.data).cell_id === cell.id)).toHaveLength(1);
+      expect(manual.status).toBe("fulfilled");
+      if (final?.completion_operation_id === null || final?.completion_operation_id === undefined) {
+        expect(final?.closed_reason).toBe("manual");
+        expect(identityClose.status).toBe("rejected");
+        expect((identityClose as PromiseRejectedResult).reason).toMatchObject({ name: "OperationIdConflictError" });
+      } else {
+        expect(final.completion_operation_id).toBe(identity);
+        expect(final.closed_reason).toBe("identity");
+        expect(identityClose.status).toBe("fulfilled");
+      }
+    }
+  });
+
+  test("atomic close updates blocked cache and dirty marker", async () => {
+    const blocker = await adapter.createCell(projectKey, { title: "Blocker", type: "task" });
+    const blocked = await adapter.createCell(projectKey, { title: "Blocked", type: "task" });
+    await adapter.addDependency(projectKey, blocked.id, blocker.id, "blocks");
+    const before = await db.query<{ blocker_ids: string }>(
+      "SELECT blocker_ids FROM blocked_beads_cache WHERE cell_id = ?", [blocked.id],
+    );
+    expect(JSON.parse(before.rows[0].blocker_ids)).toEqual([blocker.id]);
+    await db.query("DELETE FROM dirty_beads WHERE cell_id = ?", [blocker.id]);
+
+    await adapter.closeCell(projectKey, blocker.id, "done", { completion_operation_id: "cache-op" });
+
+    const after = await db.query("SELECT cell_id FROM blocked_beads_cache WHERE cell_id = ?", [blocked.id]);
+    expect(after.rows).toHaveLength(0);
+    const dirty = await db.query("SELECT cell_id FROM dirty_beads WHERE cell_id = ?", [blocker.id]);
+    expect(dirty.rows).toHaveLength(1);
+  });
+
   test("concurrent different-identity closes: one event, one winner, loser conflicts", async () => {
     const cell = await adapter.createCell(projectKey, { title: "Race close", type: "task" });
     const results = await Promise.allSettled(

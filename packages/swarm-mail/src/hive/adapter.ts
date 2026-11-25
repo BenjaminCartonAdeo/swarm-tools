@@ -37,7 +37,7 @@ import {
   readCellEvents,
   replayCellEvents,
 } from "./store.js";
-import { OperationIdConflictError } from "./store.js";
+import { CellAlreadyClosedError, OperationIdConflictError } from "./store.js";
 
 import {
   getCell,
@@ -247,6 +247,8 @@ export function createHiveAdapter(
       } as any;
 
       await appendCellEvent(event, projectPath, db).catch(async (error: unknown) => {
+        // Manual close of an already-closed cell (incl. lost race): no second event, no-op.
+        if (!completionOperationId && error instanceof CellAlreadyClosedError) return;
         if (!completionOperationId || !(error instanceof OperationIdConflictError)) throw error;
         // Lost a concurrent close: same identity is an idempotent success, otherwise a definite conflict.
         const current = await getCell(db, projectKeyParam, cellId);

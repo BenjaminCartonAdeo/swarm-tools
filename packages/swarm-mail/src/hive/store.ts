@@ -144,48 +144,8 @@ export async function appendCellEventDrizzle(
     return { ...event, id: created.id, sequence };
   }
 
-  const completionOperationId = (event as { completion_operation_id?: unknown }).completion_operation_id;
-  if (type === "cell_closed" && typeof completionOperationId === "string" && completionOperationId.length > 0) {
-    // Atomic, conflict-safe identity close: the event insert and the beads
-    // update share one batch (single BEGIN/COMMIT) and the same guard
-    // `completion_operation_id IS NULL`. A losing concurrent close inserts no
-    // event and updates no row, so no orphan cell_closed event can exist.
-    const cellId = event.cell_id;
-    const data = JSON.stringify(rest);
-    const guardedEvent = db.run(sql`
-      INSERT INTO events (type, project_key, timestamp, data)
-      SELECT ${type}, ${project_key}, ${timestamp}, ${data}
-      WHERE EXISTS (SELECT 1 FROM beads WHERE id = ${cellId} AND completion_operation_id IS NULL)
-    `);
-    const result = (event as { result?: string | null }).result ?? null;
-    const guardedUpdate = db.run(sql`
-      UPDATE beads SET status = 'closed', closed_at = ${timestamp}, closed_reason = ${(event as { reason?: string }).reason ?? null},
-        updated_at = ${timestamp}, completion_operation_id = ${completionOperationId},
-        result = COALESCE(${result}, result), result_at = CASE WHEN ${result} IS NULL THEN result_at ELSE ${timestamp} END
-      WHERE id = ${cellId} AND completion_operation_id IS NULL
-    `);
-    let batchResult: Array<{ rowsAffected: number; lastInsertRowid?: bigint | number }>;
-    try {
-      batchResult = (await db.batch([guardedEvent, guardedUpdate])) as unknown as typeof batchResult;
-    } catch (error) {
-      if (isOperationIdUniqueViolation(error, "beads", "completion_operation_id")) {
-        throw new OperationIdConflictError(completionOperationId, error, "beads.completion");
-      }
-      throw error;
-    }
-    const inserted = batchResult[0];
-    if (!inserted || inserted.rowsAffected === 0) {
-      throw new OperationIdConflictError(
-        completionOperationId,
-        new Error(`cell ${cellId} already has a completion identity`),
-        "beads.completion",
-      );
-    }
-    const id = Number(inserted.lastInsertRowid);
-    const sequence = await resolveSequence(db, id, null);
-    // Remaining side effects (blocked cache, dirty marker); the identity guard keeps this idempotent.
-    await updateProjectionsDrizzle(db, { ...event, id, sequence } as any);
-    return { ...event, id, sequence };
+  if (type === "cell_closed") {
+    return appendGuardedCellClosed(db, event, rest);
   }
 
   // Insert event
@@ -211,6 +171,94 @@ export async function appendCellEventDrizzle(
   // Update materialized views based on event type
   await updateProjectionsDrizzle(db, { ...event, id, sequence } as any);
 
+  return { ...event, id, sequence };
+}
+
+/**
+ * Thrown when a cell_closed event targets a cell that is already closed.
+ * The whole batch was a no-op: no event, no projection change.
+ */
+export class CellAlreadyClosedError extends Error {
+  readonly cellId: string;
+  constructor(cellId: string) {
+    super(`[BeadsStore] cell already closed: ${cellId}`);
+    this.name = "CellAlreadyClosedError";
+    this.cellId = cellId;
+  }
+}
+
+/**
+ * Atomic, conflict-safe close. One db.batch (single BEGIN/COMMIT) holds the
+ * guarded event insert, the guarded beads update, blocked-cache bookkeeping
+ * and the dirty marker. Guard: cell is open (`status <> 'closed'`) and, for an
+ * identity close, `completion_operation_id IS NULL`. A losing concurrent close
+ * inserts no event and changes nothing.
+ */
+async function appendGuardedCellClosed(
+  db: SwarmDb,
+  event: CellEvent,
+  rest: Record<string, unknown>,
+): Promise<CellEvent & { id: number; sequence: number }> {
+  const { type, project_key, timestamp } = event;
+  const cellId = event.cell_id;
+  const rawIdentity = (event as { completion_operation_id?: unknown }).completion_operation_id;
+  const identity = typeof rawIdentity === "string" && rawIdentity.length > 0 ? rawIdentity : null;
+  const data = JSON.stringify(rest);
+  const reason = (event as { reason?: string | null }).reason ?? null;
+  const result = (event as { result?: string | null }).result ?? null;
+  const identityGuard = identity === null ? sql`` : sql` AND completion_operation_id IS NULL`;
+  const closedByThisEvent = sql`EXISTS (SELECT 1 FROM beads WHERE id = ${cellId} AND status = 'closed' AND closed_at = ${timestamp})`;
+
+  const statements = [
+    db.run(sql`
+      INSERT INTO events (type, project_key, timestamp, data)
+      SELECT ${type}, ${project_key}, ${timestamp}, ${data}
+      WHERE EXISTS (SELECT 1 FROM beads WHERE id = ${cellId} AND status <> 'closed'${identityGuard})
+    `),
+    db.run(sql`
+      UPDATE beads SET status = 'closed', closed_at = ${timestamp}, closed_reason = ${reason},
+        updated_at = ${timestamp}, completion_operation_id = COALESCE(${identity}, completion_operation_id),
+        result = COALESCE(${result}, result),
+        result_at = CASE WHEN ${result} IS NULL THEN result_at ELSE ${timestamp} END
+      WHERE id = ${cellId} AND status <> 'closed'${identityGuard}
+    `),
+    // Blocked cache: a cell closed by this event is no longer an open blocker.
+    db.run(sql`
+      UPDATE blocked_beads_cache
+      SET blocker_ids = (
+            SELECT json_group_array(value) FROM json_each(blocked_beads_cache.blocker_ids) WHERE value <> ${cellId}
+          ),
+          updated_at = ${timestamp}
+      WHERE EXISTS (SELECT 1 FROM json_each(blocked_beads_cache.blocker_ids) WHERE value = ${cellId})
+        AND ${closedByThisEvent}
+    `),
+    db.run(sql`DELETE FROM blocked_beads_cache WHERE blocker_ids = '[]' AND ${closedByThisEvent}`),
+    db.run(sql`
+      INSERT INTO dirty_beads (cell_id, marked_at) SELECT ${cellId}, ${Date.now()} WHERE ${closedByThisEvent}
+      ON CONFLICT (cell_id) DO UPDATE SET marked_at = excluded.marked_at
+    `),
+  ];
+
+  let batchResult: Array<{ rowsAffected: number; lastInsertRowid?: bigint | number }>;
+  try {
+    batchResult = (await db.batch(statements as any)) as unknown as typeof batchResult;
+  } catch (error) {
+    if (identity !== null && isOperationIdUniqueViolation(error, "beads", "completion_operation_id")) {
+      throw new OperationIdConflictError(identity, error, "beads.completion");
+    }
+    throw error;
+  }
+  const inserted = batchResult[0];
+  if (!inserted || inserted.rowsAffected === 0) {
+    if (identity === null) throw new CellAlreadyClosedError(cellId);
+    throw new OperationIdConflictError(
+      identity,
+      new Error(`cell ${cellId} already closed or already has a completion identity`),
+      "beads.completion",
+    );
+  }
+  const id = Number(inserted.lastInsertRowid);
+  const sequence = await resolveSequence(db, id, null);
   return { ...event, id, sequence };
 }
 
