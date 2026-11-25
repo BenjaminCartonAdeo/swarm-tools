@@ -736,6 +736,92 @@ export const beadsOperationIdMigration: Migration = {
   `,
 };
 
+const V12_CELLS_COLUMNS = `${V11_CELLS_COLUMNS}, completion_operation_id`;
+
+/** Build the LibSQL cells view + INSTEAD OF triggers for an explicit, stable column order. */
+function libsqlCellsViewSql(columns: string): string {
+  const names = columns.split(",").map((name) => name.trim()).filter((name) => name.length > 0);
+  const values = names.map((name) => `NEW.${name}`).join(", ");
+  const updates = names.filter((name) => name !== "id").map((name) => `${name} = NEW.${name}`).join(",\n        ");
+  return `
+    CREATE VIEW cells AS SELECT ${names.join(", ")} FROM beads;
+
+    CREATE TRIGGER cells_insert
+      INSTEAD OF INSERT ON cells
+      FOR EACH ROW
+    BEGIN
+      INSERT INTO beads (${names.join(", ")}) VALUES (${values});
+    END;
+
+    CREATE TRIGGER cells_update
+      INSTEAD OF UPDATE ON cells
+      FOR EACH ROW
+    BEGIN
+      UPDATE beads SET
+        ${updates}
+      WHERE id = NEW.id;
+    END;
+
+    CREATE TRIGGER cells_delete
+      INSTEAD OF DELETE ON cells
+      FOR EACH ROW
+    BEGIN
+      DELETE FROM beads WHERE id = OLD.id;
+    END;
+  `;
+}
+
+/**
+ * Migration v12: completion identity (LibSQL).
+ *
+ * Adds nullable `completion_operation_id` recorded when a cell is closed by an
+ * idempotent completion. A partial unique index guarantees one identity never
+ * closes two cells. The cells view/triggers are rebuilt with an explicit column
+ * order (v11 columns first), so readers selecting named columns keep working.
+ *
+ * Rollback: drop index, drop view (and its triggers), drop the column, then
+ * rebuild the v11 view/triggers with the v11 column order.
+ */
+export const beadsCompletionOperationIdMigrationLibSQL: Migration = {
+  version: 12,
+  description: "Add nullable unique completion_operation_id to beads (LibSQL)",
+  up: `
+    DROP VIEW IF EXISTS cells;
+    ALTER TABLE beads ADD COLUMN completion_operation_id TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_beads_completion_operation_id
+      ON beads(completion_operation_id) WHERE completion_operation_id IS NOT NULL;
+    ${libsqlCellsViewSql(V12_CELLS_COLUMNS)}
+  `,
+  down: `
+    DROP INDEX IF EXISTS idx_beads_completion_operation_id;
+    DROP VIEW IF EXISTS cells;
+    ALTER TABLE beads DROP COLUMN completion_operation_id;
+    ${libsqlCellsViewSql(V11_CELLS_COLUMNS)}
+  `,
+};
+
+/** Migration v12 (PGLite): nullable unique completion_operation_id. */
+export const beadsCompletionOperationIdMigration: Migration = {
+  version: 12,
+  description: "Add nullable unique completion_operation_id to beads",
+  up: `
+    ALTER TABLE beads ADD COLUMN IF NOT EXISTS completion_operation_id TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_beads_completion_operation_id
+      ON beads(completion_operation_id) WHERE completion_operation_id IS NOT NULL;
+    CREATE OR REPLACE VIEW cells AS SELECT
+        ${V12_CELLS_COLUMNS}
+      FROM beads;
+  `,
+  down: `
+    DROP INDEX IF EXISTS idx_beads_completion_operation_id;
+    DROP VIEW IF EXISTS cells CASCADE;
+    ALTER TABLE beads DROP COLUMN IF EXISTS completion_operation_id;
+    CREATE VIEW cells AS SELECT
+        ${V11_CELLS_COLUMNS}
+      FROM beads;
+  `,
+};
+
 /**
  * Export individual migrations
  */
@@ -749,6 +835,7 @@ export const hiveMigrations: Migration[] = [
   cellsViewMigration,
   beadsResultColumnsMigration,
   beadsOperationIdMigration,
+  beadsCompletionOperationIdMigration,
 ];
 
 /**
@@ -797,4 +884,5 @@ export const hiveMigrationsLibSQL: Migration[] = [
 	sessionsMigrationLibSQL,
 	beadsResultColumnsMigrationLibSQL,
 	beadsOperationIdMigrationLibSQL,
+	beadsCompletionOperationIdMigrationLibSQL,
 ];

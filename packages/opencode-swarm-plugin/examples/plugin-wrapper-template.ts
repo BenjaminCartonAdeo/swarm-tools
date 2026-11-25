@@ -1218,6 +1218,10 @@ const swarm_complete = tool({
       .boolean()
       .optional()
       .describe("Skip review gate check"),
+    operation_id: tool.schema
+      .string()
+      .optional()
+      .describe("Idempotent completion identity persisted on the closed cell"),
   },
   execute: (args, ctx) => execTool("swarm_complete", args, ctx),
 });

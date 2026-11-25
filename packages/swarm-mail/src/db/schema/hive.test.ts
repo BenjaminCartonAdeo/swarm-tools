@@ -134,7 +134,8 @@ describe("Hive Schema", () => {
         created_by TEXT,
         result TEXT,
         result_at INTEGER,
-        operation_id TEXT
+        operation_id TEXT,
+        completion_operation_id TEXT
       )
     `);
 
@@ -201,7 +202,8 @@ describe("Hive Schema", () => {
         created_by TEXT,
         result TEXT,
         result_at INTEGER,
-        operation_id TEXT
+        operation_id TEXT,
+        completion_operation_id TEXT
       )
     `);
 

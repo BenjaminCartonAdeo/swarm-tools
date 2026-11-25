@@ -1028,6 +1028,12 @@ export const swarm_complete = tool({
       .string()
       .optional()
       .describe("Git branch (auto-detected if not provided)"),
+    operation_id: tool.schema
+      .string()
+      .optional()
+      .describe(
+        "Completion identity. Persisted on the closed cell; replaying the same identity is idempotent, a different identity on an already-closed cell is a conflict.",
+      ),
   },
   async execute(args, _ctx) {
     // Validate required parameters with helpful error messages
@@ -1325,6 +1331,7 @@ This will be recorded as a negative learning signal.`;
       try {
         await adapter.closeCell(args.project_key, args.bead_id, args.summary, {
           result: resultText,
+          ...(args.operation_id ? { completion_operation_id: args.operation_id } : {}),
         });
       } catch (closeError) {
         const errorMessage = closeError instanceof Error ? closeError.message : String(closeError);

@@ -56,8 +56,12 @@ export const beads = sqliteTable(
     result: text("result"), // Implementation summary (set on completion)
     result_at: integer("result_at"), // BIGINT (Unix ms) - when result was recorded
     operation_id: text("operation_id"), // Idempotency key (partial unique index, migration v11)
+    completion_operation_id: text("completion_operation_id"), // Completion identity (partial unique index, migration v12)
   },
   (table) => ({
+    completionOperationIdIdx: uniqueIndex("idx_beads_completion_operation_id")
+      .on(table.completion_operation_id)
+      .where(sql`completion_operation_id IS NOT NULL`),
     operationIdIdx: uniqueIndex("idx_beads_operation_id")
       .on(table.operation_id)
       .where(sql`operation_id IS NOT NULL`),

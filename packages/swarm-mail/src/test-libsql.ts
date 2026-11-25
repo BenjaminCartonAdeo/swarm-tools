@@ -374,6 +374,7 @@ export async function createTestLibSQLDb(): Promise<{
       result TEXT,
       result_at INTEGER,
       operation_id TEXT UNIQUE,
+      completion_operation_id TEXT UNIQUE,
       CHECK ((status = 'closed') = (closed_at IS NOT NULL)),
       FOREIGN KEY (parent_id) REFERENCES beads(id) ON DELETE SET NULL
     )

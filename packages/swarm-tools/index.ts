@@ -365,6 +365,7 @@ export const SWARM_TOOLS = [
         start_time: { type: "number", description: "Start timestamp (optional; defaults to submission time)" },
         files_touched: { type: "string", description: "Files touched (JSON array)" },
         skip_verification: { type: "boolean", description: "Skip verification gate" },
+        operation_id: { type: "string", description: "Idempotent completion identity persisted on the closed cell" },
       },
       required: ["project_key", "agent_name", "bead_id", "summary"],
       additionalProperties: false,

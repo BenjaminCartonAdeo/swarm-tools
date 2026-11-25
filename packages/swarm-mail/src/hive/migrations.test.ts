@@ -198,9 +198,9 @@ describe("Hive Migrations", () => {
     });
 
     test("migrationV11AddsNullableUniqueOperationId", async () => {
-      expect(hiveMigrationsLibSQL.map(({ version }) => version)).toEqual([7, 8, 9, 10, 11]);
+      expect(hiveMigrationsLibSQL.map(({ version }) => version)).toEqual([7, 8, 9, 10, 11, 12]);
 
-      for (const migration of hiveMigrationsLibSQL) {
+      for (const migration of hiveMigrationsLibSQL.filter(({ version }) => version <= 11)) {
         await db.exec(migration.up);
       }
 
@@ -285,6 +285,55 @@ describe("Hive Migrations", () => {
   });
 
   describe("recovery scenarios", () => {
+    test("migrationV12AddsNullableUniqueCompletionOperationId", async () => {
+      for (const migration of hiveMigrationsLibSQL) {
+        await db.exec(migration.up);
+      }
+      const columns = await db.query<{ name: string; notnull: number }>("PRAGMA table_info(beads)");
+      expect(columns.rows.at(-1)).toMatchObject({ name: "completion_operation_id", notnull: 0 });
+      const viewColumns = await db.query<{ name: string }>("PRAGMA table_info(cells)");
+      expect(viewColumns.rows.map(({ name }) => name).slice(-2)).toEqual(["operation_id", "completion_operation_id"]);
+      const indexes = await db.query<{ sql: string }>(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_beads_completion_operation_id'",
+      );
+      expect(indexes.rows).toHaveLength(1);
+      expect(indexes.rows[0].sql).toContain("WHERE completion_operation_id IS NOT NULL");
+
+      const insert = `INSERT INTO cells (id, project_key, type, status, title, priority, created_at, updated_at, closed_at, completion_operation_id)
+        VALUES (?, '/test', 'task', 'closed', 't', 2, 100, 100, 100, 'complete-op')`;
+      await client.execute({ sql: insert, args: ["c-one"] });
+      await expect(client.execute({ sql: insert, args: ["c-two"] })).rejects.toThrow();
+      await db.exec("UPDATE cells SET title = 'renamed' WHERE id = 'c-one'");
+      const row = await db.query<{ title: string; completion_operation_id: string }>(
+        "SELECT title, completion_operation_id FROM cells WHERE id = 'c-one'",
+      );
+      expect(row.rows).toEqual([{ title: "renamed", completion_operation_id: "complete-op" }]);
+    });
+
+    test("oldReaderAndRollbackAroundV12", async () => {
+      for (const migration of hiveMigrationsLibSQL.filter(({ version }) => version <= 11)) {
+        await db.exec(migration.up);
+      }
+      await db.query(`
+        INSERT INTO beads (id, project_key, type, status, title, priority, created_at, updated_at, operation_id)
+        VALUES ('legacy', '/test', 'task', 'open', 'Legacy', 2, 100, 100, 'op-legacy')
+      `);
+      const v11ViewColumns = await db.query<{ name: string }>("PRAGMA table_info(cells)");
+      const v12 = hiveMigrationsLibSQL.find(({ version }) => version === 12)!;
+      await db.exec(v12.up);
+      const oldReader = await db.query("SELECT id, title, operation_id FROM cells WHERE id = 'legacy'");
+      expect(oldReader.rows).toEqual([{ id: "legacy", title: "Legacy", operation_id: "op-legacy" }]);
+
+      await db.exec(v12.down);
+      const restored = await db.query<{ name: string }>("PRAGMA table_info(cells)");
+      expect(restored.rows.map(({ name }) => name)).toEqual(v11ViewColumns.rows.map(({ name }) => name));
+      const index = await db.query("SELECT name FROM sqlite_master WHERE name = 'idx_beads_completion_operation_id'");
+      expect(index.rows).toHaveLength(0);
+      await db.exec("INSERT INTO cells (id, project_key, type, status, title, priority, created_at, updated_at) VALUES ('after', '/test', 'task', 'open', 'After', 2, 1, 1)");
+      const after = await db.query("SELECT id FROM beads WHERE id IN ('legacy', 'after') ORDER BY id");
+      expect(after.rows).toEqual([{ id: "after" }, { id: "legacy" }]);
+    });
+
     test("handles missing cells view gracefully", async () => {
       // Database has v6 but somehow missing v7
       await db.exec(beadsMigration.up);

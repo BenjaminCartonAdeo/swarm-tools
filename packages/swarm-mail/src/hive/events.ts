@@ -98,6 +98,8 @@ export interface CellClosedEvent extends BaseCellEvent {
   duration_ms?: number;
   /** Implementation summary - what was actually done (like a PR description) */
   result?: string;
+  /** Idempotent completion identity persisted on the cell (migration v12) */
+  completion_operation_id?: string;
 }
 
 export interface CellReopenedEvent extends BaseCellEvent {

@@ -222,6 +222,17 @@ export function createHiveAdapter(
         throw new Error(`[HiveAdapter] Bead not found: ${cellId}`);
       }
 
+      const completionOperationId = options?.completion_operation_id;
+      if (completionOperationId && existingBead.status === "closed") {
+        // Idempotent completion: same identity → return the already-closed cell.
+        if (existingBead.completion_operation_id === completionOperationId) return existingBead;
+        throw new OperationIdConflictError(
+          completionOperationId,
+          new Error(`cell ${cellId} already closed with completion identity ${existingBead.completion_operation_id ?? "<none>"}`),
+          "beads.completion",
+        );
+      }
+
       const event: CellEvent = {
         type: "cell_closed",
         project_key: projectKeyParam,
@@ -232,6 +243,7 @@ export function createHiveAdapter(
         files_touched: options?.files_touched || null,
         duration_ms: options?.duration_ms || null,
         result: options?.result || null,
+        ...(completionOperationId ? { completion_operation_id: completionOperationId } : {}),
       } as any;
 
       await appendCellEvent(event, projectPath, db);

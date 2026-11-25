@@ -47,6 +47,25 @@ describe("Beads Adapter", () => {
     expect(found.map((c) => c.id)).toEqual([first.id]);
   });
 
+  test("closeCell with completion_operation_id is idempotent and conflicts on a different identity", async () => {
+    const cell = await adapter.createCell(projectKey, { title: "Complete me", type: "task" });
+    const closed = await adapter.closeCell(projectKey, cell.id, "done", { completion_operation_id: "effect-complete-1" });
+    expect(closed).toMatchObject({ status: "closed", completion_operation_id: "effect-complete-1" });
+
+    const again = await adapter.closeCell(projectKey, cell.id, "done again", { completion_operation_id: "effect-complete-1" });
+    expect(again).toMatchObject({ status: "closed", completion_operation_id: "effect-complete-1", closed_reason: "done" });
+
+    await expect(
+      adapter.closeCell(projectKey, cell.id, "other", { completion_operation_id: "effect-complete-2" }),
+    ).rejects.toMatchObject({ name: "OperationIdConflictError" });
+
+    const legacy = await adapter.createCell(projectKey, { title: "Closed without identity", type: "task" });
+    await adapter.closeCell(projectKey, legacy.id, "manual");
+    await expect(
+      adapter.closeCell(projectKey, legacy.id, "late", { completion_operation_id: "effect-complete-3" }),
+    ).rejects.toMatchObject({ name: "OperationIdConflictError" });
+  });
+
   test("concurrent creates with same operation_id converge on one cell", async () => {
     const results = await Promise.all(
       [1, 2, 3].map((n) => adapter.createCell(projectKey, { title: `Race ${n}`, type: "task", operation_id: "op-race" })),

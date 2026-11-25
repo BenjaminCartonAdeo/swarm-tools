@@ -65,6 +65,8 @@ export interface Cell {
   result_at: number | null;
   /** Idempotency key used at creation (null/absent for legacy cells) */
   operation_id?: string | null;
+  /** Completion identity recorded when closed idempotently (null/absent otherwise) */
+  completion_operation_id?: string | null;
 }
 
 /**
@@ -185,6 +187,12 @@ export interface CellAdapter {
       duration_ms?: number;
       /** Implementation summary (what was actually done, like a PR description) */
       result?: string;
+      /**
+       * Completion identity. Closing an already-closed cell with the same identity
+       * is an idempotent no-op; a different or missing identity on a closed cell
+       * throws OperationIdConflictError.
+       */
+      completion_operation_id?: string;
     },
     projectPath?: string,
   ): Promise<Cell>;

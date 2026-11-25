@@ -251,6 +251,11 @@ async function handleBeadClosedDrizzle(
     setFields.result_at = event.timestamp;
   }
 
+  const completionOperationId = (event as { completion_operation_id?: unknown }).completion_operation_id;
+  if (typeof completionOperationId === "string" && completionOperationId.length > 0) {
+    setFields.completion_operation_id = completionOperationId;
+  }
+
   await db
     .update(beads)
     .set(setFields)
