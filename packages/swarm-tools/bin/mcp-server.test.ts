@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { SWARM_TOOLS } from "../index.js";
 import { buildToolCliArgs } from "./tool-cli-args.js";
 
@@ -24,5 +25,11 @@ describe("MCP tool forwarding operation_id (operationId)", () => {
       expect(params.properties.operation_id).toEqual(expect.objectContaining({ type: "string" }));
       expect(params.required).not.toContain("operation_id");
     }
+  });
+
+  test("built MCP bundle serializes the complete tool arguments to the CLI", () => {
+    const bundle = readFileSync(new URL("./mcp-server.js", import.meta.url), "utf8");
+
+    expect(bundle).toMatch(/return\["tool",\$,"--json",JSON\.stringify\(v\)\]/);
   });
 });

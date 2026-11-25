@@ -227,6 +227,21 @@ describe("real OpenCode V2 host", () => {
           baseUrl,
           headers: { authorization: `Basic ${btoa(`opencode:${password}`)}` },
         });
+        const connectedEvents = client.event.subscribe({
+          signal: subscription.signal,
+        });
+        const connectedIterator = connectedEvents[Symbol.asyncIterator]();
+        const serverConnected = withTimeout(
+          (async () => {
+            while (true) {
+              const step = await connectedIterator.next();
+              if (step.done) throw new Error("server.connected event stream closed");
+              if (step.value.type === "server.connected") return;
+            }
+          })(),
+          RUN_TIMEOUT_MS,
+          "server.connected",
+        );
         const info = await withTimeout(client.server.info(), RUN_TIMEOUT_MS, "server.info");
         console.log(`[real-host] server.info=${JSON.stringify(info)}`);
         const session = await withTimeout(
@@ -259,6 +274,8 @@ describe("real OpenCode V2 host", () => {
             RUN_TIMEOUT_MS,
             label,
           );
+
+        await serverConnected;
 
         // Run 1: model calls the swarmx `hive_ready` tool.
         const run1 = nextSettled("hive_ready run");
