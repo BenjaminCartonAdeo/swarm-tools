@@ -1,4 +1,9 @@
-import type { MissionCellSnapshot, MissionState as ProjectedMissionState, RetryCauseRecord } from "../types.js";
+import type {
+  ConsolidationState,
+  MissionCellSnapshot,
+  MissionState as ProjectedMissionState,
+  RetryCauseRecord,
+} from "../types.js";
 import type { AssignmentRow, MissionBudgetPolicy } from "./mission.js";
 import type { Mission, WorkUnit, WorkUnitState } from "./schema.js";
 
@@ -12,8 +17,8 @@ function parsePolicy(mission: Mission): MissionBudgetPolicy {
   if (mission.budget_policy_json !== null) {
     try {
       const parsed: unknown = JSON.parse(mission.budget_policy_json);
-      if (typeof parsed === "object" && parsed !== null && "total" in parsed && "perCellIterations" in parsed) {
-        return parsed as MissionBudgetPolicy;
+      if (isMissionBudgetPolicy(parsed)) {
+        return parsed;
       }
     } catch {
       // Older and partially migrated missions use the persisted budget limit below.
@@ -22,13 +27,78 @@ function parsePolicy(mission: Mission): MissionBudgetPolicy {
   return { total: mission.budget_limit ?? 0, perCellIterations: 0, workerShare: null, version: 1 };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isMissionBudgetPolicy(value: unknown): value is MissionBudgetPolicy {
+  if (!isRecord(value)) return false;
+  const workerShare = value.workerShare;
+  const validWorkerShare = workerShare === null || (
+    isRecord(workerShare)
+    && typeof workerShare.agent === "string"
+    && workerShare.agent.trim().length > 0
+    && typeof workerShare.maxFraction === "number"
+    && Number.isFinite(workerShare.maxFraction)
+    && workerShare.maxFraction >= 0
+    && workerShare.maxFraction <= 1
+  );
+  return value.version === 1
+    && typeof value.total === "number"
+    && Number.isFinite(value.total)
+    && value.total >= 0
+    && typeof value.perCellIterations === "number"
+    && Number.isFinite(value.perCellIterations)
+    && value.perCellIterations >= 0
+    && validWorkerShare;
+}
+
+function isRetryCauseRecord(value: unknown): value is RetryCauseRecord {
+  if (!isRecord(value)) return false;
+  return typeof value.cellID === "string" && value.cellID.length > 0
+    && typeof value.epicID === "string" && value.epicID.length > 0
+    && typeof value.attempt === "number" && Number.isInteger(value.attempt) && value.attempt > 0
+    && typeof value.ts === "string" && value.ts.length > 0
+    && (value.failureReason === undefined || typeof value.failureReason === "string")
+    && (value.failedCommand === undefined || typeof value.failedCommand === "string")
+    && (value.errorExcerpt === undefined || typeof value.errorExcerpt === "string");
+}
+
+function isConsolidationStatus(value: unknown): value is ConsolidationState["status"] {
+  return value === "pending" || value === "ready" || value === "dispatched" || value === "completed";
+}
+
 function parseStoredCauses(mission: Mission): RetryCauseRecord[] {
   if (mission.retry_causes_json === null) return [];
   try {
     const parsed: unknown = JSON.parse(mission.retry_causes_json);
-    return Array.isArray(parsed) ? parsed as RetryCauseRecord[] : [];
+    return Array.isArray(parsed) ? parsed.filter(isRetryCauseRecord) : [];
   } catch {
     return [];
+  }
+}
+
+function parseConsolidation(mission: Mission): ConsolidationState | undefined {
+  if (mission.consolidation_json === null) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(mission.consolidation_json);
+    if (!isRecord(parsed)) return undefined;
+    const status = parsed.status;
+    if (typeof parsed.epicID !== "string" || parsed.epicID.length === 0
+      || typeof parsed.cellID !== "string" || parsed.cellID.length === 0
+      || !isConsolidationStatus(status) || typeof parsed.createdAt !== "number" || !Number.isFinite(parsed.createdAt)
+      || (parsed.prompt !== undefined && typeof parsed.prompt !== "string")) {
+      return undefined;
+    }
+    return {
+      epicID: parsed.epicID,
+      cellID: parsed.cellID,
+      status,
+      createdAt: parsed.createdAt,
+      ...(parsed.prompt === undefined ? {} : { prompt: parsed.prompt }),
+    };
+  } catch {
+    return undefined;
   }
 }
 
@@ -69,6 +139,7 @@ function mergedRetryCauses(mission: Mission, units: readonly WorkUnit[]): RetryC
 export function projectMission(input: ProjectionInput): ProjectedMissionState {
   const { mission, units } = input;
   const budgetPolicy = parsePolicy(mission);
+  const consolidation = parseConsolidation(mission);
   const attemptsByCell: Record<string, number> = {};
   const chargedCells = new Set<string>();
   for (const unit of units) {
@@ -96,7 +167,7 @@ export function projectMission(input: ProjectionInput): ProjectedMissionState {
       workerSpawns: units.filter((unit) => unit.worker_agent === "swarm-worker").length,
     },
     retryCauses: mergedRetryCauses(mission, units),
-    ...(mission.consolidation_json === null ? {} : { consolidation: JSON.parse(mission.consolidation_json) as ProjectedMissionState["consolidation"] }),
+    ...(consolidation === undefined ? {} : { consolidation }),
     createdAt,
     updatedAt,
   };
@@ -123,7 +194,10 @@ export function projectMissionCells(input: ProjectionInput & { cells: MissionCel
   const { mission, units, assignments, cells } = input;
   const hiveCells = new Map(cells.map((cell) => [cell.id, cell]));
   const assignmentByCell = new Map(assignments
-    .filter((assignment) => assignment.project === mission.project && assignment.state === "assigned" && assignment.agent !== null)
+    .filter((assignment) => assignment.project === mission.project
+      && assignment.mission_pk === mission.id
+      && assignment.state === "assigned"
+      && assignment.agent !== null)
     .map((assignment) => [assignment.cell_id, assignment]));
   const unitsByCell = new Map<string, WorkUnit[]>();
   for (const unit of units) {

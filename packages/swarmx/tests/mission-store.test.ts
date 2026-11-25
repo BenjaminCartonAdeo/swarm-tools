@@ -5,6 +5,7 @@ import {
   assignCell,
   createMission,
   getMission,
+  getMissionByPk as missionGetMissionByPk,
   listUnits,
   listMissions,
   MissionConflictError,
@@ -13,7 +14,7 @@ import {
   setConsolidation,
   updateMissionPolicy,
 } from "../src/workunit/mission.js";
-import { getMissionByPk } from "../src/workunit/store.js";
+import { getMissionByPk as storeGetMissionByPk } from "../src/workunit/store.js";
 
 const policy = {
   total: 12,
@@ -62,10 +63,14 @@ describe("WorkUnit mission store", () => {
       updated_at: 100,
     });
     expect(await getMission(adapter, "store-project", "store-session")).toEqual(first);
-    expect(await getMissionByPk(adapter, first.id)).toEqual(first);
+    expect(await missionGetMissionByPk(adapter, first.id)).toEqual(first);
     expect(await listMissions(adapter, "store-project", "store-session")).toEqual([first]);
     expect(await listMissions(adapter, "another-project")).toEqual([]);
     expect(await listMissions(adapter, "store-project")).toEqual([first]);
+  });
+
+  test("mission module reuses the store primary-key lookup export", () => {
+    expect(missionGetMissionByPk).toBe(storeGetMissionByPk);
   });
 
   test("generates an RFC 4122 UUID mission id when one is not supplied", async () => {

@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseAdapter } from "swarm-mail";
 import type { ConsolidationState, MissionMode, RetryCauseRecord } from "../types.js";
 import type { Mission, WorkUnit } from "./schema.js";
-import { MissionFenceConflictError } from "./store.js";
+import { getMissionByPk, MissionFenceConflictError } from "./store.js";
+
+export { getMissionByPk };
 
 export interface MissionBudgetPolicy {
   total: number;
@@ -131,11 +133,6 @@ export async function getMission(db: DatabaseAdapter, project: string, session: 
        created_at DESC, updated_at DESC, id DESC LIMIT 1`,
     [project, session],
   );
-  return asMission(result.rows[0]);
-}
-
-export async function getMissionByPk(db: DatabaseAdapter, missionPk: string): Promise<Mission | null> {
-  const result = await db.query("SELECT * FROM swarmx_missions WHERE id = ?", [missionPk]);
   return asMission(result.rows[0]);
 }
 

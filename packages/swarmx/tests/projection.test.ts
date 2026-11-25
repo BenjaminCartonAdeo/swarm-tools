@@ -56,6 +56,55 @@ describe("WorkUnit mission projections", () => {
     expect(projected).toMatchObject({ active: true, mode: "dev", projectID: "p", sessionID: "s", missionID: "m1" });
   });
 
+  test("falls back to the legacy budget limit when policy workerShare is missing or invalid", () => {
+    const invalidPolicies = [
+      JSON.stringify({ total: 99, perCellIterations: 8, version: 1 }),
+      JSON.stringify({ total: 99, perCellIterations: 8, workerShare: { agent: "worker", maxFraction: 2 }, version: 1 }),
+    ];
+    for (const budgetPolicy of invalidPolicies) {
+      const projected = projectMission({
+        mission: mission({ budget_limit: 7, budget_policy_json: budgetPolicy }),
+        units: [],
+        assignments: [],
+      });
+      expect(projected.budget).toEqual({ maxSpawns: 7, maxIterations: 0 });
+    }
+  });
+
+  test("accepts a valid policy with null workerShare", () => {
+    const projected = projectMission({
+      mission: mission({ budget_policy_json: JSON.stringify({ total: 6, perCellIterations: 2, workerShare: null, version: 1 }) }),
+      units: [],
+      assignments: [],
+    });
+    expect(projected.budget).toEqual({ maxSpawns: 6, maxIterations: 2 });
+  });
+
+  test("omits malformed consolidation JSON instead of throwing", () => {
+    const projected = projectMission({ mission: mission({ consolidation_json: "{" }), units: [], assignments: [] });
+    expect(projected).not.toHaveProperty("consolidation");
+  });
+
+  test("ignores malformed retry-cause entries and retains valid causes", () => {
+    const valid = { cellID: "valid-cell", epicID: "epic-1", attempt: 2, ts: "2026-02-01T00:00:00.000Z", failureReason: "known failure" };
+    const projected = projectMission({
+      mission: mission({ retry_causes_json: JSON.stringify([null, { cellID: "bad", epicID: "epic-1", attempt: "2", ts: 4 }, valid]) }),
+      units: [],
+      assignments: [],
+    });
+    expect(projected.retryCauses).toEqual([valid]);
+  });
+
+  test("excludes assignments owned by another mission in the same project", () => {
+    const cells = projectMissionCells({
+      mission: mission(),
+      units: [],
+      assignments: [{ ...assignment, cell_id: "foreign-cell", mission_pk: "mission:p:s:other" }],
+      cells: [],
+    });
+    expect(cells).toEqual([]);
+  });
+
   test("merges retry-unit reasons with stored causes and retains the newest twenty", () => {
     const old = Array.from({ length: 20 }, (_, index): RetryCauseRecord => ({
       cellID: `cell-${index}`, epicID: "epic-1", attempt: 1, ts: `2026-01-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`, failureReason: `old-${index}`,
