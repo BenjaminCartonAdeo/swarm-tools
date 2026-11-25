@@ -194,19 +194,22 @@ export async function completeReviewFeedback(
 /**
  * Release unfinished claims whose owner is provably dead: same hostname and
  * `isProcessAlive(pid)` false. Foreign-host claims are only reported.
+ * `projectKey` narrows both recovery and reporting to one project.
  */
 export async function recoverStaleReviewFeedback(
-  input: { hostname: string; isProcessAlive: (pid: number) => boolean },
+  input: { hostname: string; isProcessAlive: (pid: number) => boolean; projectKey?: string },
   dbOverride?: DatabaseAdapter,
-): Promise<{ recovered: number; foreignCandidates: string[] }> {
+): Promise<{ recovered: number; foreignCandidates: string[]; recoveredOperations: string[] }> {
   const db = await resolveDb(dbOverride);
+  const scoped = input.projectKey !== undefined;
   const open = await db.query<OperationRow>(
     `SELECT operation_id, request_hash, attempt, state, claim_token, hostname, pid, result
      FROM review_feedback_operations
-     WHERE state != 'done' AND claim_token IS NOT NULL
+     WHERE state != 'done' AND claim_token IS NOT NULL${scoped ? " AND project_key = ?" : ""}
      ORDER BY operation_id`,
+    scoped ? [input.projectKey] : [],
   );
-  let recovered = 0;
+  const recoveredOperations: string[] = [];
   const foreignCandidates: string[] = [];
   for (const row of open.rows) {
     if (row.hostname !== input.hostname) {
@@ -220,9 +223,9 @@ export async function recoverStaleReviewFeedback(
        RETURNING operation_id`,
       [Date.now(), row.operation_id, row.claim_token],
     );
-    recovered += released.rows.length;
+    if (released.rows.length > 0) recoveredOperations.push(row.operation_id);
   }
-  return { recovered, foreignCandidates };
+  return { recovered: recoveredOperations.length, foreignCandidates, recoveredOperations };
 }
 
 /**
@@ -266,17 +269,22 @@ export async function getDurableReviewApproval(
   return (JSON.parse(raw) as { status?: string }).status === "approved";
 }
 
-/** Explicit operator recovery of one unfinished claim (e.g. foreign host). */
+/**
+ * Explicit operator recovery of one unfinished claim (e.g. foreign host).
+ * With `projectKey`, a claim belonging to another project is left untouched.
+ */
 export async function recoverReviewFeedbackOperation(
   operationId: string,
   dbOverride?: DatabaseAdapter,
+  projectKey?: string,
 ): Promise<boolean> {
   const db = await resolveDb(dbOverride);
+  const scoped = projectKey !== undefined;
   const released = await db.query(
     `UPDATE review_feedback_operations SET claim_token = NULL, updated_at = ?
-     WHERE operation_id = ? AND state != 'done' AND claim_token IS NOT NULL
+     WHERE operation_id = ? AND state != 'done' AND claim_token IS NOT NULL${scoped ? " AND project_key = ?" : ""}
      RETURNING operation_id`,
-    [Date.now(), operationId],
+    scoped ? [Date.now(), operationId, projectKey] : [Date.now(), operationId],
   );
   return released.rows.length > 0;
 }

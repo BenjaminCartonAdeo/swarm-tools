@@ -1,7 +1,8 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseAdapter } from "swarm-mail";
 import {
   type CloseIntent,
+  HOST_IDENTITIES_DDL,
   type Mission,
   LEGAL_WORK_UNIT_TRANSITIONS,
   type TransitionFence,
@@ -1059,4 +1060,116 @@ export async function setMissionConsolidation(
   const row: unknown = result.rows[0];
   if (isRecord(row)) return row as unknown as Mission;
   throw new MissionFenceConflictError(input.missionPk, input.expectedFence);
+}
+
+// ---------------------------------------------------------------------------
+// Operator lifecycle commands (CLI-only): host identity, revoke, downgrade.
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the stable instance id persisted for `hostname`, creating it once.
+ * Creates its own table so it can run before the full schema.
+ */
+export async function getOrCreateHostInstanceId(db: DatabaseAdapter, hostname: string): Promise<string> {
+  await db.exec(HOST_IDENTITIES_DDL);
+  await db.query(
+    `INSERT INTO swarmx_host_identities (hostname, host_instance_id, created_at)
+     VALUES (?, ?, ?) ON CONFLICT(hostname) DO NOTHING`,
+    [hostname, randomUUID(), Date.now()],
+  );
+  const result = await db.query<{ host_instance_id: string }>(
+    "SELECT host_instance_id FROM swarmx_host_identities WHERE hostname = ?",
+    [hostname],
+  );
+  const id = result.rows[0]?.host_instance_id;
+  if (typeof id !== "string") throw new Error(`Host identity for ${hostname} could not be persisted`);
+  return id;
+}
+
+export class WorkUnitNotFoundError extends Error {
+  constructor(unitId: string) {
+    super(`WorkUnit ${unitId} was not found`);
+    this.name = "WorkUnitNotFoundError";
+  }
+}
+
+export class InvalidRevokeReasonError extends Error {
+  constructor() {
+    super("Revoke requires a nonblank reason");
+    this.name = "InvalidRevokeReasonError";
+  }
+}
+
+const REVOCABLE_STATES = new Set<WorkUnitState>(["RESERVED", "BOUND", "SUBMITTED"]);
+
+/** Fenced operator revoke: RESERVED|BOUND|SUBMITTED -> REVOKED at `expectedFence`. */
+export async function revokeWorkUnit(
+  db: DatabaseAdapter,
+  input: { unitId: string; expectedFence: number; reason: string },
+): Promise<WorkUnit> {
+  const reason = input.reason.trim();
+  if (reason.length === 0) throw new InvalidRevokeReasonError();
+  const unit = await getWorkUnit(db, input.unitId);
+  if (unit === null) throw new WorkUnitNotFoundError(input.unitId);
+  const state = unit.state;
+  if (!REVOCABLE_STATES.has(state)) {
+    if (Number(unit.fence) !== input.expectedFence) throw new FenceConflictError(input.unitId, state, input.expectedFence);
+    throw new IllegalTransitionError(state, "REVOKED");
+  }
+  return transitionWorkUnit(db, {
+    unitId: input.unitId,
+    expectedState: state,
+    unitFence: input.expectedFence,
+    nextState: "REVOKED",
+    patch: { kind: "revoke", reason },
+  });
+}
+
+export class LiveMissionError extends Error {
+  constructor(project: string) {
+    super(`Project ${project} has a live (OPEN or CLOSING) mission`);
+    this.name = "LiveMissionError";
+  }
+}
+
+const LIVE_MISSION_SQL = "SELECT 1 FROM swarmx_missions WHERE project = ? AND state IN ('OPEN', 'CLOSING')";
+
+export async function hasLiveMission(db: DatabaseAdapter, project: string): Promise<boolean> {
+  return (await db.query(LIVE_MISSION_SQL, [project])).rows.length > 0;
+}
+
+/**
+ * Atomically records an idempotent pending downgrade request unless the project
+ * has a live mission. A project without missions is eligible.
+ */
+export async function requestDowngrade(
+  db: DatabaseAdapter,
+  project: string,
+): Promise<{ project: string; status: "requested" }> {
+  const written = await db.query(
+    `INSERT INTO swarmx_downgrade_requests (project, status, requested_at)
+     SELECT ?, 'pending', ? WHERE NOT EXISTS (${LIVE_MISSION_SQL})
+     ON CONFLICT(project) DO UPDATE SET status = 'pending', completed_at = NULL, cleared_keys = NULL
+     RETURNING project`,
+    [project, Date.now(), project],
+  );
+  if (written.rows.length === 0) throw new LiveMissionError(project);
+  return { project, status: "requested" };
+}
+
+export async function isDowngradePending(db: DatabaseAdapter, project: string): Promise<boolean> {
+  const result = await db.query(
+    "SELECT 1 FROM swarmx_downgrade_requests WHERE project = ? AND status = 'pending'",
+    [project],
+  );
+  return result.rows.length > 0;
+}
+
+export async function completeDowngrade(db: DatabaseAdapter, project: string, clearedKeys: number): Promise<boolean> {
+  const result = await db.query(
+    `UPDATE swarmx_downgrade_requests SET status = 'completed', completed_at = ?, cleared_keys = ?
+     WHERE project = ? AND status = 'pending' RETURNING project`,
+    [Date.now(), clearedKeys, project],
+  );
+  return result.rows.length > 0;
 }

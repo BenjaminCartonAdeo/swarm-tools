@@ -173,7 +173,9 @@ describe("WorkUnit schema", () => {
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'swarmx_%' ORDER BY name",
       );
       expect(tables.rows.map((row) => rowValue(row, "name"))).toEqual([
+        "swarmx_downgrade_requests",
         "swarmx_effects",
+        "swarmx_host_identities",
         "swarmx_legacy_assignments",
         "swarmx_locks",
         "swarmx_missions",

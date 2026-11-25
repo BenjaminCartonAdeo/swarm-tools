@@ -131,13 +131,13 @@ describe("review feedback operations", () => {
       { hostname: "host-a", isProcessAlive: () => true },
       db,
     );
-    expect(liveOnly).toEqual({ recovered: 0, foreignCandidates: [] });
+    expect(liveOnly).toEqual({ recovered: 0, foreignCandidates: [], recoveredOperations: [] });
 
     const recovery = await recoverStaleReviewFeedback(
       { hostname: "host-a", isProcessAlive: (pid) => pid !== 5555 },
       db,
     );
-    expect(recovery).toEqual({ recovered: 1, foreignCandidates: [] });
+    expect(recovery).toEqual({ recovered: 1, foreignCandidates: [], recoveredOperations: ["op-dead"] });
 
     const retaken = await claimReviewFeedback(claimInput("op-dead", { pid: 6666 }), db);
     if (retaken.kind !== "claimed") throw new Error(`expected claimed, got ${retaken.kind}`);
@@ -165,7 +165,7 @@ describe("review feedback operations", () => {
       },
       db,
     );
-    expect(recovery).toEqual({ recovered: 0, foreignCandidates: ["op-foreign"] });
+    expect(recovery).toEqual({ recovered: 0, foreignCandidates: ["op-foreign"], recoveredOperations: [] });
     expect(pidChecks).toBe(0);
     expect(await claimReviewFeedback(claimInput("op-foreign"), db)).toEqual({
       kind: "busy",
@@ -175,6 +175,31 @@ describe("review feedback operations", () => {
     expect(await recoverReviewFeedbackOperation("op-foreign", db)).toBe(true);
     const retaken = await claimReviewFeedback(claimInput("op-foreign"), db);
     expect(retaken.kind === "claimed" && retaken.attempt).toBe(1);
+  });
+
+  // Break: stale/explicit recovery ignoring projectKey and releasing another project's claim.
+  test("recoverProjectFilterDoesNotTouchOtherProjects", async () => {
+    const mine = await claimReviewFeedback(claimInput("op-mine", { pid: 5555 }), db);
+    const other = await claimReviewFeedback(
+      claimInput("op-other", { projectKey: "/tmp/other-project", pid: 5555 }),
+      db,
+    );
+    const foreignOther = await claimReviewFeedback(
+      claimInput("op-foreign-other", { projectKey: "/tmp/other-project", hostname: "host-b" }),
+      db,
+    );
+    expect([mine.kind, other.kind, foreignOther.kind]).toEqual(["claimed", "claimed", "claimed"]);
+
+    const recovery = await recoverStaleReviewFeedback(
+      { hostname: "host-a", isProcessAlive: () => false, projectKey: PROJECT },
+      db,
+    );
+    expect(recovery).toEqual({ recovered: 1, foreignCandidates: [], recoveredOperations: ["op-mine"] });
+    expect(await claimReviewFeedback(claimInput("op-other", { projectKey: "/tmp/other-project" }), db))
+      .toEqual({ kind: "busy", attempt: 1 });
+
+    expect(await recoverReviewFeedbackOperation("op-other", db, PROJECT)).toBe(false);
+    expect(await recoverReviewFeedbackOperation("op-other", db, "/tmp/other-project")).toBe(true);
   });
 
   test("staleClaimTokenCannotCompleteFeedback", async () => {

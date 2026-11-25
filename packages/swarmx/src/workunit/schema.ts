@@ -124,6 +124,13 @@ export interface WorkUnitEffect {
   updated_at: number;
 }
 
+/** Stable per-hostname instance id shared by plugin setup and CLI recovery. */
+export const HOST_IDENTITIES_DDL = `CREATE TABLE IF NOT EXISTS swarmx_host_identities (
+    hostname TEXT PRIMARY KEY,
+    host_instance_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`;
+
 const schemaStatements = [
   `CREATE TABLE IF NOT EXISTS swarmx_missions (
     id TEXT PRIMARY KEY,
@@ -220,6 +227,14 @@ const schemaStatements = [
     state TEXT,
     updated_at INTEGER,
     PRIMARY KEY (project, cell_id)
+  )`,
+  HOST_IDENTITIES_DDL,
+  `CREATE TABLE IF NOT EXISTS swarmx_downgrade_requests (
+    project TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'completed')),
+    requested_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    cleared_keys INTEGER
   )`,
 ] as const;
 

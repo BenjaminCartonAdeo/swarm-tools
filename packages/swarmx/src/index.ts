@@ -15,7 +15,13 @@ import { Plugin } from "@opencode/plugin";
 import { registerTools } from "./catalog";
 import { createSwarmCliRunner } from "./cli";
 
-export { createWorkUnitEffectPorts, setupWorkUnitRuntime } from "./workunit/ports";
+export {
+  consumePendingDowngrade,
+  createWorkUnitEffectPorts,
+  isProcessAlive,
+  resolveHostIdentity,
+  setupWorkUnitRuntime,
+} from "./workunit/ports";
 export type { SetupWorkUnitRuntimeOptions, WorkUnitRuntime } from "./workunit/ports";
 export { createWorkUnitMissionStore, DerivedFieldWriteError } from "./workunit/mission-store-adapter";
 export { createMissionCommands, type MissionActor, type MissionCommands } from "./workunit/commands";
@@ -43,7 +49,7 @@ import {
 } from "./state";
 import type { DispatchAgentInfo, DispatchAgentList, SwarmxRuntime, ToolContextLike } from "./types";
 import { getSwarmMailDatabaseAdapter, type DatabaseAdapter } from "swarm-mail";
-import { setupWorkUnitRuntime, type WorkUnitRuntime } from "./workunit/ports";
+import { consumePendingDowngrade, setupWorkUnitRuntime, type WorkUnitRuntime } from "./workunit/ports";
 import { getMission } from "./workunit/mission";
 import { acquireWorkUnitLock, BUILD_LOCK_STALE_MS, buildLockName, releaseWorkUnitLock } from "./workunit/locks";
 import { listUnits } from "./workunit/mission";
@@ -311,6 +317,9 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
           ...(overrides.workUnitTrace === undefined ? {} : { trace: overrides.workUnitTrace }),
         });
         overrides.workUnitTrace?.("runtime");
+        // Pending operator downgrade for this project only, before hooks/tools.
+        // Raw storage: the tombstone guard would refuse lifecycle removals.
+        await consumePendingDowngrade(db, ctx.storage as unknown as MissionStorageLike, projectID);
       }
       const skills = await ctx.skill.list().catch(() => undefined);
       const catalogProtocol = skills?.data.find((skill) => skill.id === "swarm-worker-protocol")?.content;

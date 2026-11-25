@@ -1752,7 +1752,7 @@ describe("WorkUnit runtime setup (additive)", () => {
         },
       });
       expect(steps).toEqual(["host", "schema", "recovery", "adapter", "commands"]);
-      expect(workUnit.recovery).toEqual({ recovered: 0, foreignHostCandidates: [] });
+      expect(workUnit.recovery).toEqual({ recovered: 0, foreignHostCandidates: [], recoveredEffects: [] });
       expect(workUnit.host).toEqual({ hostInstanceId: "h", hostname: "box", pid: 42 });
       expect(await workUnit.store.list()).toEqual([]);
       expect(legacyReads).toEqual(["list"]);

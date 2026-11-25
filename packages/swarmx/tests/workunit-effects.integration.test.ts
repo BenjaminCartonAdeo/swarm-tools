@@ -7,6 +7,7 @@ import {
   EffectNotFoundError,
   recoverStaleEffects,
   recordEffectResult,
+  recoverEffectClaim,
   DefiniteEffectError,
   drainWorkUnitEffects,
   runWorkUnitEffect,
@@ -145,7 +146,7 @@ describe("work unit effect journal claims", () => {
       isProcessAlive: (pid) => pid !== 321,
     });
 
-    expect(recovered).toEqual({ recovered: 1, foreignHostCandidates: [] });
+    expect(recovered).toEqual({ recovered: 1, foreignHostCandidates: [], recoveredEffects: ["effect-1"] });
     expect(await readEffect(db)).toMatchObject({
       state: "unknown",
       claim_token: null,
@@ -189,7 +190,7 @@ describe("work unit effect journal claims", () => {
       isProcessAlive: (pid) => pid === 321,
     });
 
-    expect(recovered).toEqual({ recovered: 0, foreignHostCandidates: ["effect-1"] });
+    expect(recovered).toEqual({ recovered: 0, foreignHostCandidates: ["effect-1"], recoveredEffects: [] });
     expect(await readEffect(db)).toMatchObject({ state: "in_flight", host_instance_id: "host-foreign" });
     expect(await readEffect(db, "effect-live")).toMatchObject({ state: "in_flight", host_instance_id: "host-1" });
   });
@@ -635,5 +636,52 @@ describe("forced mission close", () => {
     expect(closed).toMatchObject({ state: "FINISHED", fence: 3 });
     expect(await states(db, "units")).toEqual({ pub: "FAILED", ret: "FAILED" });
     expect(await forceMissionClose(db, { ...owner, expectedFence: 2 })).toMatchObject({ state: "FINISHED", fence: 3 });
+  });
+});
+
+describe("explicit effect claim recovery", () => {
+  async function claimed(db: DatabaseAdapter): Promise<string> {
+    const claim = await claimEffect(db, {
+      effectId: "effect-1", unitId: "unit-1", expectedUnitState: "PUBLISHING", unitFence: 7,
+      hostInstanceId: "host-foreign", hostname: "other-machine", pid: 654,
+    });
+    return claim!.claimToken;
+  }
+
+  // Break: recovery that ignores the observed token and clobbers a newer claim.
+  test("recoverEffectClaimCasInvalidatesStaleToken", async () => {
+    const db = await seedEffect();
+    const token = await claimed(db);
+
+    await expect(recoverEffectClaim(db, { effectId: "effect-1", expectedClaimToken: "not-it" }))
+      .rejects.toBeInstanceOf(EffectClaimConflictError);
+    expect(await readEffect(db)).toMatchObject({ state: "in_flight", claim_token: token });
+
+    await expect(recoverEffectClaim(db, { effectId: "effect-1", expectedClaimToken: token, project: "elsewhere" }))
+      .rejects.toBeInstanceOf(EffectNotFoundError);
+    await expect(recoverEffectClaim(db, { effectId: "missing", expectedClaimToken: token }))
+      .rejects.toBeInstanceOf(EffectNotFoundError);
+
+    const recovered = await recoverEffectClaim(db, { effectId: "effect-1", expectedClaimToken: token, project: "project" });
+    expect(recovered).toMatchObject({ effect_id: "effect-1", state: "unknown", claim_token: null, host_instance_id: null, claimed_by_pid: null });
+
+    // The stale owner can no longer record a result, and a replayed recovery conflicts.
+    await expect(recordEffectResult(db, { effectId: "effect-1", claimToken: token, state: "succeeded" }))
+      .rejects.toBeInstanceOf(EffectClaimConflictError);
+    await expect(recoverEffectClaim(db, { effectId: "effect-1", expectedClaimToken: token }))
+      .rejects.toBeInstanceOf(EffectClaimConflictError);
+  });
+
+  // Break: stale recovery ignoring the project filter.
+  test("recoverStaleEffectsProjectFilter", async () => {
+    const db = await seedEffect();
+    await claimEffect(db, {
+      effectId: "effect-1", unitId: "unit-1", expectedUnitState: "PUBLISHING", unitFence: 7,
+      hostInstanceId: "host-1", hostname: "worker-a", pid: 321,
+    });
+    const other = await recoverStaleEffects(db, { hostInstanceId: "host-1", hostname: "worker-a", isProcessAlive: () => false, project: "other" });
+    expect(other).toEqual({ recovered: 0, foreignHostCandidates: [], recoveredEffects: [] });
+    const mine = await recoverStaleEffects(db, { hostInstanceId: "host-1", hostname: "worker-a", isProcessAlive: () => false, project: "project" });
+    expect(mine).toEqual({ recovered: 1, foreignHostCandidates: [], recoveredEffects: ["effect-1"] });
   });
 });

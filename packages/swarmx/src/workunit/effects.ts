@@ -95,6 +95,8 @@ export interface RecoverStaleEffectsInput {
   hostInstanceId: string;
   hostname: string;
   isProcessAlive: (pid: number) => boolean;
+  /** Restricts recovery and foreign-host reporting to one project's units. */
+  project?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -171,12 +173,14 @@ export async function recordEffectResult(
 export async function recoverStaleEffects(
   db: DatabaseAdapter,
   input: RecoverStaleEffectsInput,
-): Promise<{ recovered: number; foreignHostCandidates: string[] }> {
+): Promise<{ recovered: number; foreignHostCandidates: string[]; recoveredEffects: string[] }> {
+  const scoped = input.project !== undefined;
   const result = await db.query(
     `SELECT effect_id, claim_token, claimed_by_pid, host_instance_id, claimed_hostname
-     FROM swarmx_effects WHERE state = 'in_flight' ORDER BY effect_id`,
+     FROM swarmx_effects WHERE state = 'in_flight'${scoped ? PROJECT_SCOPE_SQL : ""} ORDER BY effect_id`,
+    scoped ? [input.project] : [],
   );
-  let recovered = 0;
+  const recoveredEffects: string[] = [];
   const foreignHostCandidates: string[] = [];
 
   for (const candidate of result.rows) {
@@ -202,10 +206,59 @@ export async function recoverStaleEffects(
        RETURNING effect_id`,
       [Date.now(), effectId, claimToken, input.hostInstanceId, input.hostname, pid],
     );
-    if (recovery.rows.length > 0) recovered += 1;
+    if (recovery.rows.length > 0) recoveredEffects.push(effectId);
   }
 
-  return { recovered, foreignHostCandidates };
+  return { recovered: recoveredEffects.length, foreignHostCandidates, recoveredEffects };
+}
+
+const PROJECT_SCOPE_SQL = ` AND EXISTS (SELECT 1 FROM swarmx_work_units pu
+  WHERE pu.id = swarmx_effects.unit_id AND pu.project = ?)`;
+
+/**
+ * Explicit operator recovery of one in-flight effect: a CAS on the observed claim
+ * token that marks it `unknown` and clears claim metadata. Never kills a process.
+ * Missing (or out-of-project) effects raise `EffectNotFoundError`; any other
+ * mismatch (token changed, not in flight) raises `EffectClaimConflictError`.
+ */
+export async function recoverEffectClaim(
+  db: DatabaseAdapter,
+  input: { effectId: string; expectedClaimToken: string; project?: string },
+): Promise<WorkUnitEffect> {
+  const scoped = input.project !== undefined;
+  const scopeArgs = scoped ? [input.project] : [];
+  const result = await db.query(
+    `UPDATE swarmx_effects
+     SET state = 'unknown', claim_token = NULL, host_instance_id = NULL, claimed_hostname = NULL,
+         claimed_by_pid = NULL, claimed_at = NULL, updated_at = ?
+     WHERE effect_id = ? AND state = 'in_flight' AND claim_token = ?${scoped ? PROJECT_SCOPE_SQL : ""}
+     RETURNING *`,
+    [Date.now(), input.effectId, input.expectedClaimToken, ...scopeArgs],
+  );
+  const effect = effectFromRow(result.rows[0]);
+  if (effect !== null) return effect;
+  const existing = await db.query(
+    `SELECT effect_id FROM swarmx_effects WHERE effect_id = ?${scoped ? PROJECT_SCOPE_SQL : ""}`,
+    [input.effectId, ...scopeArgs],
+  );
+  if (!isRecord(existing.rows[0])) throw new EffectNotFoundError(input.effectId);
+  throw new EffectClaimConflictError(input.effectId);
+}
+
+/** Reads the current claim token of an effect (operator recovery observes it before the CAS). */
+export async function readEffectClaimToken(
+  db: DatabaseAdapter,
+  effectId: string,
+  project?: string,
+): Promise<string | null | undefined> {
+  const scoped = project !== undefined;
+  const result = await db.query(
+    `SELECT claim_token FROM swarmx_effects WHERE effect_id = ?${scoped ? PROJECT_SCOPE_SQL : ""}`,
+    scoped ? [effectId, project] : [effectId],
+  );
+  const row = result.rows[0];
+  if (!isRecord(row)) return undefined;
+  return typeof row.claim_token === "string" ? row.claim_token : null;
 }
 
 /**

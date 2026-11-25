@@ -631,6 +631,26 @@ export function lifecycleKeyScope(key: string): { projectID: string; sessionID?:
 }
 
 /**
+ * Downgrade cleanup selection (read-only): every recognized lifecycle KV key of
+ * `projectID`. `legacy-tombstone:` keys, other projects' keys and unrelated keys
+ * are never returned. The locked downgrade consumer performs the removals.
+ */
+export async function listProjectLifecycleKeys(storage: MissionStorageLike, projectID: string): Promise<string[]> {
+  const prefixes = [
+    ...PLAIN_LIFECYCLE_PREFIXES.map(({ prefix }) => `${prefix}${projectID}`),
+    ...ENCODED_LIFECYCLE_PREFIXES.map(({ prefix }) => `${prefix}${encodeURIComponent(projectID)}`),
+  ];
+  const keys = new Set<string>();
+  for (const prefix of prefixes) {
+    for (const entry of await scanAll(storage, prefix)) {
+      if (entry.key.startsWith(LEGACY_TOMBSTONE_PREFIX)) continue;
+      if (lifecycleKeyScope(entry.key)?.projectID === projectID) keys.add(entry.key);
+    }
+  }
+  return [...keys].sort();
+}
+
+/**
  * Wraps plugin storage so every lifecycle `set`/`remove` is refused once the
  * project (or session) is tombstoned. Reads and scans pass through untouched.
  */

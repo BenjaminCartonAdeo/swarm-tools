@@ -23,6 +23,9 @@ import {
 } from "./mission-store-adapter.js";
 import { ensureWorkUnitSchema } from "./schema.js";
 import { migrateLegacyLifecycle, type LegacyLifecycleStore } from "./migrate.js";
+import { listProjectLifecycleKeys, type MissionStorageLike } from "../state.js";
+import { acquireWorkUnitLock, CLEANUP_LOCK_STALE_MS, cleanupLockName, releaseWorkUnitLock } from "./locks.js";
+import { completeDowngrade, getOrCreateHostInstanceId, hasLiveMission, isDowngradePending } from "./store.js";
 
 const SWARM_REVIEW_FEEDBACK_TOOL = "swarm_review_feedback";
 const HIVE_CELLS_TOOL = "hive_cells";
@@ -87,7 +90,7 @@ export interface WorkUnitRuntime {
   readonly db: DatabaseAdapter;
   readonly host: EffectHostIdentity;
   readonly isProcessAlive: (pid: number) => boolean;
-  readonly recovery: { recovered: number; foreignHostCandidates: string[] };
+  readonly recovery: { recovered: number; foreignHostCandidates: string[]; recoveredEffects: string[] };
   readonly store: WorkUnitMissionStore;
   readonly commands: MissionCommands;
   /** Builds ports against the runtime and binds them for the command layer's effect drains. */
@@ -103,12 +106,52 @@ export interface SetupWorkUnitRuntimeOptions extends WorkUnitMissionStoreOptions
   trace?: (step: "host" | "schema" | "migration" | "recovery" | "adapter" | "commands") => void;
 }
 
-function defaultIsProcessAlive(pid: number): boolean {
+/** PID liveness probe shared by plugin setup and CLI recovery. Never kills: signal 0 only. */
+export function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
   } catch (error) {
     return isRecord(error) && error.code === "EPERM";
+  }
+}
+
+/** Current host identity, reusing the stable per-hostname instance id persisted in the DB. */
+export async function resolveHostIdentity(db: DatabaseAdapter): Promise<EffectHostIdentity> {
+  const hostname = osHostname();
+  return { hostInstanceId: await getOrCreateHostInstanceId(db, hostname), hostname, pid: process.pid };
+}
+
+/**
+ * Consumes the current project's pending downgrade request: under the project
+ * cleanup SQL lock, rechecks that no mission is live, clears only recognized
+ * lifecycle KV keys through raw storage, then marks the request completed.
+ * Any failure leaves the request pending for the next setup. DB data is untouched.
+ */
+export async function consumePendingDowngrade(
+  db: DatabaseAdapter,
+  rawStorage: MissionStorageLike,
+  project: string,
+): Promise<{ status: "none" | "deferred" | "completed" | "failed"; clearedKeys?: number }> {
+  if (!(await isDowngradePending(db, project))) return { status: "none" };
+  const name = cleanupLockName(project);
+  const token = randomUUID();
+  const lock = await acquireWorkUnitLock(db, {
+    name, token, ownerSession: "swarmx-downgrade", now: Date.now(), staleAfterMs: CLEANUP_LOCK_STALE_MS,
+  });
+  if (!lock.acquired) return { status: "deferred" };
+  try {
+    if (await hasLiveMission(db, project)) return { status: "deferred" };
+    // Raw removals: throws on the first failure (removed keys stay removed; a retry finishes the rest).
+    const keys = await listProjectLifecycleKeys(rawStorage, project);
+    for (const key of keys) await rawStorage.remove(key);
+    const clearedKeys = keys.length;
+    await completeDowngrade(db, project, clearedKeys);
+    return { status: "completed", clearedKeys };
+  } catch {
+    return { status: "failed" };
+  } finally {
+    await releaseWorkUnitLock(db, { name, token, fence: lock.fence });
   }
 }
 
@@ -118,8 +161,8 @@ export async function setupWorkUnitRuntime(
   opts: SetupWorkUnitRuntimeOptions = {},
 ): Promise<WorkUnitRuntime> {
   const { host: hostOption, isProcessAlive: aliveOption, trace, migrate, ...storeOptions } = opts;
-  const host = hostOption ?? { hostInstanceId: randomUUID(), hostname: osHostname(), pid: process.pid };
-  const isProcessAlive = aliveOption ?? defaultIsProcessAlive;
+  const host = hostOption ?? (await resolveHostIdentity(db));
+  const isAlive = aliveOption ?? isProcessAlive;
   trace?.("host");
   await ensureWorkUnitSchema(db);
   trace?.("schema");
@@ -127,7 +170,7 @@ export async function setupWorkUnitRuntime(
     await migrateLegacyLifecycle(db, migrate);
     trace?.("migration");
   }
-  const recovery = await recoverStaleEffects(db, { hostInstanceId: host.hostInstanceId, hostname: host.hostname, isProcessAlive });
+  const recovery = await recoverStaleEffects(db, { hostInstanceId: host.hostInstanceId, hostname: host.hostname, isProcessAlive: isAlive });
   trace?.("recovery");
   const store = createWorkUnitMissionStore(db, storeOptions);
   trace?.("adapter");
@@ -135,7 +178,7 @@ export async function setupWorkUnitRuntime(
   const commands = createMissionCommands(db, { host, ports: () => ports });
   trace?.("commands");
   return {
-    db, host, isProcessAlive, recovery, store, commands,
+    db, host, isProcessAlive: isAlive, recovery, store, commands,
     createEffectPorts(runtime) {
       ports = createWorkUnitEffectPorts(runtime);
       return ports;
