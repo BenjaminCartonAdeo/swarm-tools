@@ -440,6 +440,7 @@ export function createMissionStateStore(
       return readMission(store, projectID, sessionID);
     },
     async save(state) {
+      await assertLegacyLifecycleWritable(store, state.projectID, state.sessionID);
       await storage.set(missionKey(state.projectID, state.sessionID), state as unknown as JsonValue);
     },
     async list() {
@@ -485,6 +486,7 @@ export async function putAttempt(
   projectID: string,
   attempt: DispatchAttempt,
 ): Promise<void> {
+  await assertLegacyLifecycleWritable(store, projectID, attempt.sessionID);
   await store.storage.set(attemptKey(projectID, attempt.callID), attempt as unknown as JsonValue);
 }
 
@@ -514,6 +516,7 @@ export async function acquireBuildLock(
   callID: string,
   command: string,
 ): Promise<boolean> {
+  await assertLegacyLifecycleWritable(store, projectID, sessionID);
   return withMissionLock(projectID, "__build__", async () => {
     const key = buildLockKey(projectID);
     const raw = await store.storage.get(key);
@@ -823,6 +826,7 @@ export async function setAssignment(
   agent: string,
   owner?: AssignmentOwner,
 ): Promise<void> {
+  await assertLegacyLifecycleWritable(store, projectID, owner?.sessionID);
   await store.storage.set(assignmentKey(projectID, cellID), {
     cellID,
     agent,
@@ -1126,4 +1130,207 @@ export async function audit(
         : { consolidation: { ...mission.consolidation } }),
     };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Legacy lifecycle cutover: read-only KV view + write tombstone.
+// ---------------------------------------------------------------------------
+
+/** Prefix of the KV tombstone written once the legacy lifecycle was imported. */
+export const LEGACY_TOMBSTONE_PREFIX = "legacy-tombstone:";
+/** Session marker of the project-wide tombstone. */
+export const LEGACY_TOMBSTONE_PROJECT_SESSION = "*";
+
+export function legacyTombstoneKey(projectID: string, sessionID: string): string {
+  return `${LEGACY_TOMBSTONE_PREFIX}${projectID}:${sessionID}`;
+}
+
+/** Raised when a lifecycle write targets KV after the legacy import tombstone. */
+export class LegacyLifecycleTombstonedError extends Error {
+  readonly projectID: string;
+  constructor(projectID: string) {
+    super(`Legacy lifecycle state for project ${projectID} was imported; KV writes are read-only`);
+    this.name = "LegacyLifecycleTombstonedError";
+    this.projectID = projectID;
+  }
+}
+
+async function assertLegacyLifecycleWritable(
+  store: Pick<MissionStateStore, "storage">,
+  projectID: string,
+  sessionID: string | undefined,
+): Promise<void> {
+  const keys = [legacyTombstoneKey(projectID, LEGACY_TOMBSTONE_PROJECT_SESSION)];
+  if (sessionID !== undefined) keys.push(legacyTombstoneKey(projectID, sessionID));
+  for (const key of keys) {
+    if ((await store.storage.get(key)) !== undefined) throw new LegacyLifecycleTombstonedError(projectID);
+  }
+}
+
+export interface LegacyAssignment {
+  readonly cellID: string;
+  readonly agent: string;
+  readonly updatedAt: IsoTimestamp;
+  readonly sessionID?: string;
+}
+
+export interface LegacyPendingCompletion {
+  readonly projectID: string;
+  readonly parentSessionID: string;
+  readonly missionID: string;
+  readonly workerSessionID: string;
+  readonly taskID: string;
+  readonly epicID: string;
+  readonly workerAgentID: string;
+  readonly attemptCallID: string;
+  readonly dispatchToken: string;
+  readonly summary: string;
+  readonly filesTouched: readonly string[];
+  readonly submittedAt: number;
+  readonly finalized?: boolean;
+  readonly canceled?: boolean;
+  readonly cancelReason?: string;
+  readonly verification?: unknown;
+  readonly [extra: string]: unknown;
+}
+
+export interface LegacyReviewReceipt {
+  readonly projectID: string;
+  readonly sessionID: string;
+  readonly missionID: string;
+  readonly taskID: string;
+  readonly assignedAgentID: string;
+  readonly attemptCallID: string;
+  readonly dispatchToken: string;
+  readonly diffHash: string;
+  readonly reviewedAt: number;
+  readonly approval?: { readonly diffHash: string; readonly approvedAt: number; readonly [extra: string]: unknown };
+  readonly [extra: string]: unknown;
+}
+
+export interface LegacyBuildLock {
+  readonly projectID: string;
+  readonly sessionID: string;
+  readonly callID: string;
+  readonly command: string;
+  readonly acquiredAt: IsoTimestamp;
+}
+
+export interface LegacyCleanupClaim {
+  readonly taskID: string;
+  readonly at: number;
+}
+
+/** Read-only view over the legacy KV lifecycle documents. */
+export interface LegacyLifecycleReader {
+  getMission(project: string, session: string): Promise<MissionState | undefined>;
+  listAttempts(project: string, session?: string): Promise<DispatchAttempt[]>;
+  listAssignments(project: string): Promise<LegacyAssignment[]>;
+  listPendingCompletions(project: string): Promise<LegacyPendingCompletion[]>;
+  listReviewReceipts(project: string): Promise<LegacyReviewReceipt[]>;
+  getBuildLock(project: string): Promise<LegacyBuildLock | undefined>;
+  getCleanupClaim(project: string): Promise<LegacyCleanupClaim | undefined>;
+}
+
+export interface LegacyLifecycleStore extends LegacyLifecycleReader {
+  setTombstone(project: string, session: string, value: JsonValue): Promise<void>;
+}
+
+const isStr = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+const isNum = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+const isStrList = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((item) => typeof item === "string");
+
+function isLegacyPendingCompletion(value: unknown): value is LegacyPendingCompletion {
+  return (
+    isRecord(value) &&
+    isStr(value.projectID) &&
+    isStr(value.parentSessionID) &&
+    isStr(value.missionID) &&
+    isStr(value.workerSessionID) &&
+    isStr(value.taskID) &&
+    isStr(value.epicID) &&
+    isStr(value.workerAgentID) &&
+    isStr(value.attemptCallID) &&
+    isStr(value.dispatchToken) &&
+    typeof value.summary === "string" &&
+    isStrList(value.filesTouched) &&
+    isNum(value.submittedAt)
+  );
+}
+
+function isLegacyReviewReceipt(value: unknown): value is LegacyReviewReceipt {
+  if (!isRecord(value)) return false;
+  const approval = value.approval;
+  return (
+    isStr(value.projectID) &&
+    isStr(value.sessionID) &&
+    isStr(value.missionID) &&
+    isStr(value.taskID) &&
+    isStr(value.assignedAgentID) &&
+    isStr(value.attemptCallID) &&
+    isStr(value.dispatchToken) &&
+    isStr(value.diffHash) &&
+    isNum(value.reviewedAt) &&
+    (approval === undefined || (isRecord(approval) && isStr(approval.diffHash) && isNum(approval.approvedAt)))
+  );
+}
+
+/** Builds the read-only legacy reader plus the single tombstone write over `ctx.storage`. */
+export function createLegacyLifecycleStore(store: MissionStateStore): LegacyLifecycleStore {
+  const scanValues = async (prefix: string): Promise<unknown[]> =>
+    (await scanAll(store.storage, prefix)).map((entry) => entry.value);
+  return {
+    getMission: (project, session) => readMission(store, project, session),
+    async listAttempts(project, session) {
+      const values = await scanValues(`${ATTEMPT_KEY_PREFIX}${project}:`);
+      return values
+        .filter(isDispatchAttempt)
+        .filter((attempt) => session === undefined || attempt.sessionID === session)
+        .sort(compareAttempts);
+    },
+    async listAssignments(project) {
+      const values = await scanValues(`${ASSIGNMENT_KEY_PREFIX}${project}:`);
+      const out: LegacyAssignment[] = [];
+      for (const value of values) {
+        if (!isRecord(value) || !isStr(value.cellID) || !isStr(value.agent) || !isStr(value.updatedAt)) continue;
+        if (value.sessionID !== undefined && !isStr(value.sessionID)) continue;
+        out.push({
+          cellID: value.cellID,
+          agent: value.agent,
+          updatedAt: value.updatedAt,
+          ...(isStr(value.sessionID) ? { sessionID: value.sessionID } : {}),
+        });
+      }
+      return out.sort((left, right) => left.cellID.localeCompare(right.cellID));
+    },
+    async listPendingCompletions(project) {
+      const prefix = `${["pending-completion:", project].map(encodeURIComponent).join(":")}:`;
+      return (await scanValues(prefix)).filter(isLegacyPendingCompletion).filter((v) => v.projectID === project);
+    },
+    async listReviewReceipts(project) {
+      const prefix = `${["review-receipt:", project].map(encodeURIComponent).join(":")}:`;
+      return (await scanValues(prefix)).filter(isLegacyReviewReceipt).filter((v) => v.projectID === project);
+    },
+    async getBuildLock(project) {
+      const raw = await store.storage.get(buildLockKey(project));
+      if (!isRecord(raw) || !isStr(raw.sessionID) || !isStr(raw.callID) || !isStr(raw.acquiredAt)) return undefined;
+      if (!Number.isFinite(Date.parse(raw.acquiredAt))) return undefined;
+      return {
+        projectID: isStr(raw.projectID) ? raw.projectID : project,
+        sessionID: raw.sessionID,
+        callID: raw.callID,
+        command: typeof raw.command === "string" ? raw.command : "",
+        acquiredAt: raw.acquiredAt,
+      };
+    },
+    async getCleanupClaim(project) {
+      const raw = await store.storage.get(`cleanup-claim:${project}`);
+      if (!isRecord(raw) || !isStr(raw.taskID) || !isNum(raw.at)) return undefined;
+      return { taskID: raw.taskID, at: raw.at };
+    },
+    async setTombstone(project, session, value) {
+      await store.storage.set(legacyTombstoneKey(project, session), value);
+    },
+  };
 }

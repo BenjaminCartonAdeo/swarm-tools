@@ -127,6 +127,10 @@ const schemaStatements = [
     fence INTEGER NOT NULL DEFAULT 0,
     budget_limit REAL,
     legacy_source TEXT,
+    mode TEXT,
+    budget_policy_json TEXT,
+    consolidation_json TEXT,
+    retry_causes_json TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE (project, session_id, mission_id)
@@ -200,26 +204,58 @@ const schemaStatements = [
     owner TEXT,
     raw_json TEXT NOT NULL,
     created_at INTEGER NOT NULL,
+    mission_pk TEXT,
+    agent TEXT,
+    state TEXT,
+    updated_at INTEGER,
     PRIMARY KEY (project, cell_id)
   )`,
 ] as const;
+
+type UpgradableColumn =
+  | {
+      table: "swarmx_missions";
+      column: "epic_id" | "mode" | "budget_policy_json" | "consolidation_json" | "retry_causes_json";
+      ddl: "TEXT";
+    }
+  | { table: "swarmx_effects"; column: "request_json"; ddl: "TEXT" }
+  | { table: "swarmx_legacy_assignments"; column: "mission_pk" | "agent" | "state"; ddl: "TEXT" }
+  | { table: "swarmx_legacy_assignments"; column: "updated_at"; ddl: "INTEGER" };
+
+const upgradableColumns: readonly UpgradableColumn[] = [
+  { table: "swarmx_missions", column: "epic_id", ddl: "TEXT" },
+  { table: "swarmx_missions", column: "mode", ddl: "TEXT" },
+  { table: "swarmx_missions", column: "budget_policy_json", ddl: "TEXT" },
+  { table: "swarmx_missions", column: "consolidation_json", ddl: "TEXT" },
+  { table: "swarmx_missions", column: "retry_causes_json", ddl: "TEXT" },
+  { table: "swarmx_effects", column: "request_json", ddl: "TEXT" },
+  { table: "swarmx_legacy_assignments", column: "mission_pk", ddl: "TEXT" },
+  { table: "swarmx_legacy_assignments", column: "agent", ddl: "TEXT" },
+  { table: "swarmx_legacy_assignments", column: "state", ddl: "TEXT" },
+  { table: "swarmx_legacy_assignments", column: "updated_at", ddl: "INTEGER" },
+];
+
+/** Adds a nullable column when missing. Identifiers come only from the internal literal union. */
+async function ensureColumn<C extends UpgradableColumn>(
+  db: DatabaseAdapter,
+  table: C["table"],
+  column: C["column"],
+  ddl: C["ddl"],
+): Promise<void> {
+  const columns = await db.query(`PRAGMA table_info(${table})`);
+  const present = columns.rows.some(
+    (row) => typeof row === "object" && row !== null && "name" in row && Reflect.get(row, "name") === column,
+  );
+  if (!present) {
+    await db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+  }
+}
 
 export async function ensureWorkUnitSchema(db: DatabaseAdapter): Promise<void> {
   for (const statement of schemaStatements) {
     await db.exec(statement);
   }
-  const missionColumns = await db.query("PRAGMA table_info(swarmx_missions)");
-  const hasEpicId = missionColumns.rows.some(
-    (row) => typeof row === "object" && row !== null && "name" in row && Reflect.get(row, "name") === "epic_id",
-  );
-  if (!hasEpicId) {
-    await db.exec("ALTER TABLE swarmx_missions ADD COLUMN epic_id TEXT");
-  }
-  const effectColumns = await db.query("PRAGMA table_info(swarmx_effects)");
-  const hasRequestJson = effectColumns.rows.some(
-    (row) => typeof row === "object" && row !== null && "name" in row && Reflect.get(row, "name") === "request_json",
-  );
-  if (!hasRequestJson) {
-    await db.exec("ALTER TABLE swarmx_effects ADD COLUMN request_json TEXT");
+  for (const entry of upgradableColumns) {
+    await ensureColumn(db, entry.table, entry.column, entry.ddl);
   }
 }
