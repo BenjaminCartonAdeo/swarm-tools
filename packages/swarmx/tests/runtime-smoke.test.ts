@@ -16,6 +16,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
 import { mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -1917,7 +1918,7 @@ interface NativeRig {
   drift: boolean;
 }
 
-async function createNativeRig(options: { readonly feedbackSucceeds?: boolean } = {}): Promise<NativeRig> {
+async function createNativeRig(options: { readonly feedbackSucceeds?: boolean; readonly cleanupFails?: boolean } = {}): Promise<NativeRig> {
   const native = await createNativeMission();
   const project = await createNativeProject();
   const hive = new Map<string, { status: string; completion_operation_id?: string }>();
@@ -1942,6 +1943,9 @@ async function createNativeRig(options: { readonly feedbackSucceeds?: boolean } 
         return [...hive.entries()].map(([cellID, cell]) => ({ id: cellID, ...cell }));
       }
       if (name === "hive_create") return { id: "cell-consolidate" };
+      if (name === "swarm_worktree_cleanup" && options.cleanupFails === true) {
+        return { success: false, error: "cleanup backend exploded" };
+      }
       if (name === "swarm_review_feedback") {
         return options.feedbackSucceeds === false ? { success: false, error: "rejected" } : { success: true };
       }
@@ -2014,7 +2018,7 @@ describe("WorkUnit completion lifecycle", () => {
   afterEach(async () => {
     for (const n of rigs.splice(0)) await n.project.cleanup();
   });
-  async function nativeRig(options: { readonly feedbackSucceeds?: boolean } = {}): Promise<NativeRig> {
+  async function nativeRig(options: { readonly feedbackSucceeds?: boolean; readonly cleanupFails?: boolean } = {}): Promise<NativeRig> {
     const n = await createNativeRig(options);
     rigs.push(n);
     return n;
@@ -2263,6 +2267,91 @@ describe("WorkUnit completion lifecycle", () => {
     const unit = await nativeUnit(n, "cell-a");
     expect(unit).toMatchObject({ state: "IN_REVIEW", review_verdict: null });
     expect(await nativeEffects(n, unit.id)).toEqual([]);
+  });
+
+  async function nativeApprove(n: NativeRig, cellID: string, callID: string, workerSessionID: string): Promise<void> {
+    await nativeDispatch(n, cellID, callID, workerSessionID);
+    await nativeSubmit(n, cellID, ["docs/guide.md"], {}, workerSessionID);
+    await nativeReview(n, cellID, ["docs/guide.md"]);
+    await nativeFeedback(n, cellID, "approved");
+    expect((await nativeUnit(n, cellID)).state).toBe("DONE");
+  }
+
+  function nativeFinish(n: NativeRig) {
+    return n.rig.tools.get("swarm_finish")!.execute({}, toolContext("swarm/swarm-coordinator", "call-finish"));
+  }
+
+  test("WorkUnit MissionBarrier: finish requires consolidation when multiple work cells lack a completed consolidation", async () => {
+    const n = await nativeRig();
+    await nativeApprove(n, "cell-a", "call-a", "ses-worker");
+    await nativeApprove(n, "cell-b", "call-b", "ses-worker-b");
+    await expect(nativeFinish(n)).rejects.toThrow(/consolidation required/);
+    const mission = await getMission(n.native.runtime.db, PROJECT, SESSION);
+    expect(mission?.state).toBe("OPEN");
+  });
+
+  test("WorkUnit finish reports skipped worktree cleanup warning", async () => {
+    const n = await nativeRig();
+    await nativeApprove(n, "cell-a", "call-a", "ses-worker");
+    // Without a resolvable canonical project root, cleanup is skipped, not failed.
+    await n.project.cleanup();
+    const result = await nativeFinish(n);
+    expect((result.output as { warnings?: unknown }).warnings).toEqual([
+      expect.objectContaining({ type: "warning", code: "worktree_cleanup_skipped", taskID: "cell-a" }),
+    ]);
+    expect(n.rig.runCalls.some((call) => call.name === "swarm_worktree_cleanup")).toBe(false);
+  });
+
+  test("WorkUnit finish reports failed worktree cleanup warning", async () => {
+    const n = await nativeRig({ cleanupFails: true });
+    await nativeApprove(n, "cell-a", "call-a", "ses-worker");
+    const result = await nativeFinish(n);
+    expect((result.output as { finished?: boolean }).finished).toBe(true);
+    expect((result.output as { warnings?: unknown }).warnings).toEqual([
+      expect.objectContaining({
+        type: "warning",
+        code: "worktree_cleanup_failed",
+        taskID: "cell-a",
+        message: "cleanup backend exploded",
+      }),
+    ]);
+  });
+
+  test("WorkUnit review rejects files outside the reviewed project scope", async () => {
+    const n = await nativeRig();
+    await nativeDispatch(n, "cell-a", "call-a");
+    await nativeSubmit(n, "cell-a", ["src/a.ts"]);
+    await expect(nativeReview(n, "cell-a", ["../outside.ts"])).rejects.toThrow(/invalid_input.*portable repo-relative/);
+    await expect(nativeReview(n, "cell-a", ["/etc/passwd"])).rejects.toThrow(/swarm_review failed .invalid_input./);
+    expect(n.rig.runCalls.some((call) => call.name === "swarm_review")).toBe(false);
+    expect((await nativeUnit(n, "cell-a")).state).toBe("SUBMITTED");
+  });
+
+  test("WorkUnit completion records missing_start_time violation and uses fallback", async () => {
+    const n = await nativeRig();
+    const previous = process.env.SWARM_SESSIONS_DIR;
+    const sessionsDir = join(n.project.path, ".sessions");
+    process.env.SWARM_SESSIONS_DIR = sessionsDir;
+    try {
+      await nativeDispatch(n, "cell-a", "call-a");
+      const output = await nativeSubmit(n, "cell-a", ["src/a.ts"], { start_time: undefined });
+      expect(output).toMatchObject({ status: "pending_review" });
+      expect((await nativeUnit(n, "cell-a")).state).toBe("SUBMITTED");
+      const events = readdirSync(sessionsDir)
+        .flatMap((file) => readFileSync(join(sessionsDir, file), "utf-8").split("\n"))
+        .filter((line) => line.trim().length > 0)
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((event) => event.event_type === "VIOLATION");
+      expect(events).toEqual([
+        expect.objectContaining({
+          violation_type: "missing_start_time",
+          payload: expect.objectContaining({ tool: "swarm_complete", bead_id: "cell-a" }),
+        }),
+      ]);
+    } finally {
+      if (previous === undefined) delete process.env.SWARM_SESSIONS_DIR;
+      else process.env.SWARM_SESSIONS_DIR = previous;
+    }
   });
 
   test("native pending completion is denied without a legacy store", async () => {
