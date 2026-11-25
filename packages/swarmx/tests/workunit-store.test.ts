@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createLibSQLAdapter, type DatabaseAdapter } from "swarm-mail";
 import { ensureWorkUnitSchema } from "../src/workunit/schema.js";
-import { getMissionBudgetUsed, transitionWorkUnit } from "../src/workunit/store.js";
+import { FenceConflictError, getMissionBudgetUsed, InvalidPatchError, transitionWorkUnit } from "../src/workunit/store.js";
 import { LEGAL_WORK_UNIT_TRANSITIONS, type WorkUnitState } from "../src/workunit/schema.js";
 
 async function seedUnit(
@@ -243,6 +243,85 @@ describe("WorkUnit transitions and budgets", () => {
           expect(after.rows).toEqual(before.rows);
         }
       }
+    } finally {
+      await db.close?.();
+    }
+  });
+
+  test("requestChangesClearsWorkerSessionInSameUpdate", async () => {
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      await ensureWorkUnitSchema(db);
+      await seedUnit(db, "rc", "IN_REVIEW", 7);
+      await db.query("UPDATE swarmx_work_units SET worker_session = 'ws', worker_agent = 'wa' WHERE id = 'rc'");
+      const returned = await transitionWorkUnit(db, {
+        unitId: "rc",
+        expectedState: "IN_REVIEW",
+        unitFence: 7,
+        nextState: "RETURNING",
+        patch: { kind: "request_changes", reviewVerdict: "changes", reviewFeedbackJson: '{"fix":1}' },
+      });
+      expect(returned).toMatchObject({
+        state: "RETURNING",
+        fence: 8,
+        worker_session: null,
+        review_verdict: "changes",
+        review_feedback_json: '{"fix":1}',
+      });
+      const stored = await db.query("SELECT state, fence, worker_session FROM swarmx_work_units WHERE id = 'rc'");
+      expect(stored.rows[0]).toMatchObject({ state: "RETURNING", fence: 8, worker_session: null });
+    } finally {
+      await db.close?.();
+    }
+  });
+
+  test("legalTransitionWithMissingOrWrongPatchPerformsNoWrite", async () => {
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      await ensureWorkUnitSchema(db);
+      await seedUnit(db, "p1", "RESERVED", 3);
+      const snapshot = async () =>
+        (await db.query("SELECT state, fence, worker_session, updated_at FROM swarmx_work_units WHERE id = 'p1'")).rows[0];
+      const before = await snapshot();
+      await expect(
+        transitionWorkUnit(db, { unitId: "p1", expectedState: "RESERVED", unitFence: 3, nextState: "BOUND" }),
+      ).rejects.toBeInstanceOf(InvalidPatchError);
+      await expect(
+        transitionWorkUnit(db, {
+          unitId: "p1",
+          expectedState: "RESERVED",
+          unitFence: 3,
+          nextState: "BOUND",
+          patch: { kind: "cancel", reason: "wrong" },
+        }),
+      ).rejects.toMatchObject({ name: "InvalidPatchError", expectedKind: "bind", actualKind: "cancel" });
+      expect(await snapshot()).toEqual(before);
+    } finally {
+      await db.close?.();
+    }
+  });
+
+  test("concurrentSameFenceTransitionsHaveExactlyOneWinner", async () => {
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      await ensureWorkUnitSchema(db);
+      await seedUnit(db, "race", "RESERVED", 1);
+      const attempt = (session: string) =>
+        transitionWorkUnit(db, {
+          unitId: "race",
+          expectedState: "RESERVED",
+          unitFence: 1,
+          nextState: "BOUND",
+          patch: { kind: "bind", workerSession: session, workerAgent: session },
+        });
+      const results = await Promise.allSettled([attempt("a"), attempt("b")]);
+      const won = results.filter((r) => r.status === "fulfilled");
+      const lost = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+      expect(won).toHaveLength(1);
+      expect(lost).toHaveLength(1);
+      expect(lost[0]?.reason).toBeInstanceOf(FenceConflictError);
+      const stored = await db.query("SELECT fence FROM swarmx_work_units WHERE id = 'race'");
+      expect(stored.rows[0]).toMatchObject({ fence: 2 });
     } finally {
       await db.close?.();
     }

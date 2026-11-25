@@ -36,9 +36,25 @@ export class FenceConflictError extends Error {
   }
 }
 
+export class InvalidPatchError extends Error {
+  readonly expectedKind: PatchKind;
+  readonly actualKind: PatchKind | undefined;
+  constructor(from: WorkUnitState, to: WorkUnitState, expectedKind: PatchKind, actualKind: PatchKind | undefined) {
+    super(`Transition ${from} -> ${to} requires patch kind ${expectedKind}, got ${String(actualKind)}`);
+    this.name = "InvalidPatchError";
+    this.expectedKind = expectedKind;
+    this.actualKind = actualKind;
+  }
+}
+
 type PatchKind = WorkUnitPatch["kind"];
 
-const transitionPatchKinds: Readonly<Record<string, PatchKind>> = {
+type LegalTransitions = typeof LEGAL_WORK_UNIT_TRANSITIONS;
+export type LegalTransitionKey = {
+  [From in keyof LegalTransitions]: `${From & string}->${LegalTransitions[From][number] & string}`;
+}[keyof LegalTransitions];
+
+const transitionPatchKinds: { readonly [K in LegalTransitionKey]: PatchKind } = {
   "RESERVED->BOUND": "bind",
   "BOUND->SUBMITTED": "submit",
   "SUBMITTED->IN_REVIEW": "begin_review",
@@ -123,9 +139,9 @@ export async function transitionWorkUnit(
     throw new IllegalTransitionError(expectedState, nextState);
   }
 
-  const expectedPatchKind = transitionPatchKinds[`${expectedState}->${nextState}`];
-  if (expectedPatchKind === undefined || patch?.kind !== expectedPatchKind) {
-    throw new TypeError(`Transition ${expectedState} -> ${nextState} requires patch kind ${String(expectedPatchKind)}`);
+  const expectedPatchKind = transitionPatchKinds[`${expectedState}->${nextState}` as LegalTransitionKey];
+  if (patch?.kind !== expectedPatchKind) {
+    throw new InvalidPatchError(expectedState, nextState, expectedPatchKind, patch?.kind);
   }
 
   const assignment = patchAssignments(patch);
@@ -147,10 +163,10 @@ export async function getWorkUnit(db: DatabaseAdapter, unitId: string): Promise<
   return isRecord(row) ? (row as unknown as WorkUnit) : null;
 }
 
-export async function getMissionBudgetUsed(db: DatabaseAdapter, missionId: string): Promise<number> {
+export async function getMissionBudgetUsed(db: DatabaseAdapter, missionPk: string): Promise<number> {
   const result = await db.query(
     "SELECT COALESCE(SUM(budget_charge), 0) AS total FROM swarmx_work_units WHERE mission_pk = ?",
-    [missionId],
+    [missionPk],
   );
   const row: unknown = result.rows[0];
   if (!isRecord(row)) return 0;
