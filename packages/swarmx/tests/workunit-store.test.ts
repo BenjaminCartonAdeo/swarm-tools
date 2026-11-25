@@ -1,6 +1,23 @@
 import { describe, expect, test } from "bun:test";
-import { createLibSQLAdapter } from "swarm-mail";
+import { createLibSQLAdapter, type DatabaseAdapter } from "swarm-mail";
 import { ensureWorkUnitSchema } from "../src/workunit/schema.js";
+import { getMissionBudgetUsed, transitionWorkUnit } from "../src/workunit/store.js";
+import { LEGAL_WORK_UNIT_TRANSITIONS, type WorkUnitState } from "../src/workunit/schema.js";
+
+async function seedUnit(
+  db: DatabaseAdapter,
+  id: string,
+  state: WorkUnitState,
+  fence = 1,
+  budgetCharge: number | null = null,
+): Promise<void> {
+  await db.query(
+    `INSERT INTO swarmx_missions (id, project, session_id, mission_id, state, fence, created_at, updated_at) VALUES ('m-${id}', 'p', 's-${id}', 'mission-${id}', 'OPEN', 1, 0, 0)`,
+  );
+  await db.query(
+    `INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, idem_key, attempt_no, state, fence, budget_charge, created_at, updated_at) VALUES ('${id}', 'p', 'm-${id}', 'call-${id}', 'idem-${id}', 1, '${state}', ${fence}, ${budgetCharge === null ? "NULL" : budgetCharge}, 0, 0)`,
+  );
+}
 
 function rowValue(row: unknown, key: string): unknown {
   if (typeof row !== "object" || row === null || !(key in row)) {
@@ -37,24 +54,24 @@ describe("WorkUnit schema", () => {
         "swarmx_units_live_cell_uq",
       ]);
 
-      await db.exec(
+      await db.query(
         "INSERT INTO swarmx_missions (id, project, session_id, mission_id, state, fence, created_at, updated_at) VALUES ('m1', 'p', 's', 'x', 'OPEN', 1, 0, 0)",
       );
       await expect(
-        db.exec(
+        db.query(
           "INSERT INTO swarmx_missions (id, project, session_id, mission_id, state, fence, created_at, updated_at) VALUES ('m2', 'p', 's', 'y', 'CLOSING', 1, 0, 0)",
         ),
       ).rejects.toThrow();
-      await db.exec(
+      await db.query(
         "INSERT INTO swarmx_missions (id, project, session_id, mission_id, state, fence, created_at, updated_at) VALUES ('m3', 'p', 's', 'z', 'FINISHED', 1, 0, 0)",
       );
       await expect(
-        db.exec(
+        db.query(
           "INSERT INTO swarmx_missions (id, project, session_id, mission_id, state, fence, created_at, updated_at) VALUES ('m4', 'p', 's', 'x', 'FINISHED', 1, 0, 0)",
         ),
       ).rejects.toThrow();
 
-      await db.exec(
+      await db.query(
         "INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, idem_key, attempt_no, state, fence, created_at, updated_at) VALUES ('u1', 'p', 'm1', 'call1', 'idem1', 1, 'RESERVED', 1, 0, 0)",
       );
       for (const [id, callId, idemKey] of [
@@ -62,29 +79,29 @@ describe("WorkUnit schema", () => {
         ["u3", "call3", "idem1"],
       ]) {
         await expect(
-          db.exec(
+          db.query(
             `INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, idem_key, attempt_no, state, fence, created_at, updated_at) VALUES ('${id}', 'p', 'm1', '${callId}', '${idemKey}', 1, 'BOUND', 1, 0, 0)`,
           ),
         ).rejects.toThrow();
       }
-      await db.exec(
+      await db.query(
         "INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, cell_id, idem_key, attempt_no, state, fence, created_at, updated_at) VALUES ('u4', 'p', 'm1', 'call4', 'cell1', 'idem4', 1, 'RESERVED', 1, 0, 0)",
       );
       await expect(
-        db.exec(
+        db.query(
           "INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, cell_id, idem_key, attempt_no, state, fence, created_at, updated_at) VALUES ('u5', 'p', 'm1', 'call5', 'cell1', 'idem5', 1, 'SUBMITTED', 1, 0, 0)",
         ),
       ).rejects.toThrow();
-      await db.exec("UPDATE swarmx_work_units SET state = 'DONE' WHERE id = 'u4'");
-      await db.exec(
+      await db.query("UPDATE swarmx_work_units SET state = 'DONE' WHERE id = 'u4'");
+      await db.query(
         "INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, cell_id, idem_key, attempt_no, state, fence, created_at, updated_at) VALUES ('u6', 'p', 'm1', 'call6', 'cell1', 'idem6', 1, 'RESERVED', 1, 0, 0)",
       );
 
-      await db.exec(
+      await db.query(
         "INSERT INTO swarmx_effects (effect_id, unit_id, kind, mandatory, unit_fence, state, attempt, updated_at) VALUES ('e1', 'u1', 'backend_complete', 1, 1, 'pending', 0, 0)",
       );
       await expect(
-        db.exec(
+        db.query(
           "INSERT INTO swarmx_effects (effect_id, unit_id, kind, mandatory, unit_fence, state, attempt, updated_at) VALUES ('e2', 'u1', 'backend_complete', 1, 1, 'pending', 0, 0)",
         ),
       ).rejects.toThrow();
@@ -95,20 +112,20 @@ describe("WorkUnit schema", () => {
           : undefined,
       ).toBe(1);
 
-      await db.exec(
+      await db.query(
         "INSERT INTO swarmx_locks (name, token, owner_session, fence, acquired_at) VALUES ('global', 't1', 's1', 1, 0)",
       );
       await expect(
-        db.exec(
+        db.query(
           "INSERT INTO swarmx_locks (name, token, owner_session, fence, acquired_at) VALUES ('global', 't2', 's2', 2, 0)",
         ),
       ).rejects.toThrow();
 
-      await db.exec(
+      await db.query(
         "INSERT INTO swarmx_legacy_assignments (project, cell_id, owner, raw_json, created_at) VALUES ('p', 'legacy-cell', NULL, '{}', 0)",
       );
       await expect(
-        db.exec(
+        db.query(
           "INSERT INTO swarmx_legacy_assignments (project, cell_id, owner, raw_json, created_at) VALUES ('p', 'legacy-cell', 'worker', '{}', 0)",
         ),
       ).rejects.toThrow();
@@ -118,6 +135,114 @@ describe("WorkUnit schema", () => {
           ? rowValue(legacy.rows.find((row) => rowValue(row, "name") === "owner"), "notnull")
           : undefined,
       ).toBe(0);
+    } finally {
+      await db.close?.();
+    }
+  });
+});
+
+describe("WorkUnit transitions and budgets", () => {
+  test("transitionUsesExpectedStateAndFence", async () => {
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      await ensureWorkUnitSchema(db);
+      await seedUnit(db, "u1", "RESERVED", 4);
+
+      const bound = await transitionWorkUnit(db, {
+        unitId: "u1",
+        expectedState: "RESERVED",
+        unitFence: 4,
+        nextState: "BOUND",
+        patch: { kind: "bind", workerSession: "worker-session", workerAgent: "worker-agent" },
+      });
+      expect(bound.state).toBe("BOUND");
+      expect(bound.fence).toBe(5);
+      expect(bound.worker_session).toBe("worker-session");
+      expect(bound.worker_agent).toBe("worker-agent");
+
+      const submitted = await transitionWorkUnit(db, {
+        unitId: "u1",
+        expectedState: "BOUND",
+        unitFence: 5,
+        nextState: "SUBMITTED",
+        patch: { kind: "submit", evidenceHash: "e-hash", diffHash: "d-hash", evidenceJson: '{"ok":true}' },
+      });
+      expect(submitted.fence).toBe(6);
+      expect(submitted.evidence_hash).toBe("e-hash");
+      expect(submitted.diff_hash).toBe("d-hash");
+      expect(submitted.evidence_json).toBe('{"ok":true}');
+    } finally {
+      await db.close?.();
+    }
+  });
+
+  test("staleFenceCannotOverwriteNewState", async () => {
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      await ensureWorkUnitSchema(db);
+      await seedUnit(db, "u1", "RESERVED", 1);
+      await transitionWorkUnit(db, {
+        unitId: "u1",
+        expectedState: "RESERVED",
+        unitFence: 1,
+        nextState: "BOUND",
+        patch: { kind: "bind", workerSession: "w", workerAgent: "a" },
+      });
+      await expect(
+        transitionWorkUnit(db, {
+          unitId: "u1",
+          expectedState: "RESERVED",
+          unitFence: 1,
+          nextState: "BOUND",
+          patch: { kind: "bind", workerSession: "stale", workerAgent: "stale" },
+        }),
+      ).rejects.toMatchObject({ name: "FenceConflictError" });
+      const current = await db.query("SELECT state, fence, worker_session FROM swarmx_work_units WHERE id = 'u1'");
+      expect(current.rows[0]).toMatchObject({ state: "BOUND", fence: 2, worker_session: "w" });
+    } finally {
+      await db.close?.();
+    }
+  });
+
+  test("budgetSumsChargesIncludingRetries", async () => {
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      await ensureWorkUnitSchema(db);
+      await seedUnit(db, "u1", "FAILED", 2, 1.25);
+      await db.query(
+        "INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, idem_key, attempt_no, retry_of, state, fence, budget_charge, created_at, updated_at) VALUES ('u2', 'p', 'm-u1', 'call-u2', 'idem-u2', 2, 'u1', 'DONE', 3, 2.5, 0, 0)",
+      );
+      expect(await getMissionBudgetUsed(db, "m-u1")).toBe(3.75);
+    } finally {
+      await db.close?.();
+    }
+  });
+
+  test("everyIllegalTransitionIsRejectedWithoutWrite", async () => {
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      await ensureWorkUnitSchema(db);
+      const states = Object.keys(LEGAL_WORK_UNIT_TRANSITIONS) as WorkUnitState[];
+      let counter = 0;
+      for (const from of states) {
+        for (const to of states) {
+          if ((LEGAL_WORK_UNIT_TRANSITIONS[from] as readonly WorkUnitState[]).includes(to)) continue;
+          const id = `illegal-${counter++}`;
+          await seedUnit(db, id, from);
+          const before = await db.query(`SELECT fence, state FROM swarmx_work_units WHERE id = '${id}'`);
+          await expect(
+            transitionWorkUnit(db, {
+              unitId: id,
+              expectedState: from,
+              unitFence: 1,
+              nextState: to,
+              patch: undefined,
+            }),
+          ).rejects.toMatchObject({ name: "IllegalTransitionError" });
+          const after = await db.query(`SELECT fence, state FROM swarmx_work_units WHERE id = '${id}'`);
+          expect(after.rows).toEqual(before.rows);
+        }
+      }
     } finally {
       await db.close?.();
     }
