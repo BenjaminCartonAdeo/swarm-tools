@@ -6,6 +6,7 @@
  * explicit legacy override being ignored, and a bundle that cannot load swarm-mail.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Plugin } from "@opencode/plugin";
 import { createLibSQLAdapter, getSwarmMailDatabaseAdapter, type DatabaseAdapter } from "swarm-mail";
@@ -113,14 +114,112 @@ describe("default setup: WorkUnit lifecycle", () => {
     expect([...ctx.storage.map.keys()].filter((k) => k.startsWith("legacy-tombstone:"))).toEqual([]);
   });
 
-  test("built bundle imports and resolves swarm-mail at runtime", async () => {
+  test("packed plugin + CLI bundles resolve swarm-mail from an isolated consumer outside the workspace", async () => {
     const pkg = join(import.meta.dir, "..");
-    const build = Bun.spawnSync(["bun", "run", "build"], { cwd: pkg, stdout: "pipe", stderr: "pipe" });
-    expect(build.exitCode).toBe(0);
-    const probe = Bun.spawnSync(["bun", "-e",
-      `const m = await import(${JSON.stringify(join(pkg, "dist/index.js"))}); console.log(typeof m.default?.setup, typeof m.setupWorkUnitRuntime);`,
-    ], { cwd: pkg, stdout: "pipe", stderr: "pipe", env: { ...process.env, SWARM_DB_PATH: ":memory:" } });
-    expect(probe.stderr.toString()).toBe("");
-    expect(probe.stdout.toString().trim()).toBe("function function");
-  }, 60_000);
+    const mailPkg = join(pkg, "..", "swarm-mail");
+    await mkdir("/tmp/opencode", { recursive: true });
+    const root = await mkdtemp("/tmp/opencode/swarmx-consumer-");
+    const run = (cmd: string[], cwd: string) => {
+      const r = Bun.spawnSync(cmd, { cwd, stdout: "pipe", stderr: "pipe", env: { ...process.env, SWARM_DB_PATH: ":memory:" } });
+      return { code: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() };
+    };
+    try {
+      expect(run(["bun", "run", "build"], pkg).code).toBe(0);
+      expect(run(["bun", "pm", "pack", "--destination", root, "--quiet"], mailPkg).code).toBe(0);
+      expect(run(["bun", "pm", "pack", "--destination", root, "--quiet"], pkg).code).toBe(0);
+      const tarballs = (await readdir(root)).filter((f) => f.endsWith(".tgz"));
+      const mailTgz = tarballs.find((f) => f.startsWith("swarm-mail-"));
+      const swarmxTgz = tarballs.find((f) => f.startsWith("benjamin-swarmx-"));
+      expect(mailTgz).toBeDefined();
+      expect(swarmxTgz).toBeDefined();
+      const consumer = join(root, "consumer");
+      await mkdir(join(consumer, "node_modules", "@opencode"), { recursive: true });
+      await writeFile(join(consumer, "package.json"), JSON.stringify({
+        name: "swarmx-consumer", private: true, type: "module",
+        dependencies: { "@benjamin/swarmx": `file:../${swarmxTgz}`, "swarm-mail": `file:../${mailTgz}` },
+        overrides: { "swarm-mail": `file:../${mailTgz}` },
+      }));
+      const install = run(["bun", "install", "--production", "--omit=peer"], consumer);
+      expect(install.code).toBe(0);
+      // @opencode/plugin is a host-provided peer (OpenCode supplies it); link the workspace copy.
+      await symlink(await realpath(join(pkg, "node_modules", "@opencode", "plugin")), join(consumer, "node_modules", "@opencode", "plugin"));
+      const installed = join(consumer, "node_modules", "@benjamin", "swarmx");
+      expect(await realpath(installed)).not.toContain(join(pkg, ".."));
+
+      const plugin = run(["node", "--input-type=module", "-e",
+        `const m = await import("@benjamin/swarmx"); const mail = await import("swarm-mail"); console.log(typeof m.default?.setup, typeof m.setupWorkUnitRuntime, typeof mail.getSwarmMailDatabaseAdapter);`,
+      ], consumer);
+      expect(plugin.err).toBe("");
+      expect(plugin.out.trim()).toBe("function function function");
+
+      const cli = run(["node", join(installed, "dist", "bin", "swarmx.js"), "doctor", "--target", join(root, "target"), "--json"], consumer);
+      const report = JSON.parse(cli.out) as { command?: string; error?: string };
+      expect(report.error).toBeUndefined();
+      expect(report.command).toBe("doctor");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 180_000);
+});
+
+describe("default setup: SQL build lock through shell hooks", () => {
+  type Hook = (event: unknown) => Promise<void>;
+  async function rig(): Promise<{ db: DatabaseAdapter; before: (id: string) => Promise<void>; after: (id: string) => Promise<void> }> {
+    const db = await freshDb();
+    const ctx = createFakeContext({ projectId: `${P}-lock`, storage: [] });
+    await createSwarmxPlugin({ workUnitDatabase: async () => db }).setup(ctx as unknown as Plugin.Context);
+    const beforeHook = ctx.captures.toolHooks.get("execute.before")?.[0] as Hook | undefined;
+    const afterHook = ctx.captures.toolHooks.get("execute.after")?.[0] as Hook | undefined;
+    expect(beforeHook).toBeDefined();
+    expect(afterHook).toBeDefined();
+    const shell = (id: string) => ({
+      tool: "shell", sessionID: "ses-lock", agent: "build", messageID: `msg-${id}`, id, input: { command: "bun run build" },
+    });
+    return {
+      db,
+      before: (id) => beforeHook!(shell(id)),
+      after: (id) => afterHook!({ ...shell(id), status: "completed", result: { output: "ok" } }),
+    };
+  }
+  const lockTokens = async (db: DatabaseAdapter): Promise<string[]> =>
+    (await db.query<{ token: string }>("SELECT token FROM swarmx_locks")).rows.map((row) => String(row.token));
+  const BUSY = "another build/test is already running";
+
+  test("a concurrent build is refused while the SQL lock is held", async () => {
+    const r = await rig();
+    await r.before("call-a");
+    expect(await lockTokens(r.db)).toEqual(["call-a"]);
+    await expect(r.before("call-b")).rejects.toThrow(BUSY);
+  });
+
+  test("release from a different callID is a no-op", async () => {
+    const r = await rig();
+    await r.before("call-a");
+    await r.after("call-b");
+    expect(await lockTokens(r.db)).toEqual(["call-a"]);
+    await expect(r.before("call-b")).rejects.toThrow(BUSY);
+  });
+
+  test("acquire succeeds after the owner releases", async () => {
+    const r = await rig();
+    await r.before("call-a");
+    await r.after("call-a");
+    expect(await lockTokens(r.db)).toEqual([]);
+    await r.before("call-b");
+    expect(await lockTokens(r.db)).toEqual(["call-b"]);
+    await r.after("call-b");
+    expect(await lockTokens(r.db)).toEqual([]);
+  });
+
+  test("a stale lock left by a missed release is reclaimed", async () => {
+    const r = await rig();
+    await r.before("call-a");
+    // call-a never reaches execute.after; age its lock past the 15-minute stale window.
+    await r.db.query("UPDATE swarmx_locks SET acquired_at = ?", [Date.now() - 16 * 60 * 1000]);
+    await r.before("call-b");
+    expect(await lockTokens(r.db)).toEqual(["call-b"]);
+    // The late release of the reclaimed owner must not drop the new holder's lock.
+    await r.after("call-a");
+    expect(await lockTokens(r.db)).toEqual(["call-b"]);
+  });
 });
