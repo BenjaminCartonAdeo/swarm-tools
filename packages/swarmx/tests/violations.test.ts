@@ -20,14 +20,10 @@ import { join } from "node:path";
 import type { Plugin } from "@opencode/plugin";
 
 import { extractCellMarker } from "../src/dispatch";
-import { createSwarmxPlugin } from "../src/index";
+import { createSwarmxPlugin, setupWorkUnitRuntime, type WorkUnitRuntime } from "../src/index";
+import { createLibSQLAdapter } from "swarm-mail";
+import { createMission } from "../src/workunit/mission";
 import { createSessionEventWriter } from "../src/session-events";
-import {
-  createMissionStateStore,
-  setAssignment,
-  setBudget,
-  type MissionStorageLike,
-} from "../src/state";
 import type { CellMarker } from "../src/types";
 import {
   createFakeContext,
@@ -66,18 +62,31 @@ interface Rig {
   readonly tools: Map<string, FakeToolInfo>;
   readonly before: (payload: FakeToolBeforePayload) => Promise<void>;
   readonly bindWorker: (marker: CellMarker) => void;
+  readonly workUnit: WorkUnitRuntime;
+  readonly missionPk: string;
 }
 
 /** Boots the plugin on a fake host, with the real JSONL writer as the sink. */
 async function createRig(projectPath: string): Promise<Rig> {
   const ctx = createFakeContext({ agents: AGENTS, projectId: PROJECT, projectPath });
+  const db = await createLibSQLAdapter({ url: ":memory:" });
+  const workUnit = await setupWorkUnitRuntime(db, {
+    projectID: PROJECT,
+    host: { hostInstanceId: "violations", hostname: "test-host", pid: 1 },
+  });
+  const mission = await createMission(db, {
+    project: PROJECT,
+    sessionId: SESSION,
+    missionId: "violations-mission",
+    mode: "dev",
+    budgetPolicy: { total: 5, perCellIterations: 5, workerShare: null, version: 1 },
+  });
   const workerCells = new Map<string, CellMarker>();
   const workerParents = new Map<string, string | null>([[WORKER_SESSION, SESSION]]);
   const plugin = createSwarmxPlugin({
     runtime: {
       runTool: async () => ({ ok: true }),
-      // Legacy-store assertions: explicitly opt out of the default WorkUnit lifecycle.
-      workUnit: undefined,
+      workUnit,
       sessionID: () => SESSION,
       sessionEvents: createSessionEventWriter(),
       workerProtocol: "",
@@ -105,6 +114,8 @@ async function createRig(projectPath: string): Promise<Rig> {
     bindWorker: (marker) => {
       workerCells.set(WORKER_SESSION, marker);
     },
+    workUnit,
+    missionPk: mission.id,
   };
 }
 
@@ -128,18 +139,10 @@ function workerContext(id: string): {
 
 /** Active mission + assigned cell + one dispatched attempt for `CELL`. */
 async function dispatchWorker(rig: Rig): Promise<void> {
-  const store = createMissionStateStore(rig.ctx.storage as unknown as MissionStorageLike, {
-    projectID: PROJECT,
-  });
-  await setBudget(store, {
-    projectID: PROJECT,
-    sessionID: SESSION,
-    mode: "dev",
-    maxSpawns: 5,
-    maxIterations: 5,
-    workerShare: 1,
-  });
-  await setAssignment(store, PROJECT, CELL, "swarm/swarm-worker");
+  await rig.workUnit.commands.assignCell(
+    { kind: "coordinator", sessionId: SESSION },
+    { missionPk: rig.missionPk, cellId: CELL, agent: "swarm/swarm-worker" },
+  );
   const payload: FakeToolBeforePayload = {
     tool: "subagent",
     sessionID: SESSION,
@@ -229,12 +232,11 @@ describe("VIOLATION events", () => {
     });
   });
 
-  test("missing start_time without WorkUnit fails typed before recording", async () => {
+  test("missing start_time records one violation on native submission", async () => {
     const rig = await createRig(projectPath);
     await dispatchWorker(rig);
 
-    // This rig omits WorkUnit: the violation is recorded before submission,
-    // then swarm_complete fails typed instead of falling back to raw KV.
+    // start_time is optional for submission, but its absence is recorded as a violation.
     await expect(
       rig.tools.get("swarm_complete")!.execute(
         {
@@ -246,8 +248,8 @@ describe("VIOLATION events", () => {
         },
         workerContext("call-complete-no-start"),
       ),
-    ).rejects.toThrow("swarm_complete failed [runtime_unavailable]");
-    expect(readViolations(WORKER_SESSION)).toHaveLength(0);
+    ).resolves.toBeDefined();
+    expect(readViolations(WORKER_SESSION)).toHaveLength(1);
   });
 
   test("an explicit start_time records no violation", async () => {
@@ -266,7 +268,7 @@ describe("VIOLATION events", () => {
         },
         workerContext("call-complete-with-start"),
       ),
-    ).rejects.toThrow("swarm_complete failed [runtime_unavailable]");
+    ).resolves.toBeDefined();
 
     expect(readViolations(WORKER_SESSION)).toHaveLength(0);
   });

@@ -32,17 +32,13 @@ import {
   type DispatchBeforeEvent,
 } from "./dispatch";
 import {
-  acquireBuildLock,
-  bindWorkerAttemptSession,
   createMissionStateStore,
   createTombstoneGuardedStorage,
   listAssignments,
   listAttempts,
   readMission,
-  releaseBuildLock,
   selectPendingOrphans,
   type MissionStorageLike,
-  legacyStoreOf,
   createLegacyLifecycleStore,
 } from "./state";
 import type { DispatchAgentInfo, DispatchAgentList, SwarmxRuntime, ToolContextLike } from "./types";
@@ -177,8 +173,10 @@ async function workerMutationDenial(
   }
   if (caller === undefined) return "token_missing";
   if (caller.mode === "primary") return undefined;
+  // Worker capabilities are WorkUnit-only: a CLI-only runtime never binds legacy KV attempts.
+  const native = runtime.workUnit;
   if (
-    (runtime.store === undefined && runtime.workUnit === undefined) ||
+    native === undefined ||
     runtime.projectID === undefined ||
     runtime.resolveWorkerParentSession === undefined ||
     runtime.resolveWorkerCell === undefined
@@ -199,13 +197,7 @@ async function workerMutationDenial(
   if (parentSessionID === undefined) return "token_missing";
   let mission;
   try {
-    if (runtime.workUnit === undefined) {
-      const legacyStore = legacyStoreOf(runtime);
-      if (legacyStore === undefined) return "token_missing";
-      mission = await readMission(legacyStore, runtime.projectID, parentSessionID);
-    } else {
-      mission = await runtime.workUnit.store.load(runtime.projectID, parentSessionID);
-    }
+    mission = await native.store.load(runtime.projectID, parentSessionID);
   } catch {
     return "token_missing";
   }
@@ -215,26 +207,13 @@ async function workerMutationDenial(
   let bindingStatus: "bound" | "already_bound" | "not_owner" | "revoked" | "inactive" | "token_missing";
   let followup: boolean;
   try {
-    if (runtime.workUnit === undefined) {
-      const binding = await bindWorkerAttemptSession(
-        legacyStoreOf(runtime)!,
-        runtime.projectID,
-        parentSessionID,
-        sessionID,
-        marker,
-        agentID,
-      );
-      bindingStatus = binding.status === "not_found" || binding.status === "invalid_status" ? "token_missing" : binding.status;
-      followup = binding.status === "bound" || binding.status === "already_bound"
-        ? binding.attempt.followup === true
-        : false;
-    } else {
-      const missionRow = await getMission(runtime.workUnit.db, runtime.projectID, parentSessionID);
+    {
+      const missionRow = await getMission(native.db, runtime.projectID, parentSessionID);
       if (missionRow === null || missionRow.mission_id !== mission.missionID) {
         bindingStatus = "inactive";
         followup = false;
       } else {
-        const unit = (await listUnits(runtime.workUnit.db, missionRow.id)).find((candidate) =>
+        const unit = (await listUnits(native.db, missionRow.id)).find((candidate) =>
           candidate.dispatch_token === marker?.dispatchToken &&
           candidate.cell_id === marker.cellID &&
           candidate.worker_agent === agentID,
@@ -246,7 +225,7 @@ async function workerMutationDenial(
           bindingStatus = unit.worker_session === sessionID ? "already_bound" : "not_owner";
           followup = unit.budget_charge === 0;
         } else if (unit.state === "RESERVED") {
-          const bound = await runtime.workUnit.commands.bindWorker(
+          const bound = await native.commands.bindWorker(
             { kind: "coordinator", sessionId: parentSessionID },
             { unitId: unit.id, unitFence: unit.fence, workerSessionId: sessionID, workerAgent: agentID },
           );
@@ -398,12 +377,12 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
       // the catalogue only needs the synchronous `tool.transform` surface.
       await registerTools(ctx as unknown as ToolContextLike, runtime);
 
-      // Build/test serialisation: SQL fenced lock once WorkUnit owns the lifecycle
-      // (legacy KV lock keys are tombstoned after migration); legacy KV otherwise.
+      // Build/test serialisation: SQL fenced WorkUnit lock only. CLI-only runtimes
+      // without WorkUnit do not serialise builds and never write KV lock keys.
       const buildLockFences = new Map<string, number>();
       const acquireShellBuildLock = async (sessionID: string, callID: string, command: string): Promise<boolean> => {
         const native = runtime.workUnit;
-        if (native === undefined) return acquireBuildLock(store, projectID, sessionID, callID, command);
+        if (native === undefined) return true;
         const result = await acquireWorkUnitLock(native.db, {
           name: buildLockName(projectID),
           token: callID,
@@ -416,7 +395,7 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
       };
       const releaseShellBuildLock = async (callID: string): Promise<boolean> => {
         const native = runtime.workUnit;
-        if (native === undefined) return releaseBuildLock(store, projectID, callID);
+        if (native === undefined) return false;
         const fence = buildLockFences.get(callID);
         if (fence === undefined) return false;
         buildLockFences.delete(callID);

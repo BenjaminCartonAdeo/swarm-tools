@@ -27,13 +27,10 @@ import {
 import {
   createMissionState,
   listAssignments,
-  putAttempt,
   selectCells,
   selectMissionSummary,
   selectPendingOrphans,
   selectReadyCells,
-  setAssignment,
-  setBudget,
   missionKey,
   createMissionStateStore,
   type LegacyMissionStateStore,
@@ -117,6 +114,10 @@ function setup(options: {
     options.store?.(ctx) ??
     createMissionStateStore(ctx.storage as unknown as MissionStorageLike, { projectID: PROJECT });
   return { ctx, store };
+}
+
+function seedKv(ctx: FakeContext, key: string, value: unknown): void {
+  (ctx.storage as unknown as { map: Map<string, unknown> }).map.set(key, value);
 }
 
 describe("buildCompactionContribution", () => {
@@ -284,10 +285,10 @@ describe("mission selectors", () => {
   });
 
   test("listAssignments reads every assignment of the project, sorted", async () => {
-    const { store } = setup();
-    await setAssignment(store, PROJECT, "cell-b", "ts-pro");
-    await setAssignment(store, PROJECT, "cell-a", "swarm-worker");
-    await setAssignment(store, "other-project", "cell-x", "nobody");
+    const { ctx, store } = setup();
+    seedKv(ctx, "assignment:adeo:cell-b", { cellID: "cell-b", agent: "ts-pro", updatedAt: "t" });
+    seedKv(ctx, "assignment:adeo:cell-a", { cellID: "cell-a", agent: "swarm-worker", updatedAt: "t" });
+    seedKv(ctx, "assignment:other-project:cell-x", { cellID: "cell-x", agent: "nobody", updatedAt: "t" });
     expect(await listAssignments(store, PROJECT)).toEqual({
       "cell-a": "swarm-worker",
       "cell-b": "ts-pro",
@@ -371,27 +372,24 @@ describe("compaction hook wiring", () => {
   });
 
   test("the hook reflects ledger cells recorded through the mission store", async () => {
-    const { ctx, store } = setup();
-    const mission = await setBudget(store, {
+    // Read-only legacy fallback: KV fixtures are seeded raw (the store never writes).
+    const { ctx } = setup();
+    const mission = createMissionState({
       projectID: PROJECT,
       sessionID: SESSION,
       mode: "audit",
-      maxSpawns: 4,
-      maxIterations: 2,
+      budget: { maxSpawns: 4, maxIterations: 2 },
     });
-    await setAssignment(store, PROJECT, "cell-z", "tr-pro");
-    await putAttempt(
-      store,
-      PROJECT,
-      attempt({
-        callID: "call-z",
-        cellID: "cell-z",
-        missionID: mission.missionID,
-        status: "pending",
-      }),
-    );
+    seedKv(ctx, missionKey(PROJECT, SESSION), mission);
+    seedKv(ctx, `assignment:${PROJECT}:cell-z`, { cellID: "cell-z", agent: "tr-pro", updatedAt: "t" });
+    seedKv(ctx, `attempt:${PROJECT}:call-z`, attempt({
+      callID: "call-z",
+      cellID: "cell-z",
+      missionID: mission.missionID,
+      status: "pending",
+    }));
 
-    const swarmx = createSwarmxPlugin({ runtime: { workUnit: undefined } }); // legacy ledger path, explicit opt-out
+    const swarmx = createSwarmxPlugin({ runtime: { workUnit: undefined } }); // CLI-only runtime: read-only KV fallback
     await swarmx.setup(ctx as unknown as Plugin.Context);
 
     const [hook] = ctx.captures.sessionHooks.get(COMPACTION_HOOK_NAME) ?? [];

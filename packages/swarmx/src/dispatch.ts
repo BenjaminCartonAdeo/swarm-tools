@@ -3,39 +3,25 @@
  *
  * The gate is deliberately strict — there is no heuristic fallback:
  *
- *   - outside an active mission (or for any other tool) both hooks are no-ops;
+ *   - outside an active WorkUnit mission (or for any other tool, or on a
+ *     runtime without WorkUnit) both hooks are no-ops — there is no KV branch;
  *   - the prompt must carry exactly one cell marker and a one-use dispatch token;
  *   - the target agent comes from `input.agent`, is resolved against
  *     `ctx.agent.list()` and must match the recorded cell assignment;
- *   - budget is charged at reservation time, exactly once per `Tool.CallID`.
+ *   - budget is charged by the WorkUnit reservation, exactly once per `Tool.CallID`.
  *
  * Refusal throws from `execute.before` (the only hook allowed to reject).
  * `settleAfter` never throws: a rejection there would corrupt the host call.
  */
 import { createHash, randomUUID } from "node:crypto";
 
-import {
-  DEFAULT_WORKER_SHARE,
-  getAttempt,
-  listAttempts,
-  putAttempt,
-  reconcileCountsFromAttempts,
-  readMission,
-  resolveAssignment,
-  sameMissionGeneration,
-  withMissionLock,
-} from "./state";
 import type { LegacyMissionStateStore } from "./state";
 import {
   DispatchGateError,
   type CellMarker,
   type DispatchAgentInfo,
   type DispatchAgentList,
-  type DispatchAttempt,
-  type DispatchAttemptStatus,
-  type MissionState,
 } from "./types";
-import { isSwarmWorkerAgentID } from "./roster";
 import type { WorkUnitRuntime } from "./workunit/ports";
 import { getMission } from "./workunit/mission";
 import { listUnits } from "./workunit/mission";
@@ -206,164 +192,6 @@ async function requireDispatchableAgent(
   return found;
 }
 
-async function requireAssignment(
-  store: LegacyMissionStateStore,
-  projectID: string,
-  sessionID: string,
-  marker: CellMarker,
-  agent: DispatchAgentInfo,
-  agentID: string,
-): Promise<void> {
-  const assigned = await resolveAssignment(store, projectID, marker.cellID, undefined, { sessionID });
-  if (assigned === undefined) {
-    throw new DispatchGateError(
-      "cell_not_assigned",
-      marker.cellID,
-      "no assignment recorded; run swarm_set_agent before dispatching",
-    );
-  }
-  if (assigned !== agent.id && assigned !== agent.name && assigned !== agentID) {
-    throw new DispatchGateError(
-      "assignment_mismatch",
-      marker.cellID,
-      `assigned "${assigned}", dispatched "${agentID}"`,
-    );
-  }
-}
-
-function chargeBudget(
-  mission: MissionState,
-  marker: CellMarker,
-  agent: DispatchAgentInfo,
-  countIteration: boolean,
-): void {
-  const attemptsForCell = mission.counts.attemptsByCell[marker.cellID] ?? 0;
-  if (mission.counts.spawns >= mission.budget.maxSpawns) {
-    throw new DispatchGateError(
-      "budget_exhausted",
-      marker.cellID,
-      `spawns ${mission.counts.spawns}/${mission.budget.maxSpawns}`,
-    );
-  }
-  if (countIteration && attemptsForCell >= mission.budget.maxIterations) {
-    throw new DispatchGateError(
-      "cell_iterations_exhausted",
-      marker.cellID,
-      `cell attempts ${attemptsForCell}/${mission.budget.maxIterations}`,
-    );
-  }
-  if (isSwarmWorkerAgentID(agent.id)) {
-    const share = mission.budget.workerShare ?? DEFAULT_WORKER_SHARE;
-    const projected = (mission.counts.workerSpawns + 1) / (mission.counts.spawns + 1);
-    if (projected > share) {
-      throw new DispatchGateError(
-        "worker_share_exceeded",
-        marker.cellID,
-        `worker share ${projected.toFixed(2)} > ${share}`,
-      );
-    }
-  }
-}
-
-/**
- * Reserves one spawn for `event.id`.
- *
- * Runs under the session lock so the ledger entry and the counters move
- * together. A replayed `callID` returns without touching either.
- */
-async function reserveSpawn(
-  store: LegacyMissionStateStore,
-  projectID: string,
-  event: DispatchBeforeEvent,
-  marker: CellMarker,
-  agent: DispatchAgentInfo,
-  expectedMission: MissionState,
-  countIteration: boolean,
-): Promise<
-  | { readonly status: "reserved" | "replay"; readonly dispatchToken: string }
-  | { readonly status: "mission_inactive" | "mission_changed" }
-> {
-  return withMissionLock(projectID, event.sessionID, async () => {
-    const mission = await readMission(store, projectID, event.sessionID);
-    if (mission === undefined || !mission.active) return { status: "mission_inactive" };
-    if (!sameMissionGeneration(mission, expectedMission)) return { status: "mission_changed" };
-    const attempts = await listAttempts(store, projectID, event.sessionID, mission);
-    const reconciliation = reconcileCountsFromAttempts(mission.counts, attempts);
-    if (reconciliation.changed) {
-      mission.counts = reconciliation.counts;
-      mission.updatedAt = store.now();
-      await store.save(mission);
-    }
-    const existing = attempts.find((attempt) => attempt.callID === event.id);
-    if (existing !== undefined) {
-      const matches =
-        existing.cellID === marker.cellID &&
-        existing.epicID === marker.epicID &&
-        (existing.agent === agent.id || existing.agent === agent.name);
-      if (!matches || existing.status !== "pending") {
-        throw new DispatchGateError(
-          "call_id_conflict",
-          marker.cellID,
-          "tool call ID is already bound to another or settled dispatch",
-        );
-      }
-      if (
-        existing.dispatchToken === undefined ||
-        (marker.dispatchToken !== undefined && marker.dispatchToken !== existing.dispatchToken)
-      ) {
-        throw new DispatchGateError(
-          "dispatch_token_reused",
-          marker.cellID,
-          "the replay prompt does not match the reserved one-use capability",
-        );
-      }
-      return { status: "replay", dispatchToken: existing.dispatchToken };
-    }
-    if (await getAttempt(store, projectID, event.id)) {
-      throw new DispatchGateError(
-        "call_id_conflict",
-        marker.cellID,
-        "tool call ID is already recorded in another mission generation",
-      );
-    }
-    if (marker.dispatchToken !== undefined) {
-      throw new DispatchGateError(
-        "dispatch_token_reused",
-        marker.cellID,
-        "a dispatch capability cannot be supplied or reused in a new tool call",
-      );
-    }
-    chargeBudget(mission, marker, agent, countIteration);
-    const attemptsForCell = mission.counts.attemptsByCell[marker.cellID] ?? 0;
-    const ts = store.now();
-    const dispatchToken = randomUUID();
-    const attempt: DispatchAttempt = {
-      callID: event.id,
-      ...(mission.missionID === undefined ? {} : { missionID: mission.missionID }),
-      sessionID: event.sessionID,
-      cellID: marker.cellID,
-      epicID: marker.epicID,
-      agent: agent.id,
-      status: "pending",
-      ts,
-      dispatchToken,
-      ...(countIteration ? {} : { followup: true }),
-    };
-    // Ledger first: a crash between the two writes leaves an orphan that
-    // recovery aborts — the counters were never charged twice.
-    await putAttempt(store, projectID, attempt);
-    mission.counts.spawns += 1;
-    if (countIteration) {
-      if (attemptsForCell === 0) mission.counts.cells += 1;
-      mission.counts.attemptsByCell[marker.cellID] = attemptsForCell + 1;
-    }
-    if (isSwarmWorkerAgentID(agent.id)) mission.counts.workerSpawns += 1;
-    mission.updatedAt = ts;
-    await store.save(mission);
-    return { status: "reserved", dispatchToken };
-  });
-}
-
 /**
  * Gate evaluated before a `subagent` call executes.
  *
@@ -376,81 +204,9 @@ export async function gateBefore(
   event: DispatchBeforeEvent,
   workUnit?: WorkUnitRuntime,
 ): Promise<void> {
-  if (workUnit !== undefined) {
-    await gateBeforeWorkUnit(store, workUnit, event);
-    return;
-  }
-  if (event.tool !== DISPATCH_TOOL_NAME) return;
-  const projectID = event.projectID ?? store.projectID;
-  if (projectID === undefined) return;
-  const mission = await readMission(store, projectID, event.sessionID);
-  if (mission === undefined || !mission.active) return;
-  await requireCoordinatorCaller(store, event.agent);
-  if (typeof asRecord(event.input)?.prompt !== "string") {
-    throw new DispatchGateError(
-      "dispatch_token_missing",
-      undefined,
-      "native subagent input must include a prompt string",
-    );
-  }
-  const marker = extractCellMarker(event.input);
-  const cleanupClaim = asRecord(await store.storage.get(`cleanup-claim:${projectID}`));
-  if (
-    cleanupClaim !== undefined &&
-    typeof cleanupClaim.at === "number" &&
-    Date.now() - cleanupClaim.at < 5 * 60_000 &&
-    (cleanupClaim.taskID === "*" || cleanupClaim.taskID === marker.cellID)
-  ) {
-    throw new DispatchGateError(
-      "cleanup_in_progress",
-      marker.cellID,
-      "retry after the worktree cleanup finishes",
-    );
-  }
-  const targetAgentID = asRecord(event.input)?.agent;
-  if (typeof targetAgentID !== "string" || targetAgentID.trim().length === 0) {
-    throw new DispatchGateError(
-      "agent_missing",
-      marker.cellID,
-      "subagent input must include a non-empty target agent ID",
-    );
-  }
-  if (targetAgentID !== targetAgentID.trim()) {
-    throw new DispatchGateError(
-      "agent_unknown",
-      marker.cellID,
-      "subagent input must use the exact V2 agent ID from the roster",
-    );
-  }
-  const dispatchedAgentID = targetAgentID;
-  const agent = await requireDispatchableAgent(store, dispatchedAgentID);
-  await requireAssignment(store, projectID, event.sessionID, marker, agent, dispatchedAgentID);
-  const inputRecord = asRecord(event.input);
-  const prompt = typeof inputRecord?.prompt === "string" ? inputRecord.prompt : "";
-  const countIteration = !(
-    inputRecord?.purpose === "followup" ||
-    inputRecord?.read_only === true ||
-    FOLLOWUP_MARKER_PATTERN.test(prompt)
-  );
-  const reservation = await reserveSpawn(store, projectID, event, marker, agent, mission, countIteration);
-  if (reservation.status === "replay" || reservation.status === "reserved") {
-    attachDispatchToken(event.input, reservation.dispatchToken, marker.cellID);
-    return;
-  }
-  if (reservation.status === "mission_inactive") {
-    throw new DispatchGateError(
-      "mission_inactive",
-      marker.cellID,
-      "mission finished while the dispatch was being validated",
-    );
-  }
-  if (reservation.status === "mission_changed") {
-    throw new DispatchGateError(
-      "mission_changed",
-      marker.cellID,
-      "mission restarted while the dispatch was being validated",
-    );
-  }
+  // CLI-only runtimes carry no WorkUnit: no mission can be active, so no gate.
+  if (workUnit === undefined) return;
+  await gateBeforeWorkUnit(store, workUnit, event);
 }
 
 async function gateBeforeWorkUnit(
@@ -594,42 +350,18 @@ async function gateBeforeWorkUnit(
 }
 
 /**
- * Settles the ledger entry after a `subagent` call.
+ * Settles the WorkUnit reservation after a `subagent` call.
  *
  * Never throws (the V2 `execute.after` hook must not reject). Duplicate or
- * unknown calls are a no-op: only a `pending` entry transitions, and the
- * counters are never touched here.
+ * unknown calls are a no-op: only a `RESERVED` unit transitions.
  */
 export async function settleAfter(
   store: LegacyMissionStateStore,
   event: DispatchAfterEvent,
   workUnit?: WorkUnitRuntime,
 ): Promise<void> {
-  if (workUnit !== undefined) {
-    await settleAfterWorkUnit(store, workUnit, event);
-    return;
-  }
-  try {
-    if (event.tool !== DISPATCH_TOOL_NAME) return;
-    const projectID = event.projectID ?? store.projectID;
-    if (projectID === undefined) return;
-    await withMissionLock(projectID, event.sessionID, async () => {
-      const mission = await readMission(store, projectID, event.sessionID);
-      if (mission === undefined || !mission.active) return;
-      const attempt = await getAttempt(store, projectID, event.id);
-      if (attempt === undefined || attempt.status !== "pending") return;
-      const status: DispatchAttemptStatus =
-        event.status === "completed" ? "succeeded" : "failed";
-      // Update status but do NOT auto-revoke: revoking on every tool call
-      // would break resolveParentMissionForWorker (swarmmail_init, etc.)
-      // which requires an unrevoked attempt. Revocation happens via
-      // swarm_complete (success) or swarm_finish with abandon=true (cleanup).
-      await putAttempt(store, projectID, { ...attempt, status });
-    });
-  } catch {
-    // execute.after must never reject: a ledger write failure is not worth
-    // failing the model's tool call.
-  }
+  if (workUnit === undefined) return;
+  await settleAfterWorkUnit(store, workUnit, event);
 }
 
 function childSessionID(result: unknown): string | undefined {

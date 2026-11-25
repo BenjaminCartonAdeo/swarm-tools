@@ -44,15 +44,10 @@ import {
 } from "./history";
 import {
   isConsolidationCellFinished,
-  listAttempts,
-  readMission,
   DEFAULT_WORKER_SHARE,
   selectMissionSummary,
   selectReadyCells,
-  recordRetryCause,
-  withMissionLock,
 } from "./state";
-import { legacyStoreOf } from "./state";
 import { getMission, listMissions, listUnits, MissionConflictError, MissionPolicyValidationError } from "./workunit/mission";
 import { projectMission, selectMissionOrphanCandidates } from "./workunit/projection";
 import type { Mission, WorkUnit } from "./workunit/schema";
@@ -1642,7 +1637,6 @@ async function runSpawnRetry(
   const injected = injectRetryRootCause(tool, output, section);
 
   const projectID = resolveProjectID(runtime);
-  const legacyStore = legacyStoreOf(runtime);
   const nativeRuntime = runtime.workUnit;
   if (nativeRuntime !== undefined && projectID !== undefined) {
     const mission = await getMission(nativeRuntime.db, projectID, sessionID);
@@ -1652,15 +1646,6 @@ async function runSpawnRetry(
         cause: { ...cause, cellID, epicID, attempt, ts: new Date(runtime.now?.() ?? Date.now()).toISOString() },
       });
     }
-  } else if (legacyStore !== undefined && projectID !== undefined) {
-    await recordRetryCause(legacyStore, {
-      projectID,
-      sessionID,
-      cellID,
-      epicID,
-      attempt,
-      cause,
-    });
   }
 
   return { output: injected };
@@ -2832,9 +2817,7 @@ async function executeReviewFeedback(
   runtime: SwarmxRuntime,
   context: ToolExecuteContextLike,
   args: Record<string, unknown>,
-  backendName: string,
 ): Promise<ToolExecuteResult> {
-  void backendName;
   const native = await requireOpenNativeMission(runtime, context, "swarm_review_feedback");
   const nativeKey = [native.projectID, native.sessionID].map(encodeURIComponent).join(":");
   return withReviewDecisionLock(nativeKey, () => executeNativeReviewFeedback(runtime, context, args));
@@ -3873,44 +3856,14 @@ async function restrictHiveUpdate(
 
 async function requireNoActiveProjectMission(runtime: SwarmxRuntime, tool: string): Promise<void> {
   const projectID = resolveProjectID(runtime);
-  const legacyStore = legacyStoreOf(runtime);
-  if (runtime.workUnit !== undefined && projectID !== undefined) {
-    const generations = await nativeProjectScan(tool, runtime.workUnit, projectID);
-    if (generations.some((entry) => isLiveMission(entry.mission))) {
-      throw new LocalToolError(tool, "conflict", "active swarmx cells close only through an approved swarm_complete call");
-    }
-    if (generations.some(({ units }) => units.some((unit) => LIVE_UNIT_STATES.has(unit.state)))) {
-      throw new LocalToolError(tool, "conflict", "the project still has unrevoked worker attempts");
-    }
-    return;
-  }
-  if (legacyStore === undefined || projectID === undefined) {
+  if (runtime.workUnit === undefined || projectID === undefined) {
     throw new LocalToolError(tool, "runtime_unavailable", "cannot verify active project missions");
   }
-  let missions: readonly MissionState[];
-  try {
-    missions = await legacyStore.list();
-  } catch {
-    throw new LocalToolError(tool, "runtime_unavailable", "cannot verify active project missions");
+  const generations = await nativeProjectScan(tool, runtime.workUnit, projectID);
+  if (generations.some((entry) => isLiveMission(entry.mission))) {
+    throw new LocalToolError(tool, "conflict", "active swarmx cells close only through an approved swarm_complete call");
   }
-  if (missions.some((mission) => mission.projectID === projectID && mission.active)) {
-    throw new LocalToolError(
-      tool,
-      "conflict",
-      "active swarmx cells close only through an approved swarm_complete call",
-    );
-  }
-  // finishMission refuses to close with unrevoked attempts, so a closed mission
-  // cannot hide a pending attempt; scanning all project attempts also covers
-  // orphaned ledger entries whose mission document was removed.
-  const attempts = await listAttempts(legacyStore, projectID);
-  if (
-    attempts.some(
-      (attempt) =>
-        attempt.revokedAt === undefined &&
-        (attempt.status === "pending" || attempt.status === "succeeded"),
-    )
-  ) {
+  if (generations.some(({ units }) => units.some((unit) => LIVE_UNIT_STATES.has(unit.state)))) {
     throw new LocalToolError(tool, "conflict", "the project still has unrevoked worker attempts");
   }
 }
@@ -3921,26 +3874,11 @@ async function requireNoActiveTaskAttempt(
   taskID: string,
 ): Promise<void> {
   const projectID = resolveProjectID(runtime);
-  const legacyStore = legacyStoreOf(runtime);
-  if (runtime.workUnit !== undefined && projectID !== undefined) {
-    const generations = await nativeProjectScan(tool, runtime.workUnit, projectID, "cannot verify active task attempts");
-    if (generations.some(({ units }) => units.some((unit) => unit.cell_id === taskID && LIVE_UNIT_STATES.has(unit.state)))) {
-      throw new LocalToolError(tool, "conflict", `task ${taskID} has an unrevoked worker attempt`);
-    }
-    return;
-  }
-  if (legacyStore === undefined || projectID === undefined) {
+  if (runtime.workUnit === undefined || projectID === undefined) {
     throw new LocalToolError(tool, "runtime_unavailable", "cannot verify active task attempts");
   }
-  const attempts = await listAttempts(legacyStore, projectID);
-  if (
-    attempts.some(
-      (attempt) =>
-        attempt.cellID === taskID &&
-        attempt.revokedAt === undefined &&
-        (attempt.status === "pending" || attempt.status === "succeeded"),
-    )
-  ) {
+  const generations = await nativeProjectScan(tool, runtime.workUnit, projectID, "cannot verify active task attempts");
+  if (generations.some(({ units }) => units.some((unit) => unit.cell_id === taskID && LIVE_UNIT_STATES.has(unit.state)))) {
     throw new LocalToolError(tool, "conflict", `task ${taskID} has an unrevoked worker attempt`);
   }
 }
@@ -3952,8 +3890,8 @@ async function runWorktreeCleanup(
   backendName: string,
 ): Promise<ToolExecuteResult> {
   const projectID = resolveProjectID(runtime);
-  const store = legacyStoreOf(runtime);
-  if ((store === undefined && runtime.workUnit === undefined) || projectID === undefined) {
+  const native = runtime.workUnit;
+  if (native === undefined || projectID === undefined) {
     throw new LocalToolError(
       "swarm_worktree_cleanup",
       "runtime_unavailable",
@@ -3968,62 +3906,31 @@ async function runWorktreeCleanup(
     normalized.cleanup_all === true
       ? "*"
       : requireStringInput("swarm_worktree_cleanup", normalized, "task_id");
-  const claimKey = `cleanup-claim:${projectID}`;
-  const native = runtime.workUnit;
-  let lockToken: string | undefined;
-  let lockFence: number | undefined;
-  if (native === undefined) {
-    // Explicit legacy runtimes keep the pre-WorkUnit claim until Task 13d3e.
-    await store!.storage.set(claimKey, { taskID: claimTaskID, at: Date.now() });
-  } else {
-    lockToken = randomUUID();
-    const acquired = await acquireWorkUnitLock(native.db, {
-      name: cleanupLockName(projectID),
-      token: lockToken,
-      ownerSession: sessionID,
-      now: Date.now(),
-      staleAfterMs: CLEANUP_LOCK_STALE_MS,
-    });
-    if (!acquired.acquired) {
-      throw new LocalToolError("swarm_worktree_cleanup", "conflict", "another worktree cleanup is already in progress");
-    }
-    lockFence = acquired.fence;
+  // The SQL cleanup lock (held until `finally`) blocks every project dispatch.
+  const lockToken = randomUUID();
+  const acquired = await acquireWorkUnitLock(native.db, {
+    name: cleanupLockName(projectID),
+    token: lockToken,
+    ownerSession: sessionID,
+    now: Date.now(),
+    staleAfterMs: CLEANUP_LOCK_STALE_MS,
+  });
+  if (!acquired.acquired) {
+    throw new LocalToolError("swarm_worktree_cleanup", "conflict", "another worktree cleanup is already in progress");
   }
   try {
-    // Native discovery reads the projected mission list while the SQL cleanup
-    // lock (held until `finally`) blocks every project dispatch.
-    const sessionIDs = native === undefined
-      ? (await store!.list())
-        .filter((mission) => mission.projectID === projectID)
-        .map((mission) => mission.sessionID)
-      : [...new Set((await listMissions(native.db, projectID)).map((mission) => mission.session_id))];
-    const missions = sessionIDs.sort((left, right) => left.localeCompare(right)).map((sessionID) => ({ sessionID }));
-
-    const operation = async (): Promise<ToolExecuteResult> => {
-      if (normalized.cleanup_all === true) {
-        await requireNoActiveProjectMission(runtime, "swarm_worktree_cleanup");
-      } else {
-        await requireNoActiveTaskAttempt(runtime, "swarm_worktree_cleanup", claimTaskID);
-      }
-      return { output: await runToolForSession(runtime, backendName, normalized, sessionID, 120_000) };
-    };
-
-    let run = operation;
-    for (const mission of [...missions].reverse()) {
-      const previous = run;
-      run = () => withMissionLock(projectID, mission.sessionID, previous);
+    if (normalized.cleanup_all === true) {
+      await requireNoActiveProjectMission(runtime, "swarm_worktree_cleanup");
+    } else {
+      await requireNoActiveTaskAttempt(runtime, "swarm_worktree_cleanup", claimTaskID);
     }
-    return await run();
+    return { output: await runToolForSession(runtime, backendName, normalized, sessionID, 120_000) };
   } finally {
-    if (native === undefined) {
-      await store!.storage.remove(claimKey).catch(() => undefined);
-    } else if (lockToken !== undefined && lockFence !== undefined) {
-      await releaseWorkUnitLock(native.db, {
-        name: cleanupLockName(projectID),
-        token: lockToken,
-        fence: lockFence,
-      }).catch(() => false);
-    }
+    await releaseWorkUnitLock(native.db, {
+      name: cleanupLockName(projectID),
+      token: lockToken,
+      fence: acquired.fence,
+    }).catch(() => false);
   }
 }
 
@@ -4145,18 +4052,11 @@ async function requireCoordinatorOrMissionOwner(
 
   const projectID = resolveProjectID(runtime);
   const sessionID = resolveSessionID(runtime, context);
-  const legacyStore = legacyStoreOf(runtime);
-  let ownsActiveMission: boolean;
-  if (runtime.workUnit !== undefined && projectID !== undefined && sessionID !== undefined) {
-    const mission = await getMission(runtime.workUnit.db, projectID, sessionID);
-    ownsActiveMission = mission !== null && isLiveMission(mission);
-  } else {
-    if (legacyStore === undefined || projectID === undefined || sessionID === undefined) {
-      throw new LocalToolError(tool, "runtime_unavailable", "cannot verify the mission owner");
-    }
-    const mission = await readMission(legacyStore, projectID, sessionID);
-    ownsActiveMission = mission !== undefined && mission.active;
+  if (runtime.workUnit === undefined || projectID === undefined || sessionID === undefined) {
+    throw new LocalToolError(tool, "runtime_unavailable", "cannot verify the mission owner");
   }
+  const mission = await getMission(runtime.workUnit.db, projectID, sessionID);
+  const ownsActiveMission = mission !== null && isLiveMission(mission);
   if (!ownsActiveMission || (await resolveCallerMode(runtime, context, tool)) !== "primary") {
     throw new LocalToolError(tool, "conflict", "only the canonical swarm coordinator may use this tool");
   }
@@ -4328,11 +4228,7 @@ async function executeSpec(
     await requireOpenNativeMission(runtime, context, "swarm_review");
   }
   if (spec.name === "swarm_review_feedback") {
-    const backendName = spec.backendName;
-    if (backendName === undefined) {
-      throw new UnsupportedToolError(spec.name, "backendName manquant dans le catalogue");
-    }
-    return executeReviewFeedback(runtime, context, args, backendName);
+    return executeReviewFeedback(runtime, context, args);
   }
   if (spec.name === "swarm_worktree_cleanup") {
     const backendName = spec.backendName;
@@ -4383,7 +4279,7 @@ async function executeSpec(
       if (isReview && files.length === 0) {
         // No-file tasks (research, analysis) have no diff to review. Skip the
         // backend entirely and create a synthetic empty review so the plugin
-        // can still persist a scoped review receipt and finalize the cell.
+        // can still record the native review and finalize the cell.
         output = {
           review_prompt: "## Files Modified\n\n## Code Changes\n```diff\n\n```\n\n## Review Criteria",
           context: { files_touched: [] },

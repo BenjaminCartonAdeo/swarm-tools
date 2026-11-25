@@ -34,12 +34,8 @@ function rawPendingCompletionKey(projectID: string, taskID: string): string {
 import { extractCellMarker } from "../src/dispatch";
 import {
   createMissionStateStore,
-  getAttempt,
   listAttempts,
   readMission,
-  resolveAssignment,
-  setAssignment,
-  setBudget,
   type MissionStorageLike,
 } from "../src/state";
 import { UnsupportedToolError, type CellMarker } from "../src/types";
@@ -136,6 +132,7 @@ interface Rig {
   readonly after: (payload: AfterPayload) => Promise<void>;
   readonly compaction: (event: FakeCompactionEvent) => Promise<void>;
   readonly bindWorkerSession: (sessionID: string, marker: CellMarker, parentSessionID?: string) => void;
+  readonly workUnit?: WorkUnitRuntime;
 }
 
 /**
@@ -220,6 +217,7 @@ async function createRig(options: RigOptions = {}): Promise<Rig> {
       workerCells.set(sessionID, marker);
       if (parentSessionID !== undefined) workerParents.set(sessionID, parentSessionID);
     },
+    ...(options.workUnit === undefined ? {} : { workUnit: options.workUnit }),
   };
 }
 
@@ -258,6 +256,17 @@ async function createNativeMission(options: {
 
 const nativeCoordinator: MissionActor = { kind: "coordinator", sessionId: SESSION };
 
+/** Rig over a fresh native mission (the only lifecycle backend). */
+async function createLifecycleRig(options: RigOptions = {}): Promise<Rig> {
+  const native = await createNativeMission();
+  return createRig({ ...options, workUnit: native.runtime });
+}
+
+async function nativeUnitByCall(rig: Rig, callID: string) {
+  const mission = await getMission(rig.workUnit!.db, PROJECT, SESSION);
+  return (await listUnits(rig.workUnit!.db, mission!.id)).find((unit) => unit.call_id === callID);
+}
+
 function missionStore(ctx: FakeContext) {
   return createMissionStateStore(ctx.storage as unknown as MissionStorageLike, {
     projectID: PROJECT,
@@ -270,18 +279,11 @@ async function dispatchWorker(
   callID = "call-worker-dispatch",
   workerSessionID = "ses-worker",
 ) {
-  const store = missionStore(rig.ctx);
-  if ((await readMission(store, PROJECT, SESSION)) === undefined) {
-    await setBudget(store, {
-      projectID: PROJECT,
-      sessionID: SESSION,
-      mode: "dev",
-      maxSpawns: 3,
-      maxIterations: 3,
-      workerShare: 1,
-    });
-  }
-  await setAssignment(store, PROJECT, cellID, "swarm/swarm-worker");
+  const native = rig.workUnit;
+  if (native === undefined) throw new Error("dispatchWorker requires a WorkUnit rig (createLifecycleRig)");
+  const mission = await getMission(native.db, PROJECT, SESSION);
+  if (mission === null) throw new Error("native mission missing");
+  await native.commands.assignCell(nativeCoordinator, { missionPk: mission.id, cellId: cellID, agent: "swarm/swarm-worker" });
   const payload = workerDispatchPayload(cellID, callID);
   await rig.before(payload);
   const prompt = (payload.input as { prompt: string }).prompt;
@@ -772,19 +774,7 @@ describe("mission gate → settle sequence", () => {
       { cell_id: "cell-resolve", agent: "development/typescript-pro", owner: SESSION, state: "assigned" },
       { cell_id: "cell-set", agent: "swarm/swarm-worker", owner: SESSION, state: "assigned" },
     ]);
-    expect(await resolveAssignment(missionStore(rig.ctx), PROJECT, "cell-set")).toBeUndefined();
-  });
-
-  test("read-only follow-up dispatch does not consume a cell iteration", async () => {
-    const rig = await createRig({ agents: GATE_AGENTS });
-    await dispatchWorker(rig, "cell-a", "call-dispatch-first");
-    const followup = workerDispatchPayload("cell-a", "call-followup");
-    const input = followup.input as { prompt: string };
-    input.prompt += "\n\n<!-- swarmx:followup=read-only -->";
-    await rig.before(followup);
-    const mission = await readMission(missionStore(rig.ctx), PROJECT, SESSION);
-    expect(mission?.counts.spawns).toBe(2);
-    expect(mission?.counts.attemptsByCell["cell-a"]).toBe(1);
+    expect(await rig.ctx.storage.get(`assignment:${PROJECT}:cell-set`)).toBeUndefined();
   });
 
   test("worker permissions block review approval and direct Hive closure tools", async () => {
@@ -903,7 +893,7 @@ describe("mission gate → settle sequence", () => {
     ] as const;
 
     for (const [index, entry] of cases.entries()) {
-      const rig = await createRig({ agents });
+      const rig = await createLifecycleRig({ agents });
       const tool = rig.tools.get(entry.tool);
       await expect(
         tool?.execute(entry.input, toolContext("development/typescript-pro", `call-mode-all-${index}`)),
@@ -1019,7 +1009,7 @@ describe("mission gate → settle sequence", () => {
   });
 
   test("first worker mutation binds the dispatch capability before swarmmail_init", async () => {
-    const rig = await createRig({
+    const rig = await createLifecycleRig({
       agents: GATE_AGENTS,
       workerCell: { cellID: "cell-a", epicID: "epic-1" },
     });
@@ -1035,12 +1025,12 @@ describe("mission gate → settle sequence", () => {
       }),
     ).resolves.toBeUndefined();
 
-    const attempt = await getAttempt(missionStore(rig.ctx), PROJECT, "call-dispatch-first-mutation");
-    expect(attempt?.workerSessionID).toBe("ses-worker");
+    const attempt = await nativeUnitByCall(rig, "call-dispatch-first-mutation");
+    expect(attempt?.worker_session).toBe("ses-worker");
   });
 
   test("a sibling session cannot steal a capability bound by first mutation", async () => {
-    const rig = await createRig({
+    const rig = await createLifecycleRig({
       agents: GATE_AGENTS,
       workerCell: { cellID: "cell-a", epicID: "epic-1" },
     });
@@ -1063,12 +1053,12 @@ describe("mission gate → settle sequence", () => {
         resources: ["src/handler.ts"],
       }),
     ).rejects.toThrow(/not_owner/);
-    const attempt = await getAttempt(missionStore(rig.ctx), PROJECT, "call-dispatch-lazy-owner");
-    expect(attempt?.workerSessionID).toBe("ses-worker");
+    const attempt = await nativeUnitByCall(rig, "call-dispatch-lazy-owner");
+    expect(attempt?.worker_session).toBe("ses-worker");
   });
 
   test("concurrent first mutations bind the capability to exactly one session", async () => {
-    const rig = await createRig({
+    const rig = await createLifecycleRig({
       agents: GATE_AGENTS,
       workerCell: { cellID: "cell-a", epicID: "epic-1" },
     });
@@ -1094,12 +1084,12 @@ describe("mission gate → settle sequence", () => {
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
     const winner = results[0]?.status === "fulfilled" ? "ses-worker-a" : "ses-worker-b";
-    const attempt = await getAttempt(missionStore(rig.ctx), PROJECT, "call-dispatch-race");
-    expect(attempt?.workerSessionID).toBe(winner);
+    const attempt = await nativeUnitByCall(rig, "call-dispatch-race");
+    expect(attempt?.worker_session).toBe(winner);
   });
 
   test("concurrent build commands are serialized per project", async () => {
-    const rig = await createRig({ agents: GATE_AGENTS });
+    const rig = await createLifecycleRig({ agents: GATE_AGENTS });
     const first = {
       ...beforePayload({ id: "call-build-a" }),
       tool: "shell",
@@ -1124,7 +1114,7 @@ describe("mission gate → settle sequence", () => {
       ...GATE_AGENTS,
       { id: "development/mode-all", name: "mode-all", mode: "all" as const, hidden: false, permissions: [] },
     ];
-    const rig = await createRig({ agents, rootSessionIDs: ["ses-root"] });
+    const rig = await createLifecycleRig({ agents, rootSessionIDs: ["ses-root"] });
 
     await expect(
       rig.ctx.permission.assert({
@@ -1155,7 +1145,7 @@ describe("mission gate → settle sequence", () => {
   });
 
   test("completion submission is bound to the actual dispatched worker session", async () => {
-    const rig = await createRig({
+    const rig = await createLifecycleRig({
       agents: GATE_AGENTS,
       projectPath: process.cwd(),
       workerCell: { cellID: "cell-a", epicID: "epic-1" },
@@ -1185,7 +1175,7 @@ describe("mission gate → settle sequence", () => {
 
   test("coordinator cannot cleanup a task worktree while its worker attempt is active", async () => {
     const projectPath = await realpath(process.cwd());
-    const rig = await createRig({ agents: GATE_AGENTS, projectPath });
+    const rig = await createLifecycleRig({ agents: GATE_AGENTS, projectPath });
     await dispatchWorker(rig, "cell-a", "call-dispatch-live-worktree");
 
     await expect(
@@ -1199,7 +1189,7 @@ describe("mission gate → settle sequence", () => {
 
   test("cleanup releases its claim when the backend fails", async () => {
     const projectPath = await realpath(process.cwd());
-    const rig = await createRig({
+    const rig = await createLifecycleRig({
       agents: GATE_AGENTS,
       projectPath,
       payloadFor: (name) => {
@@ -1398,32 +1388,6 @@ describe("mission gate → settle sequence", () => {
     expect(await getWorkUnit(native.runtime.db, reserved.id)).toMatchObject({ state: "PUBLISHING" });
   });
 
-  test("an inactive mission with unrevoked worker attempts cannot cleanup its worktrees", async () => {
-    const projectPath = await realpath(process.cwd());
-    const rig = await createRig({ agents: GATE_AGENTS, projectPath });
-    await dispatchWorker(rig, "cell-a", "call-dispatch-unsettled-cleanup");
-    const store = missionStore(rig.ctx);
-    const inactiveMission = await readMission(store, PROJECT, SESSION);
-    expect(inactiveMission).toBeDefined();
-    if (inactiveMission === undefined) throw new Error("test mission was not created");
-    inactiveMission.active = false;
-    await store.save(inactiveMission);
-
-    await expect(
-      rig.tools.get("swarm_worktree_cleanup")?.execute(
-        { project_path: projectPath, task_id: "cell-a", cleanup_all: false },
-        toolContext(),
-      ),
-    ).rejects.toThrow(/has an unrevoked worker attempt/);
-    await expect(
-      rig.tools.get("swarm_worktree_cleanup")?.execute(
-        { project_path: projectPath, cleanup_all: true },
-        toolContext(),
-      ),
-    ).rejects.toThrow(/unrevoked worker attempts/);
-    expect(rig.runCalls).toHaveLength(0);
-  });
-
   test("swarm_complete rejects an empty summary before reaching the backend", async () => {
     const rig = await createRig({ agents: GATE_AGENTS, projectPath: process.cwd() });
 
@@ -1469,7 +1433,7 @@ describe("mission gate → settle sequence", () => {
 
   test("swarm_review rejects non-canonical, .opencode1, and mixed-separator project keys", async () => {
     const projectPath = await realpath(process.cwd());
-    const rig = await createRig({ agents: GATE_AGENTS, projectPath });
+    const rig = await createLifecycleRig({ agents: GATE_AGENTS, projectPath });
     const tool = rig.tools.get("swarm_review");
     expect(tool).toBeDefined();
 
@@ -1520,7 +1484,7 @@ describe("mission gate → settle sequence", () => {
   test.skip("concurrent review decisions on one cell are serialized", async () => {
     const projectPath = await realpath(process.cwd());
     const file = SWARMX_FILE;
-    const rig = await createRig({
+    const rig = await createLifecycleRig({
       agents: GATE_AGENTS,
       projectPath,
       workerCell: { cellID: "cell-a", epicID: "epic-1" },
@@ -1598,7 +1562,7 @@ describe("mission gate → settle sequence", () => {
     try {
       Bun.spawnSync(["git", "init", "-q"], { cwd: projectPath });
       await writeFile(join(projectPath, "existing-change.txt"), "audit me\n");
-      const rig = await createRig({ agents: GATE_AGENTS, projectPath });
+      const rig = await createLifecycleRig({ agents: GATE_AGENTS, projectPath });
       const preflight = rig.tools.get("swarm_preflight");
       expect(preflight).toBeDefined();
 
@@ -1629,7 +1593,7 @@ describe("mission gate → settle sequence", () => {
     filesTouched: string[],
     projectPath: string,
   ) {
-    const rig = await createRig({
+    const rig = await createLifecycleRig({
       agents: GATE_AGENTS,
       projectPath,
       workerCell: { cellID: "cell-a", epicID: "epic-1" },
@@ -2578,5 +2542,74 @@ describe("Task 13d3d1: remaining mission tools route through WorkUnits", () => {
     expect(text).toContain("counts spawns=1");
     expect(text).toContain("pendingOrphans=1");
     expect((await listUnits(native.runtime.db, native.missionPk))[0]?.state).toBe("RESERVED");
+  });
+});
+
+describe("Task 13d3e: CLI-only runtimes never fall back to legacy KV lifecycle", () => {
+  const kvMap = (ctx: FakeContext) => (ctx.storage as unknown as { map: Map<string, unknown> }).map;
+  const snapshot = (ctx: FakeContext) => JSON.stringify([...kvMap(ctx).entries()]);
+  const TOKEN = "11111111-1111-1111-1111-111111111111";
+
+  /** Seeds an active legacy mission + assignment + pending attempt straight into KV. */
+  function seedLegacyKv(ctx: FakeContext): string {
+    kvMap(ctx).set(`mission:${PROJECT}:${SESSION}`, {
+      missionID: "legacy-m", projectID: PROJECT, sessionID: SESSION, active: true, mode: "dev",
+      budget: { maxSpawns: 5, maxIterations: 3, workerShare: 1 },
+      counts: { spawns: 0, cells: 0, attemptsByCell: {}, workerSpawns: 0 },
+      createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    kvMap(ctx).set(`assignment:${PROJECT}:cell-a`, { cellID: "cell-a", agent: "swarm/swarm-worker", updatedAt: "2026-01-01T00:00:00.000Z", sessionID: SESSION });
+    kvMap(ctx).set(`attempt:${PROJECT}:legacy-call`, {
+      callID: "legacy-call", missionID: "legacy-m", sessionID: SESSION, cellID: "cell-a", epicID: "epic-1",
+      agent: "swarm/swarm-worker", status: "pending", ts: "2026-01-01T00:00:01.000Z", dispatchToken: TOKEN,
+    });
+    return snapshot(ctx);
+  }
+
+  test("WorkUnit-only dispatch hooks: a legacy KV mission is never reserved or settled", async () => {
+    const rig = await createRig({ agents: GATE_AGENTS });
+    const before = seedLegacyKv(rig.ctx);
+    const payload = workerDispatchPayload("cell-a", "call-kv-dispatch");
+    await rig.before(payload);
+    await rig.after({ ...payload, status: "completed", result: { sessionID: "ses-worker" } });
+    expect(snapshot(rig.ctx)).toBe(before);
+  });
+
+  test("WorkUnit-only build hook: shell build commands never write a KV build lock", async () => {
+    const rig = await createRig({ agents: GATE_AGENTS });
+    const before = snapshot(rig.ctx);
+    const build = { ...beforePayload({ id: "call-kv-build" }), tool: "shell", input: { command: "bun run build" } };
+    await rig.before(build).catch(() => undefined);
+    expect(snapshot(rig.ctx)).toBe(before);
+    await rig.after({ ...build, status: "completed", result: {} });
+    expect(snapshot(rig.ctx)).toBe(before);
+  });
+
+  test("WorkUnit-only worker binding: a legacy KV capability is never bound", async () => {
+    const rig = await createRig({ agents: GATE_AGENTS, workerCell: { cellID: "cell-a", epicID: "epic-1", dispatchToken: TOKEN } });
+    const before = seedLegacyKv(rig.ctx);
+    await expect(rig.ctx.permission.assert({
+      sessionID: "ses-worker", agent: "swarm/swarm-worker",
+      source: { type: "tool", messageID: "msg-kv-bind", id: "call-kv-bind" },
+      action: "edit", resources: ["src/handler.ts"],
+    })).rejects.toThrow(/token_missing/);
+    expect(snapshot(rig.ctx)).toBe(before);
+  });
+
+  test("WorkUnit-only guards: hive_update closed and worktree cleanup fail typed without WorkUnit", async () => {
+    const projectPath = await realpath(process.cwd());
+    const rig = await createRig({ agents: GATE_AGENTS, projectPath });
+    kvMap(rig.ctx).set(`mission:${PROJECT}:old`, {
+      missionID: "old", projectID: PROJECT, sessionID: "old", active: false, mode: "dev",
+      budget: { maxSpawns: 1, maxIterations: 1 }, counts: { spawns: 0, cells: 0, attemptsByCell: {}, workerSpawns: 0 },
+      createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    const before = snapshot(rig.ctx);
+    await expect(rig.tools.get("hive_update")?.execute({ id: "cell-a", status: "closed" }, toolContext()))
+      .rejects.toThrow(/cannot verify active project missions/);
+    await expect(rig.tools.get("swarm_worktree_cleanup")?.execute({ project_path: projectPath, task_id: "cell-a" }, toolContext()))
+      .rejects.toThrow(/mission storage is not wired/);
+    expect(rig.runCalls).toHaveLength(0);
+    expect(snapshot(rig.ctx)).toBe(before);
   });
 });

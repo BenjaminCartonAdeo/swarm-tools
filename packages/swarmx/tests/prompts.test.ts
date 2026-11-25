@@ -16,18 +16,7 @@ import {
   WORKER_PROTOCOL_FALLBACK,
   type RenderPromptInput,
 } from "../src/roster";
-import {
-  assignmentKey,
-  budgetKey,
-  completeConsolidation,
-  createMissionStateStore,
-  maybePrepareConsolidation,
-  putAttempt,
-  readMission,
-  resetMission,
-  resolveAssignment,
-  setBudget,
-} from "../src/state";
+import { createMissionStateStore } from "../src/state";
 import type { ConsolidationStatus, SwarmxRuntime, ToolContextLike } from "../src/types";
 import { createFakeContext, type FakeAgentInfo, type FakeToolInfo } from "./helpers";
 
@@ -348,7 +337,7 @@ describe("local tool handlers", () => {
     expect(calls).toEqual([]);
   });
 
-  test("swarm_spawn_retry injects the root cause into the prompt and records it", async () => {
+  test("swarm_spawn_retry injects the root cause into the prompt and never writes a KV cause without WorkUnit", async () => {
     const calls: { name: string; args: Record<string, unknown> }[] = [];
     const { tool, store } = await setup({
       runTool: (name, args) => {
@@ -358,8 +347,6 @@ describe("local tool handlers", () => {
         );
       },
     });
-    await setBudget(store, { projectID: "adeo", sessionID: "ses_test", mode: "dev", maxSpawns: 20, maxIterations: 3 });
-
     const output = await outputOf(tool("swarm_spawn_retry"), {
       bead_id: "cell-1",
       epic_id: "epic-1",
@@ -385,26 +372,8 @@ describe("local tool handlers", () => {
     expect(prompt).toContain("bun test tests/handler.test.ts");
     expect(prompt).toContain("error: expect(received).toBe(expected)");
 
-    const mission = await store.load("adeo", "ses_test");
-    expect(mission?.retryCauses?.[0]).toMatchObject({
-      cellID: "cell-1",
-      epicID: "epic-1",
-      attempt: 1,
-      failureReason: "TypeError: handler is not a function",
-      failedCommand: "bun test tests/handler.test.ts",
-      errorExcerpt: "error: expect(received).toBe(expected)",
-    });
-  });
-
-  test("resetMission clears the budget document", async () => {
-    const PROJECT = "adeo";
-    const SESSION = "ses_test";
-    const { store } = await setup();
-    await store.storage.set(budgetKey(PROJECT, SESSION), { maxSpawns: 5 });
-    expect(await store.storage.get(budgetKey(PROJECT, SESSION))).toBeDefined();
-
-    await resetMission(store, { projectID: PROJECT, sessionID: SESSION });
-    expect(await store.storage.get(budgetKey(PROJECT, SESSION))).toBeUndefined();
+    // Native retry causes are recorded through WorkUnit; CLI-only runtimes write nothing.
+    expect(await store.load("adeo", "ses_test")).toBeUndefined();
   });
 
 });
@@ -412,13 +381,6 @@ describe("local tool handlers", () => {
 describe("consolidation detection", () => {
   const EPIC = "epic-1";
   const SCOPE = { projectID: "adeo", sessionID: "ses_test", epicID: EPIC } as const;
-
-  /** Starts a mission so `maybePrepareConsolidation` has somewhere to persist. */
-  async function setupMission() {
-    const harness = await setup();
-    await setBudget(harness.store, { projectID: "adeo", sessionID: "ses_test", mode: "dev", maxSpawns: 20, maxIterations: 3 });
-    return harness;
-  }
 
   test("creates the consolidation cell as a child of the epic", () => {
     expect(
@@ -448,165 +410,6 @@ describe("consolidation detection", () => {
     }
   });
 
-  test("all epic cells finished prepares exactly one consolidation cell", async () => {
-    const { store } = await setupMission();
-    const prepared: string[][] = [];
-
-    const consolidation = await maybePrepareConsolidation(store, {
-      ...SCOPE,
-      listCells: async () => [
-        { id: "cell-a", status: "closed", title: "A" },
-        { id: "cell-b", status: "completed", title: "B" },
-      ],
-      prepareCell: async (cells) => {
-        prepared.push(cells.map((cell) => cell.id));
-        return { cellID: "cell-consolidate", prompt: "merge and verify" };
-      },
-    });
-
-    expect(prepared).toEqual([["cell-a", "cell-b"]]);
-    expect(consolidation).toMatchObject({
-      epicID: EPIC,
-      cellID: "cell-consolidate",
-      status: "ready",
-      prompt: "merge and verify",
-    });
-    const persisted = await readMission(store, "adeo", "ses_test");
-    expect(persisted?.consolidation).toEqual(consolidation);
-  });
-
-  test("one in_progress cell prepares nothing", async () => {
-    const { store } = await setupMission();
-    let calls = 0;
-
-    const consolidation = await maybePrepareConsolidation(store, {
-      ...SCOPE,
-      listCells: async () => [
-        { id: "cell-a", status: "closed" },
-        { id: "cell-b", status: "in_progress" },
-      ],
-      prepareCell: async () => {
-        calls += 1;
-        return { cellID: "cell-consolidate", prompt: "merge and verify" };
-      },
-    });
-
-    expect(consolidation).toBeUndefined();
-    expect(calls).toBe(0);
-    expect((await readMission(store, "adeo", "ses_test"))?.consolidation).toBeUndefined();
-  });
-
-  test("an existing consolidation is never duplicated", async () => {
-    const { store } = await setupMission();
-    let calls = 0;
-    const prepareCell = async () => {
-      calls += 1;
-      return { cellID: `cell-consolidate-${calls}`, prompt: "merge and verify" };
-    };
-
-    const first = await maybePrepareConsolidation(store, {
-      ...SCOPE,
-      listCells: async () => [{ id: "cell-a", status: "closed" }],
-      prepareCell,
-    });
-    const second = await maybePrepareConsolidation(store, {
-      ...SCOPE,
-      listCells: async () => [{ id: "cell-a", status: "closed" }],
-      prepareCell,
-    });
-
-    expect(first?.cellID).toBe("cell-consolidate-1");
-    expect(second).toEqual(first);
-    expect(calls).toBe(1);
-    expect((await readMission(store, "adeo", "ses_test"))?.consolidation).toEqual(first);
-  });
-
-  test("an epic without children prepares nothing", async () => {
-    const { store } = await setupMission();
-
-    const consolidation = await maybePrepareConsolidation(store, {
-      ...SCOPE,
-      listCells: async () => [],
-      prepareCell: async () => {
-        throw new Error("must not prepare an empty epic");
-      },
-    });
-
-    expect(consolidation).toBeUndefined();
-  });
-});
-
-describe("consolidation completion", () => {
-  const EPIC = "epic-1";
-  const CONSOLIDATION_CELL = "cell-consolidate";
-
-  async function setupMission() {
-    const harness = await setup();
-    await setBudget(harness.store, { projectID: "adeo", sessionID: "ses_test", mode: "dev", maxSpawns: 20, maxIterations: 3 });
-    const mission = await readMission(harness.store, "adeo", "ses_test");
-    if (mission === undefined) throw new Error("mission was not created");
-    await harness.store.save({
-      ...mission,
-      consolidation: {
-        epicID: EPIC,
-        cellID: CONSOLIDATION_CELL,
-        status: "dispatched",
-        prompt: "merge and verify",
-        createdAt: 1_700_000_000_000,
-      },
-    });
-    return harness;
-  }
-
-  test("approving the consolidation cell marks the epic consolidated", async () => {
-    const { store } = await setupMission();
-
-    const completed = await completeConsolidation(store, {
-      projectID: "adeo",
-      sessionID: "ses_test",
-      cellID: CONSOLIDATION_CELL,
-    });
-
-    expect(completed?.status).toBe("completed");
-    expect((await readMission(store, "adeo", "ses_test"))?.consolidation?.status).toBe("completed");
-  });
-
-  test("approving any other cell leaves the consolidation untouched", async () => {
-    const { store } = await setupMission();
-
-    const completed = await completeConsolidation(store, {
-      projectID: "adeo",
-      sessionID: "ses_test",
-      cellID: "cell-a",
-    });
-
-    expect(completed).toBeUndefined();
-    expect((await readMission(store, "adeo", "ses_test"))?.consolidation?.status).toBe("dispatched");
-  });
-
-  test("completing an already completed consolidation is idempotent", async () => {
-    const { store } = await setupMission();
-    const input = { projectID: "adeo", sessionID: "ses_test", cellID: CONSOLIDATION_CELL };
-
-    const first = await completeConsolidation(store, input);
-    const second = await completeConsolidation(store, input);
-
-    expect(first).toEqual(second);
-    expect(second?.status).toBe("completed");
-  });
-
-  test("a mission without consolidation is a no-op", async () => {
-    const harness = await setup();
-    await setBudget(harness.store, { projectID: "adeo", sessionID: "ses_test", mode: "dev", maxSpawns: 20, maxIterations: 3 });
-
-    const completed = await completeConsolidation(harness.store, {
-      projectID: "adeo",
-      sessionID: "ses_test",
-      cellID: CONSOLIDATION_CELL,
-    });
-
-    expect(completed).toBeUndefined();
-  });
 });
 
 describe("lifecycle tools without a WorkUnit runtime", () => {

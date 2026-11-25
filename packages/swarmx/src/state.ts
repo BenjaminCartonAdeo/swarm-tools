@@ -8,12 +8,9 @@
  *   - `attempt:<project>:<callID>`     one dispatch ledger entry (exact-once)
  *   - `assignment:<project>:<cell>`    the agent assigned to a cell
  *
- * Mutations run through a per-session async mutex (`withMissionLock`) so
- * read-modify-write on `counts` cannot interleave. Nothing here writes to Hive:
- * assignments are local documents, with a read-only fallback on the
- * `[agent: <id>]` tag when a caller provides the cell text.
+ * WorkUnit owns the lifecycle. This KV view is a read-only fallback kept for
+ * the legacy import: the only write left is the migration tombstone.
  */
-import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type {
   ConsolidationState,
@@ -107,21 +104,12 @@ export interface MissionStorageLike {
 }
 
 export interface MissionStateStoreOptions {
-  /**
-   * Project bound at creation. `gateBefore`/`settleAfter` take two arguments,
-   * so the project comes from here (or from an explicit event override).
-   */
+  /** Project bound at creation (dispatch hooks fall back to it). */
   readonly projectID?: string;
   /** Roster reader used by the dispatch gate. Defaults to an empty roster. */
   readonly listAgents?: DispatchAgentLister;
   /** Clock override (tests). Defaults to `Date#toISOString`. */
   readonly now?: () => IsoTimestamp;
-  /**
-   * Pending attempts younger than this are treated as in flight during orphan
-   * recovery. Defaults to 0: a load or an audit that follows a crash (no
-   * matching `execute.after`) settles the attempt as `aborted` immediately.
-   */
-  readonly orphanGraceMs?: number;
 }
 
 /** Core load/save/list boundary for mission documents, backend-agnostic. */
@@ -141,20 +129,9 @@ export interface LegacyMissionStateStore extends MissionStore {
   readonly listAgents: DispatchAgentLister;
   /** Clock bound at creation. */
   readonly now: () => IsoTimestamp;
-  readonly orphanGraceMs: number;
 }
 
 const EMPTY_ROSTER: DispatchAgentLister = async () => [];
-
-/** True when a core store also carries the legacy KV ledger members. */
-export function isLegacyMissionStateStore(store: MissionStore | undefined): store is LegacyMissionStateStore {
-  return store !== undefined && "storage" in store;
-}
-
-/** Legacy KV store bound to the runtime, or undefined when the store is native/absent. */
-export function legacyStoreOf(runtime: { readonly store?: MissionStore }): LegacyMissionStateStore | undefined {
-  return isLegacyMissionStateStore(runtime.store) ? runtime.store : undefined;
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -268,54 +245,6 @@ function cloneCounts(counts: MissionCounts): MissionCounts {
   };
 }
 
-/**
- * Reconciles counters with the durable dispatch ledger without ever lowering a
- * persisted ceiling counter. The ledger may be ahead if a process stopped
- * after writing an attempt but before saving the mission document.
- */
-export function reconcileCountsFromAttempts(
-  current: MissionCounts,
-  attempts: readonly DispatchAttempt[],
-): { readonly counts: MissionCounts; readonly changed: boolean } {
-  const attemptsByCell = { ...current.attemptsByCell };
-  const observedByCell: Record<string, number> = {};
-  const cells = new Set<string>();
-  let workerSpawns = 0;
-
-  for (const attempt of attempts) {
-    if (attempt.followup !== true) {
-      observedByCell[attempt.cellID] = (observedByCell[attempt.cellID] ?? 0) + 1;
-      cells.add(attempt.cellID);
-    }
-    if (isSwarmWorkerAgentID(attempt.agent)) workerSpawns += 1;
-  }
-  for (const [cellID, count] of Object.entries(observedByCell)) {
-    attemptsByCell[cellID] = Math.max(attemptsByCell[cellID] ?? 0, count);
-  }
-
-  const counts: MissionCounts = {
-    spawns: Math.max(current.spawns, attempts.length),
-    cells: Math.max(current.cells, cells.size),
-    attemptsByCell,
-    workerSpawns: Math.max(current.workerSpawns, workerSpawns),
-  };
-  const keys = new Set([...Object.keys(current.attemptsByCell), ...Object.keys(counts.attemptsByCell)]);
-  const changed =
-    current.spawns !== counts.spawns ||
-    current.cells !== counts.cells ||
-    current.workerSpawns !== counts.workerSpawns ||
-    [...keys].some((key) => current.attemptsByCell[key] !== counts.attemptsByCell[key]);
-  return { counts, changed };
-}
-
-/** Compares mission identities, using creation time only for legacy documents. */
-export function sameMissionGeneration(current: MissionState, expected: MissionState): boolean {
-  if (current.missionID !== undefined || expected.missionID !== undefined) {
-    return current.missionID === expected.missionID;
-  }
-  return current.createdAt === expected.createdAt;
-}
-
 /** Checks whether a ledger entry belongs to the given mission generation. */
 export function attemptBelongsToMission(
   attempt: DispatchAttempt,
@@ -374,46 +303,6 @@ export function createMissionState(input: {
   };
 }
 
-/** Async mutex per `(project, session)`; shared by every store instance. */
-const locks = new Map<string, Promise<unknown>>();
-/** Tracks locks held by the current async chain to reject self-deadlocking re-entry. */
-const lockContext = new AsyncLocalStorage<ReadonlySet<string>>();
-
-/**
- * Serializes `run` behind any in-flight operation for the same session.
- *
- * A rejected operation does not poison the chain: the next caller runs
- * regardless of the previous outcome. Re-entering the same lock from the same
- * async chain throws instead of deadlocking.
- */
-export async function withMissionLock<T>(
-  projectID: string,
-  sessionID: string,
-  run: () => Promise<T>,
-): Promise<T> {
-  const key = `${projectID}\u0000${sessionID}`;
-  const held = lockContext.getStore();
-  if (held?.has(key) === true) {
-    throw new Error(`reentrant mission lock: ${projectID}/${sessionID}`);
-  }
-  const nextHeld = new Set(held ?? []);
-  nextHeld.add(key);
-  return lockContext.run(nextHeld, async () => {
-    const previous = locks.get(key) ?? Promise.resolve();
-    const result = previous.then(run, run);
-    const settled = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    locks.set(key, settled);
-    try {
-      return await result;
-    } finally {
-      if (locks.get(key) === settled) locks.delete(key);
-    }
-  });
-}
-
 async function scanAll(
   storage: MissionStorageLike,
   prefix: string,
@@ -445,19 +334,11 @@ export function createMissionStateStore(
     projectID: options.projectID,
     listAgents: options.listAgents ?? EMPTY_ROSTER,
     now: options.now ?? (() => new Date().toISOString()),
-    orphanGraceMs: options.orphanGraceMs ?? 0,
-    async load(projectID, sessionID) {
-      const mission = await readMission(store, projectID, sessionID);
-      if (mission === undefined) return undefined;
-      // Tombstoned KV is a read-only fallback: return the legacy projection without repair writes.
-      if (await isLegacyLifecycleTombstoned(storage, projectID, sessionID)) return mission;
-      await recoverPendingOrphans(store, projectID, sessionID);
-      await reconcileMissionCounts(store, projectID, sessionID);
-      return readMission(store, projectID, sessionID);
-    },
+    // Read-only fallback: never repairs orphans or counters on load.
+    load: (projectID, sessionID) => readMission(store, projectID, sessionID),
     async save(state) {
       await assertLegacyLifecycleWritable(store, state.projectID, state.sessionID);
-      await storage.set(missionKey(state.projectID, state.sessionID), state as unknown as JsonValue);
+      throw new LegacyLifecycleReadOnlyError(state.projectID);
     },
     async list() {
       const entries = await scanAll(storage, MISSION_KEY_PREFIX);
@@ -486,127 +367,11 @@ export async function readMission(
   return isMissionState(raw) ? raw : undefined;
 }
 
-/** Reads one ledger entry by call id. */
-export async function getAttempt(
-  store: LegacyMissionStateStore,
-  projectID: string,
-  callID: string,
-): Promise<DispatchAttempt | undefined> {
-  const raw = await store.storage.get(attemptKey(projectID, callID));
-  return isDispatchAttempt(raw) ? raw : undefined;
-}
-
-/** Writes one ledger entry by call id. */
-export async function putAttempt(
-  store: LegacyMissionStateStore,
-  projectID: string,
-  attempt: DispatchAttempt,
-): Promise<void> {
-  await assertLegacyLifecycleWritable(store, projectID, attempt.sessionID);
-  await store.storage.set(attemptKey(projectID, attempt.callID), attempt as unknown as JsonValue);
-}
-
-export type WorkerAttemptBindingResult =
-  | {
-      readonly status: "bound" | "already_bound";
-      readonly attempt: DispatchAttempt;
-      readonly missionID: string;
-    }
-  | {
-      readonly status: "not_owner" | "not_found" | "revoked" | "inactive" | "invalid_status";
-    };
-
 /** Prefix of the project-scoped build/test lock. */
 const BUILD_LOCK_PREFIX = "build-lock:";
-const BUILD_LOCK_TTL_MS = 15 * 60 * 1000;
 
 function buildLockKey(projectID: string): string {
   return `${BUILD_LOCK_PREFIX}${projectID}`;
-}
-
-/** Acquires the project build lock. Returns false when another build is active. */
-export async function acquireBuildLock(
-  store: LegacyMissionStateStore,
-  projectID: string,
-  sessionID: string,
-  callID: string,
-  command: string,
-): Promise<boolean> {
-  await assertLegacyLifecycleWritable(store, projectID, sessionID);
-  return withMissionLock(projectID, "__build__", async () => {
-    const key = buildLockKey(projectID);
-    const raw = await store.storage.get(key);
-    const record = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : undefined;
-    const acquiredAt = typeof record?.acquiredAt === "string" ? Date.parse(record.acquiredAt) : 0;
-    const active = Number.isFinite(acquiredAt) && Date.now() - acquiredAt < BUILD_LOCK_TTL_MS;
-    if (active && record?.callID !== callID) return false;
-    await store.storage.set(key, {
-      projectID,
-      sessionID,
-      callID,
-      command,
-      acquiredAt: store.now(),
-    });
-    return true;
-  });
-}
-
-/** Releases the project build lock when the owning shell call settles. */
-export async function releaseBuildLock(
-  store: LegacyMissionStateStore,
-  projectID: string,
-  callID: string,
-): Promise<boolean> {
-  return withMissionLock(projectID, "__build__", async () => {
-    const key = buildLockKey(projectID);
-    const raw = await store.storage.get(key);
-    const record = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : undefined;
-    if (record?.callID !== callID) return false;
-    await store.storage.remove(key);
-    return true;
-  });
-}
-
-/**
- * Atomically binds a dispatched attempt to its worker session on first use.
- *
- * The dispatch token is the capability: cell, epic, agent and token must all
- * match an active, unrevoked attempt. An unbound attempt is claimed by exactly
- * one worker session; a different session can never reuse it.
- */
-export async function bindWorkerAttemptSession(
-  store: LegacyMissionStateStore,
-  projectID: string,
-  parentSessionID: string,
-  workerSessionID: string,
-  marker: CellMarker,
-  agentID: string,
-): Promise<WorkerAttemptBindingResult> {
-  return withMissionLock(projectID, parentSessionID, async () => {
-    const mission = await readMission(store, projectID, parentSessionID);
-    if (mission === undefined || !mission.active) return { status: "inactive" };
-    const attempts = await listAttempts(store, projectID, parentSessionID, mission);
-    const attempt = attempts.find(
-      (candidate) =>
-        candidate.dispatchToken === marker.dispatchToken &&
-        candidate.cellID === marker.cellID &&
-        candidate.epicID === marker.epicID &&
-        candidate.agent === agentID,
-    );
-    if (attempt === undefined) return { status: "not_found" };
-    if (attempt.revokedAt !== undefined) return { status: "revoked" };
-    if (attempt.status !== "pending" && attempt.status !== "succeeded") {
-      return { status: "invalid_status" };
-    }
-    const missionID = mission.missionID ?? `legacy:${mission.createdAt}`;
-    if (attempt.workerSessionID === undefined) {
-      const bound = { ...attempt, workerSessionID };
-      await putAttempt(store, projectID, bound);
-      return { status: "bound", attempt: bound, missionID };
-    }
-    if (attempt.workerSessionID !== workerSessionID) return { status: "not_owner" };
-    return { status: "already_bound", attempt, missionID };
-  });
 }
 
 /**
@@ -629,259 +394,6 @@ export async function listAttempts(
     .sort((left, right) =>
       left.ts === right.ts ? left.callID.localeCompare(right.callID) : left.ts.localeCompare(right.ts),
     );
-}
-
-/** Reconciles one mission's counters from its durable attempt ledger. */
-async function reconcileMissionCountsLocked(
-  store: LegacyMissionStateStore,
-  projectID: string,
-  sessionID: string,
-  mission: MissionState,
-): Promise<DispatchAttempt[]> {
-  const attempts = await listAttempts(store, projectID, sessionID, mission);
-  const reconciliation = reconcileCountsFromAttempts(mission.counts, attempts);
-  if (reconciliation.changed) {
-    mission.counts = reconciliation.counts;
-    mission.updatedAt = store.now();
-    await store.save(mission);
-  }
-  return attempts;
-}
-
-/** Reconciles a replayed reservation under the mission lock before allowing it. */
-export async function reconcileMissionCounts(
-  store: LegacyMissionStateStore,
-  projectID: string,
-  sessionID: string,
-  expectedMission?: MissionState,
-): Promise<"reconciled" | "missing" | "inactive" | "changed"> {
-  return withMissionLock(projectID, sessionID, async () => {
-    const mission = await readMission(store, projectID, sessionID);
-    if (mission === undefined) return "missing";
-    if (expectedMission !== undefined) {
-      if (!mission.active) return "inactive";
-      if (!sameMissionGeneration(mission, expectedMission)) return "changed";
-    }
-    await reconcileMissionCountsLocked(store, projectID, sessionID, mission);
-    return "reconciled";
-  });
-}
-
-/**
- * Reports pending attempts for explicit reconciliation without changing them.
- * An elapsed grace period cannot establish whether a worker is still live.
- *
- * @returns How many pending attempts remain candidates for reconciliation.
- */
-export async function recoverPendingOrphans(
-  store: LegacyMissionStateStore,
-  projectID: string,
-  sessionID: string,
-): Promise<number> {
-  const mission = await readMission(store, projectID, sessionID);
-  const attempts = await listAttempts(store, projectID, sessionID, mission);
-  return attempts.filter((attempt) => attempt.status === "pending").length;
-}
-
-export interface SetBudgetInput {
-  readonly projectID: string;
-  readonly sessionID: string;
-  readonly mode: MissionMode;
-  readonly maxSpawns: number;
-  readonly maxIterations: number;
-  readonly workerShare?: number;
-}
-
-/**
- * Creates the mission with its budget.
- *
- * A budget is fixed once per mission: calling this while a mission is active
- * for the same `(project, session)` throws. A finished mission can be replaced
- * by a fresh one (counters reset).
- */
-export async function setBudget(
-  store: LegacyMissionStateStore,
-  input: SetBudgetInput,
-): Promise<MissionState> {
-  const budget = normalizeBudget({
-    maxSpawns: input.maxSpawns,
-    maxIterations: input.maxIterations,
-    ...(input.workerShare === undefined ? {} : { workerShare: input.workerShare }),
-  });
-  return withMissionLock(input.projectID, input.sessionID, async () => {
-    const existing = await readMission(store, input.projectID, input.sessionID);
-    if (existing !== undefined && existing.active) {
-      throw new Error(
-        `swarmx: mission budget already set for session ${input.sessionID} ` +
-          `(${existing.budget.maxSpawns} spawns / ${existing.budget.maxIterations} iterations); ` +
-          "the budget is fixed once per mission — run swarm_finish before setting a new one",
-      );
-    }
-    const state = createMissionState({
-      projectID: input.projectID,
-      sessionID: input.sessionID,
-      mode: input.mode,
-      budget,
-      now: store.now(),
-    });
-    await store.save(state);
-    return state;
-  });
-}
-
-/** Marks the mission inactive. No-op when it does not exist or is already over. */
-export async function finishMission(
-  store: LegacyMissionStateStore,
-  input: { readonly projectID: string; readonly sessionID: string; readonly abandon?: boolean },
-): Promise<MissionState | undefined> {
-  return withMissionLock(input.projectID, input.sessionID, async () => {
-    const mission = await readMission(store, input.projectID, input.sessionID);
-    if (mission === undefined) return undefined;
-    if (!mission.active) return mission;
-    const attempts = await listAttempts(store, input.projectID, input.sessionID, mission);
-    if (input.abandon === true) {
-      // Abandon: revoke all pending/succeeded attempts so the mission can close.
-      for (const attempt of attempts) {
-        if (attempt.revokedAt === undefined && (attempt.status === "pending" || attempt.status === "succeeded")) {
-          await putAttempt(store, input.projectID, { ...attempt, revokedAt: store.now() });
-        }
-      }
-    } else if (
-      attempts.some(
-        (attempt) =>
-          attempt.revokedAt === undefined &&
-          (attempt.status === "pending" || attempt.status === "succeeded"),
-      )
-    ) {
-      throw new Error("mission has unrevoked worker attempts");
-    }
-    mission.active = false;
-    mission.updatedAt = store.now();
-    await store.save(mission);
-    await store.storage.remove(budgetKey(input.projectID, input.sessionID));
-    await removeSessionAssignments(store, input.projectID, input.sessionID);
-    return mission;
-  });
-}
-
-/** Maximum retry causes retained per mission; oldest records are dropped. */
-export const MAX_RETRY_CAUSES = 20;
-
-export interface RecordRetryCauseInput {
-  readonly projectID: string;
-  readonly sessionID: string;
-  readonly cellID: string;
-  readonly epicID: string;
-  readonly attempt: number;
-  readonly cause: RetryRootCause;
-}
-
-/**
- * Appends one retry root cause to the mission document.
- *
- * @returns the persisted record, or `undefined` when the session has no mission
- * (nothing to audit against) — the retry itself is not blocked by that.
- */
-export async function recordRetryCause(
-  store: LegacyMissionStateStore,
-  input: RecordRetryCauseInput,
-): Promise<RetryCauseRecord | undefined> {
-  return withMissionLock(input.projectID, input.sessionID, async () => {
-    const mission = await readMission(store, input.projectID, input.sessionID);
-    if (mission === undefined) return undefined;
-    const record: RetryCauseRecord = {
-      ...input.cause,
-      cellID: input.cellID,
-      epicID: input.epicID,
-      attempt: input.attempt,
-      ts: store.now(),
-    };
-    mission.retryCauses = [...(mission.retryCauses ?? []), record].slice(-MAX_RETRY_CAUSES);
-    mission.updatedAt = record.ts;
-    await store.save(mission);
-    return record;
-  });
-}
-
-/** Resets a mission: removes its document, attempts, and assignments. */
-export async function resetMission(
-  store: LegacyMissionStateStore,
-  input: { readonly projectID: string; readonly sessionID: string },
-): Promise<void> {
-  return withMissionLock(input.projectID, input.sessionID, async () => {
-    const attempts = await listAttempts(store, input.projectID, input.sessionID);
-    for (const attempt of attempts) {
-      await store.storage.remove(attemptKey(input.projectID, attempt.callID));
-    }
-    await removeSessionAssignments(store, input.projectID, input.sessionID);
-    await store.storage.remove(missionKey(input.projectID, input.sessionID));
-    await store.storage.remove(budgetKey(input.projectID, input.sessionID));
-  });
-}
-
-/** Removes only assignments explicitly owned by one session. */
-async function removeSessionAssignments(
-  store: LegacyMissionStateStore,
-  projectID: string,
-  sessionID: string,
-): Promise<void> {
-  const entries = await scanAll(store.storage, `${ASSIGNMENT_KEY_PREFIX}${projectID}:`);
-  for (const entry of entries) {
-    // <!-- ponytail: Unowned legacy entries cannot be attributed safely, so preserve them. -->
-    if (isRecord(entry.value) && entry.value.sessionID === sessionID) {
-      await store.storage.remove(entry.key);
-    }
-  }
-}
-
-/** Records the agent assigned to a cell. Storage only — never a Hive write. */
-export async function setAssignment(
-  store: LegacyMissionStateStore,
-  projectID: string,
-  cellID: string,
-  agent: string,
-  owner?: AssignmentOwner,
-): Promise<void> {
-  await assertLegacyLifecycleWritable(store, projectID, owner?.sessionID);
-  await store.storage.set(assignmentKey(projectID, cellID), {
-    cellID,
-    agent,
-    updatedAt: store.now(),
-    ...(owner === undefined ? {} : { sessionID: owner.sessionID }),
-  });
-}
-
-/**
- * Reads the agent assigned to a cell.
- *
- * Storage is authoritative. When `cellText` is provided (e.g. the cell
- * description), a read-only best-effort fallback parses an `[agent: <id>]` tag.
- * Nothing is ever written to Hive.
- */
-export async function resolveAssignment(
-  store: LegacyMissionStateStore,
-  projectID: string,
-  cellID: string,
-  cellText?: string,
-  owner?: AssignmentOwner,
-): Promise<string | undefined> {
-  const raw = await store.storage.get(assignmentKey(projectID, cellID));
-  if (isRecord(raw)) {
-    if (owner !== undefined && raw.sessionID !== undefined && raw.sessionID !== owner.sessionID) {
-      return undefined;
-    }
-    if (typeof raw.agent === "string" && raw.agent.length > 0) return raw.agent;
-  }
-  if (cellText !== undefined) return parseAgentTag(cellText);
-  return undefined;
-}
-
-const AGENT_TAG = /\[agent:\s*([^\s\]]+)\s*\]/;
-
-/** Parses the read-only `[agent: <id>]` tag used by cell descriptions. */
-export function parseAgentTag(text: string): string | undefined {
-  const match = AGENT_TAG.exec(text);
-  return match === null ? undefined : match[1];
 }
 
 /**
@@ -1014,35 +526,6 @@ export function selectPendingOrphans(attempts: readonly DispatchAttempt[]): Disp
     .sort(compareAttempts);
 }
 
-/** One epic child as reported by the read-only cell lister. */
-export interface ConsolidationCellSummary {
-  readonly id: string;
-  readonly status: string;
-  readonly title?: string;
-}
-
-/** Cell and prompt produced by the injected consolidation creator. */
-export interface PreparedConsolidationCell {
-  readonly cellID: string;
-  readonly prompt: string;
-}
-
-/** Inputs of {@link maybePrepareConsolidation}. */
-export interface MaybePrepareConsolidationInput {
-  readonly projectID: string;
-  readonly sessionID: string;
-  readonly epicID: string;
-  /** Read-only epic lister (Hive). Injected so this module stays storage-only. */
-  readonly listCells: (epicID: string) => Promise<readonly ConsolidationCellSummary[]>;
-  /**
-   * Creates + assigns + starts the consolidation cell and renders its dispatch
-   * prompt. The plugin never spawns: the coordinator consumes the prompt.
-   */
-  readonly prepareCell: (
-    cells: readonly ConsolidationCellSummary[],
-  ) => Promise<PreparedConsolidationCell>;
-}
-
 /**
  * Terminal Hive statuses for consolidation detection.
  *
@@ -1052,100 +535,6 @@ export interface MaybePrepareConsolidationInput {
 export function isConsolidationCellFinished(status: string): boolean {
   const normalized = status.trim().toLowerCase();
   return normalized === "closed" || normalized === "completed" || normalized === "done";
-}
-
-/**
- * Prepares the epic consolidation cell once every epic child is finished.
- *
- * Idempotent and serialized by {@link withMissionLock}: an existing
- * `mission.consolidation` is returned as-is, so two parallel approvals create
- * at most one cell. Returns `undefined` while a cell is still in flight, when
- * the epic has no children, or when the mission is absent/inactive.
- */
-export async function maybePrepareConsolidation(
-  store: LegacyMissionStateStore,
-  input: MaybePrepareConsolidationInput,
-): Promise<ConsolidationState | undefined> {
-  return withMissionLock(input.projectID, input.sessionID, async () => {
-    const mission = await readMission(store, input.projectID, input.sessionID);
-    if (mission === undefined || !mission.active) return undefined;
-    if (mission.consolidation !== undefined) return mission.consolidation;
-
-    const cells = (await input.listCells(input.epicID)).filter(
-      (cell) => cell.id !== input.epicID,
-    );
-    if (cells.length === 0) return undefined;
-    if (cells.some((cell) => !isConsolidationCellFinished(cell.status))) return undefined;
-
-    const prepared = await input.prepareCell(cells);
-    const consolidation: ConsolidationState = {
-      epicID: input.epicID,
-      cellID: prepared.cellID,
-      status: "ready",
-      prompt: prepared.prompt,
-      createdAt: Date.now(),
-    };
-    mission.consolidation = consolidation;
-    mission.updatedAt = store.now();
-    await store.save(mission);
-    return consolidation;
-  });
-}
-
-/**
- * Marks the epic consolidation as `completed` once its cell is approved.
- *
- * The plugin cannot observe the worker's own completion: the coordinator's
- * approval of the consolidation cell is the signal. No-op for any other cell,
- * so it is safe to call on every approval.
- */
-export async function completeConsolidation(
-  store: LegacyMissionStateStore,
-  input: { readonly projectID: string; readonly sessionID: string; readonly cellID: string },
-): Promise<ConsolidationState | undefined> {
-  return withMissionLock(input.projectID, input.sessionID, async () => {
-    const mission = await readMission(store, input.projectID, input.sessionID);
-    const consolidation = mission?.consolidation;
-    if (mission === undefined || consolidation === undefined) return undefined;
-    if (consolidation.cellID !== input.cellID) return undefined;
-    if (consolidation.status === "completed") return consolidation;
-    consolidation.status = "completed";
-    mission.updatedAt = store.now();
-    await store.save(mission);
-    return consolidation;
-  });
-}
-
-/**
- * Structured mission summary for `swarm_agent_audit`.
- *
- * Reports pending attempts as reconciliation candidates without changing
- * their status; elapsed time alone cannot establish that a worker is gone.
- */
-export async function audit(
-  store: LegacyMissionStateStore,
-  projectID: string,
-  sessionID: string,
-): Promise<MissionAudit> {
-  return withMissionLock(projectID, sessionID, async () => {
-    const pendingOrphans = await recoverPendingOrphans(store, projectID, sessionID);
-    const mission = await readMission(store, projectID, sessionID);
-    const attempts =
-      mission === undefined
-        ? await listAttempts(store, projectID, sessionID)
-        : await reconcileMissionCountsLocked(store, projectID, sessionID, mission);
-    return {
-      active: mission?.active ?? false,
-      mode: mission?.mode,
-      budget: mission === undefined ? undefined : { ...mission.budget },
-      counts: mission === undefined ? undefined : cloneCounts(mission.counts),
-      attempts,
-      pendingOrphans,
-      ...(mission?.consolidation === undefined
-        ? {}
-        : { consolidation: { ...mission.consolidation } }),
-    };
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1167,6 +556,16 @@ export class LegacyLifecycleTombstonedError extends Error {
   constructor(projectID: string) {
     super(`Legacy lifecycle state for project ${projectID} was imported; KV writes are read-only`);
     this.name = "LegacyLifecycleTombstonedError";
+    this.projectID = projectID;
+  }
+}
+
+/** Raised for any lifecycle write through the legacy KV store: WorkUnit owns writes. */
+export class LegacyLifecycleReadOnlyError extends Error {
+  readonly projectID: string;
+  constructor(projectID: string) {
+    super(`Legacy lifecycle state for project ${projectID} is a read-only fallback; WorkUnit owns lifecycle writes`);
+    this.name = "LegacyLifecycleReadOnlyError";
     this.projectID = projectID;
   }
 }

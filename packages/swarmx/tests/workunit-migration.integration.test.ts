@@ -5,15 +5,12 @@ import { ensureWorkUnitSchema } from "../src/workunit/schema.js";
 import { migrateLegacyLifecycle, LegacyMissionConflictError, type LegacyLifecycleStore } from "../src/workunit/migrate.js";
 import { reserveWorkUnit } from "../src/workunit/store.js";
 import {
-  acquireBuildLock,
   createLegacyLifecycleStore,
   createMissionStateStore,
   createTombstoneGuardedStorage,
   legacyTombstoneKey,
   LegacyLifecycleTombstonedError,
-  putAttempt,
   readMission,
-  setAssignment,
   type MissionScanOptions,
   type MissionStorageLike,
 } from "../src/state.js";
@@ -390,11 +387,12 @@ describe("legacy lifecycle import", () => {
     const { db, legacyStore, missions, storage } = await setup();
     await migrateLegacyLifecycle(db, { project: P, legacyStore });
     const before = JSON.stringify([...storage.map.entries()]);
-    await expect(putAttempt(missions, P, attempt("late", "c50") as never)).rejects.toBeInstanceOf(LegacyLifecycleTombstonedError);
-    await expect(setAssignment(missions, P, "c50", "coder")).rejects.toBeInstanceOf(LegacyLifecycleTombstonedError);
+    const guarded = createTombstoneGuardedStorage(storage);
+    await expect(guarded.set(`attempt:${P}:late`, attempt("late", "c50"))).rejects.toBeInstanceOf(LegacyLifecycleTombstonedError);
+    await expect(guarded.set(`assignment:${P}:c50`, { cellID: "c50", agent: "coder" })).rejects.toBeInstanceOf(LegacyLifecycleTombstonedError);
     const mission = await readMission(missions, P, "s1");
     await expect(missions.save({ ...mission!, active: false })).rejects.toBeInstanceOf(LegacyLifecycleTombstonedError);
-    await expect(acquireBuildLock(missions, P, "s1", "b2", "bun test")).rejects.toBeInstanceOf(LegacyLifecycleTombstonedError);
+    await expect(guarded.set(`build-lock:${P}`, { callID: "b2" })).rejects.toBeInstanceOf(LegacyLifecycleTombstonedError);
     expect(JSON.stringify([...storage.map.entries()])).toBe(before);
   });
 
@@ -415,7 +413,7 @@ describe("legacy lifecycle import", () => {
     const first = await migrateLegacyLifecycle(db, { project: P, legacyStore });
     storage.map.clear();
     for (const [key, value] of snapshot) storage.map.set(key, value);
-    await setAssignment(missions, P, "c51", "coder");
+    await createTombstoneGuardedStorage(storage).set(`assignment:${P}:c51`, { cellID: "c51", agent: "coder" });
     expect(storage.map.has(`assignment:${P}:c51`)).toBe(true);
     storage.map.delete(`assignment:${P}:c51`);
     const fresh = await setup(structuredClone(snapshot));
