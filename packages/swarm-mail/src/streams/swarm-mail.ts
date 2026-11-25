@@ -294,23 +294,17 @@ export async function sendSwarmMessage(
     dbOverride,
   } = options;
 
+  let duplicate = false;
   if (operationId) {
     const { getOrCreateAdapter } = await import("./store-drizzle");
     const adapter = await getOrCreateAdapter(projectPath, dbOverride);
     const existing = await adapter.query(
-      "SELECT id, thread_id FROM messages WHERE operation_id = ?",
+      "SELECT id FROM messages WHERE operation_id = ?",
       [operationId],
     );
-    const row = existing.rows[0] as { id: number; thread_id: string | null } | undefined;
-    if (row) {
-      return {
-        success: true,
-        messageId: Number(row.id),
-        threadId: row.thread_id ?? undefined,
-        recipientCount: toAgents.length,
-        duplicate: true,
-      };
-    }
+    // Replays still flow through appendEvent below: it dedupes the event and
+    // repairs a projection lost between event insert and projection.
+    duplicate = existing.rows.length > 0;
   }
 
   // Check if thread exists (for thread_created event)
@@ -412,6 +406,7 @@ export async function sendSwarmMessage(
     messageId,
     threadId,
     recipientCount: toAgents.length,
+    ...(duplicate ? { duplicate: true } : {}),
   };
 }
 

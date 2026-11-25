@@ -71,7 +71,10 @@ export async function appendEventDrizzle(
 
   // Idempotent replay: return the persisted record, never re-run projections
   const replayed = await loadExisting();
-  if (replayed) return replayed;
+  if (replayed) {
+    await repairKeyedProjectionDrizzle(db, replayed);
+    return replayed;
+  }
 
   // Insert event
   let result: Array<{ id: number; sequence: number | null }>;
@@ -340,6 +343,38 @@ async function handleAgentRegisteredDrizzle(
         last_active_at: event.timestamp,
       },
     });
+}
+
+/**
+ * Replay repair: the event insert and its projection are separate writes, so
+ * a crash between them leaves a keyed message_sent event without its message
+ * row/recipients. On replay, re-run the (idempotent) projection.
+ */
+export async function repairKeyedProjectionDrizzle(
+  db: SwarmDb,
+  event: AgentEvent & { id: number; sequence: number },
+): Promise<void> {
+  if (event.type !== "message_sent" || !event.operation_id) return;
+  const found = await db
+    .select({ id: messagesTable.id })
+    .from(messagesTable)
+    .where(eq(messagesTable.operation_id, event.operation_id))
+    .limit(1);
+  const messageId = found[0]?.id;
+  if (messageId === undefined) {
+    try {
+      await handleMessageSentDrizzle(db, event as MessageSentEvent & { id: number; sequence: number });
+    } catch (error) {
+      if (!isOperationIdUniqueViolation(error, "messages")) throw error;
+    }
+    return;
+  }
+  if (event.to_agents.length > 0) {
+    await db
+      .insert(messageRecipientsTable)
+      .values(event.to_agents.map((agentName) => ({ message_id: messageId, agent_name: agentName })))
+      .onConflictDoNothing();
+  }
 }
 
 async function handleMessageSentDrizzle(

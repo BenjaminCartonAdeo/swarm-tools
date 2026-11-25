@@ -219,6 +219,47 @@ export async function recoverStaleReviewFeedback(
   return { recovered, foreignCandidates };
 }
 
+/**
+ * Owner-initiated release after a failed side effect: clears the token while
+ * preserving state and attempt, so a retry (same or other process) can
+ * re-claim. Side effects are operation-keyed, so re-execution is safe.
+ */
+export async function releaseReviewFeedbackClaim(
+  operationId: string,
+  claimToken: string,
+  dbOverride?: DatabaseAdapter,
+): Promise<void> {
+  const db = await resolveDb(dbOverride);
+  const released = await db.query(
+    `UPDATE review_feedback_operations SET claim_token = NULL, updated_at = ?
+     WHERE operation_id = ? AND claim_token = ? AND state != 'done'
+     RETURNING operation_id`,
+    [Date.now(), operationId, claimToken],
+  );
+  if (released.rows.length === 0) throw new StaleReviewFeedbackClaimError(operationId);
+}
+
+/**
+ * Durable review gate: true when the latest completed keyed feedback for
+ * (projectKey, taskId) approved the task.
+ */
+export async function getDurableReviewApproval(
+  projectKey: string,
+  taskId: string,
+  dbOverride?: DatabaseAdapter,
+): Promise<boolean> {
+  const db = await resolveDb(dbOverride);
+  const latest = await db.query<{ result: string | null }>(
+    `SELECT result FROM review_feedback_operations
+     WHERE project_key = ? AND task_id = ? AND state = 'done'
+     ORDER BY updated_at DESC, rowid DESC LIMIT 1`,
+    [projectKey, taskId],
+  );
+  const raw = latest.rows[0]?.result;
+  if (!raw) return false;
+  return (JSON.parse(raw) as { status?: string }).status === "approved";
+}
+
 /** Explicit operator recovery of one unfinished claim (e.g. foreign host). */
 export async function recoverReviewFeedbackOperation(
   operationId: string,

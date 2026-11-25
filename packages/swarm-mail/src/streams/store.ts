@@ -201,7 +201,10 @@ export async function appendEvent(
   const operationId = event.operation_id;
   if (operationId) {
     const existing = await findEventByOperationId(db, operationId);
-    if (existing) return existing as AgentEvent & { id: number; sequence: number };
+    if (existing) {
+      await repairKeyedProjection(db, existing as AgentEvent & { id: number; sequence: number });
+      return existing as AgentEvent & { id: number; sequence: number };
+    }
   }
 
   // Extract common fields
@@ -751,6 +754,36 @@ async function handleAgentRegistered(
       event.timestamp,
     ],
   );
+}
+
+/**
+ * Replay repair for a keyed message_sent whose projection was lost by a crash
+ * between event insert and projection: re-run it idempotently.
+ */
+async function repairKeyedProjection(
+  db: DatabaseAdapter,
+  event: AgentEvent & { id: number; sequence: number },
+): Promise<void> {
+  if (event.type !== "message_sent" || !event.operation_id) return;
+  const found = await db.query<{ id: number }>(
+    "SELECT id FROM messages WHERE operation_id = $1",
+    [event.operation_id],
+  );
+  const messageId = found.rows[0]?.id;
+  if (messageId === undefined) {
+    try {
+      await handleMessageSent(db, event as MessageSentEvent & { id: number; sequence: number });
+    } catch (error) {
+      if (!isOperationIdUniqueViolation(error, "messages")) throw error;
+    }
+    return;
+  }
+  for (const agent of event.to_agents) {
+    await db.query(
+      `INSERT INTO message_recipients (message_id, agent_name) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [messageId, agent],
+    );
+  }
 }
 
 async function handleMessageSent(

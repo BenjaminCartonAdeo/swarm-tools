@@ -82,6 +82,7 @@ import {
 import {
   isReviewApproved,
   getReviewStatus,
+  getDurableReviewApproval,
 } from "./swarm-review";
 import { getGitCommitInfo } from "./utils/git-commit-info";
 import { captureCoordinatorEvent, type EvalRecord } from "./eval-capture.js";
@@ -1061,7 +1062,13 @@ export const swarm_complete = tool({
 
     // Check review gate (unless skipped) - BEFORE try block so errors are clear
     if (!args.skip_review) {
-      const reviewStatusResult = getReviewStatus(args.bead_id);
+      let reviewStatusResult = getReviewStatus(args.bead_id);
+      if (
+        !reviewStatusResult.approved &&
+        (await getDurableReviewApproval(args.project_key, args.bead_id))
+      ) {
+        reviewStatusResult = { ...reviewStatusResult, reviewed: true, approved: true };
+      }
 
       if (!reviewStatusResult.approved) {
         // Check if review was even attempted

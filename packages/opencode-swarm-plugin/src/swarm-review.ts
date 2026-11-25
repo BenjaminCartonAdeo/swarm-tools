@@ -527,6 +527,7 @@ async function executeKeyedReviewFeedback(
     claimReviewFeedback,
     markReviewFeedbackStarted,
     completeReviewFeedback,
+    releaseReviewFeedbackClaim,
     createEvent,
     appendEvent,
   } = await import("swarm-mail");
@@ -593,6 +594,7 @@ async function executeKeyedReviewFeedback(
   const { claimToken, attempt } = claim;
   await markReviewFeedbackStarted(operationId, claimToken);
 
+  try {
   const approved = args.status === "approved";
   const remaining = approved ? MAX_REVIEW_ATTEMPTS : MAX_REVIEW_ATTEMPTS - attempt;
 
@@ -712,6 +714,28 @@ You may now complete the task with \`swarm_complete\`.`,
 
   await completeReviewFeedback(operationId, claimToken, result);
   return JSON.stringify(result, null, 2);
+  } catch (error) {
+    // Release the claim (state/attempt preserved) so a retry can re-claim;
+    // all side effects are operation-keyed, so re-execution is safe.
+    await releaseReviewFeedbackClaim(operationId, claimToken).catch(() => undefined);
+    throw error;
+  }
+}
+
+/**
+ * Durable review gate for keyed approvals (process-independent).
+ */
+export async function getDurableReviewApproval(
+  projectKey: string,
+  taskId: string,
+): Promise<boolean> {
+  try {
+    const { getDurableReviewFeedbackApproval } = await import("swarm-mail");
+    return await getDurableReviewFeedbackApproval(projectKey, taskId);
+  } catch (error) {
+    console.warn("[swarm_review] durable review lookup failed:", error);
+    return false;
+  }
 }
 
 /**

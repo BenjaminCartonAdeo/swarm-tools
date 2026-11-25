@@ -430,6 +430,8 @@ export {
 	markReviewFeedbackStarted,
 	recoverReviewFeedbackOperation,
 	recoverStaleReviewFeedback,
+	releaseReviewFeedbackClaim,
+	getDurableReviewApproval as getDurableReviewFeedbackApproval,
 	StaleReviewFeedbackClaimError,
 	type ClaimReviewFeedbackInput,
 	type ClaimReviewFeedbackOutcome,

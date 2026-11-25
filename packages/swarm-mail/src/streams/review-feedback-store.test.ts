@@ -12,6 +12,8 @@ import {
   markReviewFeedbackStarted,
   recoverReviewFeedbackOperation,
   recoverStaleReviewFeedback,
+  releaseReviewFeedbackClaim,
+  getDurableReviewApproval,
   type ReviewFeedbackResult,
 } from "./review-feedback-store.js";
 import { appendEvent } from "./store-drizzle.js";
@@ -247,5 +249,78 @@ describe("review feedback operations", () => {
       "SELECT COUNT(id) AS n FROM events WHERE type = 'message_sent'",
     );
     expect(sentEvents.rows[0]?.n).toBe(1);
+  });
+  test("failedSideEffectReleasesClaimForSafeRetry", async () => {
+    const owner = await claimReviewFeedback(claimInput("op-fail"), db);
+    if (owner.kind !== "claimed") throw new Error("expected claimed");
+    await markReviewFeedbackStarted("op-fail", owner.claimToken, db);
+    // Same live process retries before release: busy
+    expect(await claimReviewFeedback(claimInput("op-fail"), db)).toEqual({ kind: "busy", attempt: 1 });
+
+    await releaseReviewFeedbackClaim("op-fail", owner.claimToken, db);
+    const retry = await claimReviewFeedback(claimInput("op-fail"), db);
+    if (retry.kind !== "claimed") throw new Error(`expected claimed, got ${retry.kind}`);
+    expect(retry.attempt).toBe(1);
+    await expect(completeReviewFeedback("op-fail", owner.claimToken, RESULT, db)).rejects.toThrow(/stale/i);
+    await completeReviewFeedback("op-fail", retry.claimToken, RESULT, db);
+    expect(await claimReviewFeedback(claimInput("op-fail"), db)).toEqual({ kind: "done", result: RESULT });
+    const next = await claimReviewFeedback(claimInput("op-fail-next"), db);
+    expect(next.kind === "claimed" && next.attempt).toBe(2);
+  });
+
+  test("durableApprovalReflectsLatestCompletedFeedback", async () => {
+    expect(await getDurableReviewApproval(PROJECT, "task-1", db)).toBe(false);
+    const a = await claimReviewFeedback(claimInput("op-ap", { status: "approved" }), db);
+    if (a.kind !== "claimed") throw new Error("expected claimed");
+    expect(await getDurableReviewApproval(PROJECT, "task-1", db)).toBe(false);
+    await completeReviewFeedback("op-ap", a.claimToken, { ...RESULT, status: "approved" }, db);
+    expect(await getDurableReviewApproval(PROJECT, "task-1", db)).toBe(true);
+    expect(await getDurableReviewApproval(PROJECT, "task-2", db)).toBe(false);
+    expect(await getDurableReviewApproval("/other", "task-1", db)).toBe(false);
+    const n = await claimReviewFeedback(claimInput("op-nc"), db);
+    if (n.kind !== "claimed") throw new Error("expected claimed");
+    await completeReviewFeedback("op-nc", n.claimToken, RESULT, db);
+    expect(await getDurableReviewApproval(PROJECT, "task-1", db)).toBe(false);
+  });
+
+  test("keyedMessageProjectionLostByCrashIsRepairedOnReplay", async () => {
+    const send = () =>
+      sendSwarmMessage({
+        projectPath: PROJECT,
+        fromAgent: "coordinator",
+        toAgents: ["worker-1"],
+        subject: "APPROVED: task-1",
+        body: "ok",
+        operationId: "op-crash-msg",
+        dbOverride: db,
+      });
+    await send();
+    // Simulate a crash after the event insert but before the projection ran
+    await db.query("DELETE FROM message_recipients");
+    await db.query("DELETE FROM messages WHERE operation_id = 'op-crash-msg'");
+
+    const replay = await send();
+    expect(replay.messageId).toBeGreaterThan(0);
+    const rows = await db.query<{ n: number }>(
+      "SELECT COUNT(id) AS n FROM messages WHERE operation_id = 'op-crash-msg'",
+    );
+    expect(rows.rows[0]?.n).toBe(1);
+    const recipients = await db.query<{ agent_name: string }>(
+      "SELECT agent_name FROM message_recipients WHERE message_id = ?",
+      [replay.messageId],
+    );
+    expect(recipients.rows.map((r) => r.agent_name)).toEqual(["worker-1"]);
+    const events = await db.query<{ n: number }>(
+      "SELECT COUNT(id) AS n FROM events WHERE type = 'message_sent'",
+    );
+    expect(events.rows[0]?.n).toBe(1);
+
+    // Message present but recipients lost: replay restores recipients only
+    await db.query("DELETE FROM message_recipients");
+    const again = await send();
+    expect(again.messageId).toBe(replay.messageId);
+    expect(again.duplicate).toBe(true);
+    const restored = await db.query<{ n: number }>("SELECT COUNT(*) AS n FROM message_recipients");
+    expect(restored.rows[0]?.n).toBe(1);
   });
 });

@@ -29,6 +29,7 @@ import {
 	hive_create,
 	setHiveWorkingDirectory,
 } from "./hive";
+import { swarm_complete } from "./swarm-orchestrate";
 import { getReviewStatus, swarm_reset, swarm_review, swarm_review_feedback } from "./swarm-review";
 
 const mockContext = {
@@ -377,6 +378,48 @@ describe("swarm_review_feedback operation-keyed path", () => {
 		expect(await count("SELECT COUNT(id) AS n FROM events WHERE type = 'review_completed'")).toBe(1);
 		expect(await count("SELECT COUNT(*) AS n FROM decision_traces")).toBe(1);
 		expect(await count("SELECT COUNT(*) AS n FROM review_feedback_operations")).toBe(1);
+	});
+
+	test("keyedApprovalPassesSwarmCompleteReviewGate", async () => {
+		const complete = (beadId: string) =>
+			swarm_complete.execute(
+				{
+					project_key: PROJECT,
+					agent_name: "KeyedWorker",
+					bead_id: beadId,
+					summary: "done",
+					start_time: Date.now(),
+					skip_verification: true,
+				},
+				mockContext,
+			);
+		const control = JSON.parse(await complete("gate-epic.2"));
+		expect(control.status).toBe("pending_review");
+
+		await feedback("op-gate", "approved", "gate-epic.1");
+		const gated = JSON.parse(await complete("gate-epic.1"));
+		expect(gated.status).not.toBe("pending_review");
+		expect(gated.status).not.toBe("needs_changes");
+		expect(JSON.stringify(gated)).not.toContain("awaiting coordinator review");
+	});
+
+	test("keyedNeedsChangesAfterApprovalReclosesGate", async () => {
+		await feedback("op-gate-a", "approved", "gate2-epic.1");
+		await feedback("op-gate-b", "needs_changes", "gate2-epic.1");
+		const gated = JSON.parse(
+			await swarm_complete.execute(
+				{
+					project_key: PROJECT,
+					agent_name: "KeyedWorker",
+					bead_id: "gate2-epic.1",
+					summary: "done",
+					start_time: Date.now(),
+					skip_verification: true,
+				},
+				mockContext,
+			),
+		);
+		expect(gated.status).toBe("pending_review");
 	});
 
 	test("operationIdReusedWithDifferentRequestIsRejected", async () => {
