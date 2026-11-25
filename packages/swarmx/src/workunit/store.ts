@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import type { DatabaseAdapter } from "swarm-mail";
 import {
+  type CloseIntent,
+  type Mission,
   LEGAL_WORK_UNIT_TRANSITIONS,
   type TransitionFence,
   type WorkUnit,
@@ -393,4 +395,117 @@ export async function recordLegacyAssignment(
      VALUES (?, ?, ?, ?, ?) ON CONFLICT (project, cell_id) DO NOTHING`,
     [input.project, input.cellId, input.owner ?? null, rawJson, Date.now()],
   );
+}
+
+export class MissionFenceConflictError extends Error {
+  constructor(missionId: string, expectedFence: number) {
+    super(`Mission ${missionId} fence/owner/state conflict at fence ${expectedFence}`);
+    this.name = "MissionFenceConflictError";
+  }
+}
+
+export class MissionNotDrainedError extends Error {
+  constructor(missionId: string) {
+    super(`Mission ${missionId} still has live WorkUnits`);
+    this.name = "MissionNotDrainedError";
+  }
+}
+
+export interface MissionCloseFence {
+  missionId: string;
+  expectedFence: number;
+  ownerSessionId: string;
+}
+
+export const LIVE_WORK_UNIT_STATES_SQL =
+  "('RESERVED', 'BOUND', 'SUBMITTED', 'IN_REVIEW', 'APPROVED', 'PUBLISHING', 'RETURNING')";
+
+export async function getMission(db: DatabaseAdapter, missionId: string): Promise<Mission | null> {
+  const result = await db.query("SELECT * FROM swarmx_missions WHERE id = ?", [missionId]);
+  const row: unknown = result.rows[0];
+  return isRecord(row) ? (row as unknown as Mission) : null;
+}
+
+async function countLiveUnits(db: DatabaseAdapter, missionId: string): Promise<number> {
+  const result = await db.query(
+    `SELECT COUNT(id) AS n FROM swarmx_work_units WHERE mission_pk = ? AND state IN ${LIVE_WORK_UNIT_STATES_SQL}`,
+    [missionId],
+  );
+  const row: unknown = result.rows[0];
+  return isRecord(row) ? Number(row.n ?? 0) : 0;
+}
+
+/** Fenced OPEN -> CLOSING. Replaying with the pre-close fence and same intent returns the CLOSING row. */
+export async function beginMissionClose(
+  db: DatabaseAdapter,
+  input: MissionCloseFence & { intent: CloseIntent },
+): Promise<Mission> {
+  const result = await db.query(
+    `UPDATE swarmx_missions SET state = 'CLOSING', close_intent = ?, fence = fence + 1, updated_at = ?
+     WHERE id = ? AND session_id = ? AND fence = ? AND state = 'OPEN' RETURNING *`,
+    [input.intent, Date.now(), input.missionId, input.ownerSessionId, input.expectedFence],
+  );
+  const row: unknown = result.rows[0];
+  if (isRecord(row)) return row as unknown as Mission;
+  const current = await getMission(db, input.missionId);
+  if (current !== null && current.session_id === input.ownerSessionId && current.state === "CLOSING"
+    && current.close_intent === input.intent && Number(current.fence) === input.expectedFence + 1) {
+    return current;
+  }
+  throw new MissionFenceConflictError(input.missionId, input.expectedFence);
+}
+
+/** Idempotent cancel/abandon cascade; PUBLISHING/RETURNING and APPROVED-with-effects are left to drain. */
+export async function cascadeMissionClose(
+  db: DatabaseAdapter,
+  input: MissionCloseFence & { intent: "cancel" | "abandon" },
+): Promise<{ unitIds: string[] }> {
+  const nextState = input.intent === "cancel" ? "CANCELLED" : "ABANDONED";
+  const result = await db.query(
+    `UPDATE swarmx_work_units SET state = ?, fence = fence + 1, reason = COALESCE(reason, ?), updated_at = ?
+     WHERE mission_pk = ?
+       AND (state IN ('RESERVED', 'BOUND', 'SUBMITTED', 'IN_REVIEW')
+         OR (state = 'APPROVED' AND NOT EXISTS (
+           SELECT 1 FROM swarmx_effects e WHERE e.unit_id = swarmx_work_units.id)))
+       AND EXISTS (
+         SELECT 1 FROM swarmx_missions m WHERE m.id = swarmx_work_units.mission_pk
+           AND m.session_id = ? AND m.fence = ? AND m.state = 'CLOSING' AND m.close_intent = ?)
+     RETURNING id`,
+    [nextState, `mission_${input.intent}`, Date.now(), input.missionId, input.ownerSessionId, input.expectedFence, input.intent],
+  );
+  const unitIds = result.rows.flatMap((row) => (isRecord(row) && typeof row.id === "string" ? [row.id] : []));
+  if (unitIds.length > 0) return { unitIds };
+  const mission = await getMission(db, input.missionId);
+  if (mission === null || mission.session_id !== input.ownerSessionId || mission.state !== "CLOSING"
+    || mission.close_intent !== input.intent || Number(mission.fence) !== input.expectedFence) {
+    throw new MissionFenceConflictError(input.missionId, input.expectedFence);
+  }
+  return { unitIds };
+}
+
+/** Barrier: CLOSING -> terminal only when no live unit remains, in one conditional statement. */
+export async function finishMissionClose(db: DatabaseAdapter, input: MissionCloseFence): Promise<Mission> {
+  const result = await db.query(
+    `UPDATE swarmx_missions
+     SET state = CASE close_intent WHEN 'cancel' THEN 'CANCELLED' WHEN 'abandon' THEN 'ABANDONED' ELSE 'FINISHED' END,
+         fence = fence + 1, updated_at = ?
+     WHERE id = ? AND session_id = ? AND fence = ? AND state = 'CLOSING'
+       AND NOT EXISTS (SELECT 1 FROM swarmx_work_units u
+         WHERE u.mission_pk = swarmx_missions.id AND u.state IN ${LIVE_WORK_UNIT_STATES_SQL})
+     RETURNING *`,
+    [Date.now(), input.missionId, input.ownerSessionId, input.expectedFence],
+  );
+  const row: unknown = result.rows[0];
+  if (isRecord(row)) return row as unknown as Mission;
+  const mission = await getMission(db, input.missionId);
+  if (mission !== null && mission.session_id === input.ownerSessionId) {
+    const fence = Number(mission.fence);
+    if (["FINISHED", "CANCELLED", "ABANDONED"].includes(mission.state) && fence === input.expectedFence + 1) {
+      return mission;
+    }
+    if (mission.state === "CLOSING" && fence === input.expectedFence && (await countLiveUnits(db, input.missionId)) > 0) {
+      throw new MissionNotDrainedError(input.missionId);
+    }
+  }
+  throw new MissionFenceConflictError(input.missionId, input.expectedFence);
 }

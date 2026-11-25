@@ -1,7 +1,60 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseAdapter } from "swarm-mail";
 import type { EffectState, Mission, WorkUnit, WorkUnitEffect } from "./schema.js";
-import { getWorkUnit } from "./store.js";
+import {
+  finishMissionClose,
+  getWorkUnit,
+  LIVE_WORK_UNIT_STATES_SQL,
+  MissionFenceConflictError,
+  type MissionCloseFence,
+} from "./store.js";
+
+export class ForcedCloseNotAllowedError extends Error {
+  constructor(missionId: string) {
+    super(`Mission ${missionId} has live WorkUnits without failed_mandatory evidence`);
+    this.name = "ForcedCloseNotAllowedError";
+  }
+}
+
+/** Guard shared by every forced-close statement: mission fenced/owned/CLOSING and every live unit is evidenced. */
+const FORCE_GUARD_SQL = `EXISTS (SELECT 1 FROM swarmx_missions m WHERE m.id = ? AND m.session_id = ? AND m.fence = ? AND m.state = 'CLOSING')
+  AND NOT EXISTS (SELECT 1 FROM swarmx_work_units lu WHERE lu.mission_pk = ? AND lu.state IN ${LIVE_WORK_UNIT_STATES_SQL}
+    AND NOT (lu.state IN ('PUBLISHING', 'RETURNING') AND EXISTS (
+      SELECT 1 FROM swarmx_effects fe WHERE fe.unit_id = lu.id AND fe.state = 'failed_mandatory')))`;
+
+/**
+ * Coordinator forced close: (1) orphan unfinished effects and clear claim tokens, (2) fail evidenced units,
+ * (3) run the barrier. Each statement is fenced and idempotent, so a crash between steps is recoverable by retrying.
+ */
+export async function forceMissionClose(db: DatabaseAdapter, input: MissionCloseFence): Promise<Mission> {
+  const guard = [input.missionId, input.ownerSessionId, input.expectedFence, input.missionId];
+  const mission = await getMission(db, input.missionId);
+  if (mission === null || mission.session_id !== input.ownerSessionId) {
+    throw new MissionFenceConflictError(input.missionId, input.expectedFence);
+  }
+  if (mission.state === "CLOSING" && Number(mission.fence) === input.expectedFence) {
+    const evidence = await db.query(`SELECT 1 AS ok WHERE ${FORCE_GUARD_SQL}`, guard);
+    if (evidence.rows.length === 0) throw new ForcedCloseNotAllowedError(input.missionId);
+    const now = Date.now();
+    await db.query(
+      `UPDATE swarmx_effects
+       SET state = 'orphaned', claim_token = NULL, host_instance_id = NULL, claimed_hostname = NULL,
+           claimed_by_pid = NULL, claimed_at = NULL, updated_at = ?
+       WHERE state IN ('pending', 'in_flight', 'unknown')
+         AND unit_id IN (SELECT id FROM swarmx_work_units WHERE mission_pk = ? AND state IN ('PUBLISHING', 'RETURNING'))
+         AND ${FORCE_GUARD_SQL}`,
+      [now, input.missionId, ...guard],
+    );
+    await db.query(
+      `UPDATE swarmx_work_units
+       SET state = 'FAILED', fence = fence + 1, reason = COALESCE(reason, 'mission_forced_close'),
+           error_json = COALESCE(error_json, '{"cause":"failed_mandatory_effect"}'), updated_at = ?
+       WHERE mission_pk = ? AND state IN ('PUBLISHING', 'RETURNING') AND ${FORCE_GUARD_SQL}`,
+      [now, input.missionId, ...guard],
+    );
+  }
+  return finishMissionClose(db, input);
+}
 
 export class EffectNotFoundError extends Error {
   constructor(effectId: string) {

@@ -13,7 +13,8 @@ import {
   type HiveCellSnapshot,
   type WorkUnitEffectPorts,
 } from "../src/workunit/effects.js";
-import { transitionWorkUnit } from "../src/workunit/store.js";
+import { transitionWorkUnit, beginMissionClose, MissionFenceConflictError } from "../src/workunit/store.js";
+import { forceMissionClose, ForcedCloseNotAllowedError } from "../src/workunit/effects.js";
 
 const databases: DatabaseAdapter[] = [];
 
@@ -544,5 +545,65 @@ describe("work unit effect runner", () => {
     expect(states).toEqual({ "e-complete": "succeeded", "e-f0": "failed_optional", "e-start": "failed_optional" });
     const done = await transitionWorkUnit(db, { unitId: "unit-1", expectedState: "PUBLISHING", unitFence: result.unit.fence, nextState: "DONE", patch: { kind: "finalize" } });
     expect(done.state).toBe("DONE");
+  });
+});
+
+describe("forced mission close", () => {
+  const owner = { missionId: "mission-1", ownerSessionId: "session" };
+
+  async function seedForced(): Promise<DatabaseAdapter> {
+    const db = await seedEffect({ effectId: "pub-mandatory", unitId: "pub", unitState: "PUBLISHING", unitFence: 7 });
+    await db.query(
+      "INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, idem_key, attempt_no, state, fence, created_at, updated_at) VALUES ('ret', 'project', 'mission-1', 'call-ret', 'idem-ret', 1, 'RETURNING', 4, 0, 0)",
+    );
+    await db.query(
+      "INSERT INTO swarmx_effects (effect_id, unit_id, kind, mandatory, unit_fence, state, attempt, updated_at) VALUES ('ret-mandatory', 'ret', 'backend_return', 1, 4, 'failed_mandatory', 1, 0)",
+    );
+    await beginMissionClose(db, { ...owner, expectedFence: 1, intent: "finish" });
+    return db;
+  }
+
+  async function states(db: DatabaseAdapter, table: "units" | "effects"): Promise<Record<string, unknown>> {
+    const sql = table === "units"
+      ? "SELECT id AS k, state FROM swarmx_work_units ORDER BY id"
+      : "SELECT effect_id AS k, state FROM swarmx_effects ORDER BY effect_id";
+    const result = await db.query(sql);
+    return Object.fromEntries(result.rows.map((row) => [(row as Record<string, unknown>).k, (row as Record<string, unknown>).state]));
+  }
+
+  test("forcedCloseRequiresFailedMandatoryEvidence for every live unit", async () => {
+    const db = await seedForced();
+    await expect(forceMissionClose(db, { ...owner, expectedFence: 2 })).rejects.toBeInstanceOf(ForcedCloseNotAllowedError);
+    expect(await states(db, "units")).toEqual({ pub: "PUBLISHING", ret: "RETURNING" });
+    expect(await states(db, "effects")).toEqual({ "pub-mandatory": "pending", "ret-mandatory": "failed_mandatory" });
+    await db.query("UPDATE swarmx_work_units SET state = 'BOUND' WHERE id = 'pub'");
+    await db.query("UPDATE swarmx_effects SET state = 'failed_mandatory' WHERE effect_id = 'pub-mandatory'");
+    await expect(forceMissionClose(db, { ...owner, expectedFence: 2 })).rejects.toBeInstanceOf(ForcedCloseNotAllowedError);
+    await expect(forceMissionClose(db, { ...owner, ownerSessionId: "intruder", expectedFence: 2 })).rejects.toBeInstanceOf(MissionFenceConflictError);
+  });
+
+  test("forcedCloseInvalidatesLateEffectResults", async () => {
+    const db = await seedForced();
+    await db.query(
+      "INSERT INTO swarmx_effects (effect_id, unit_id, kind, mandatory, unit_fence, state, attempt, updated_at) VALUES ('pub-failed', 'pub', 'hive_close', 1, 7, 'failed_mandatory', 1, 0)",
+    );
+    const claim = await claimEffect(db, {
+      effectId: "pub-mandatory", unitId: "pub", expectedUnitState: "PUBLISHING", unitFence: 7,
+      hostInstanceId: "host", hostname: "h", pid: 1,
+    });
+    expect(claim).not.toBeNull();
+    await forceMissionClose(db, { ...owner, expectedFence: 2 });
+    await expect(recordEffectResult(db, { effectId: "pub-mandatory", claimToken: claim!.claimToken, state: "succeeded" }))
+      .rejects.toBeInstanceOf(EffectClaimConflictError);
+    expect(await readEffect(db, "pub-mandatory")).toMatchObject({ state: "orphaned", claim_token: null });
+  });
+
+  test("mandatoryFailureAllowsCoordinatorForcedClose idempotently and leaves no live units", async () => {
+    const db = await seedForced();
+    await db.query("UPDATE swarmx_effects SET state = 'failed_mandatory' WHERE effect_id = 'pub-mandatory'");
+    const closed = await forceMissionClose(db, { ...owner, expectedFence: 2 });
+    expect(closed).toMatchObject({ state: "FINISHED", fence: 3 });
+    expect(await states(db, "units")).toEqual({ pub: "FAILED", ret: "FAILED" });
+    expect(await forceMissionClose(db, { ...owner, expectedFence: 2 })).toMatchObject({ state: "FINISHED", fence: 3 });
   });
 });

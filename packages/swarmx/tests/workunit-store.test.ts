@@ -20,6 +20,11 @@ import {
   retryWorkUnit,
   RetryNotAllowedError,
   transitionWorkUnit,
+  beginMissionClose,
+  cascadeMissionClose,
+  finishMissionClose,
+  MissionFenceConflictError,
+  MissionNotDrainedError,
 } from "../src/workunit/store.js";
 import { LEGAL_WORK_UNIT_TRANSITIONS, type WorkUnitState } from "../src/workunit/schema.js";
 
@@ -565,6 +570,133 @@ describe("WorkUnit reservation, retry, and legacy assignment", () => {
       await seedMission(db);
       const live = await reserveWorkUnit(db, reservation("p", { cellId: "legacy-cell" }));
       expect(live.state).toBe("RESERVED");
+    });
+  });
+});
+
+const LIVE_STATES = ["RESERVED", "BOUND", "SUBMITTED", "IN_REVIEW", "APPROVED", "PUBLISHING", "RETURNING"];
+
+async function seedCloseUnit(db: DatabaseAdapter, missionPk: string, id: string, state: WorkUnitState): Promise<void> {
+  await db.query(
+    "INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, idem_key, attempt_no, state, fence, created_at, updated_at) VALUES (?, 'p', ?, ?, ?, 1, ?, 3, 0, 0)",
+    [id, missionPk, `call-${id}`, `idem-${id}`, state],
+  );
+}
+
+async function unitStates(db: DatabaseAdapter): Promise<Record<string, unknown>> {
+  const result = await db.query("SELECT id, state FROM swarmx_work_units ORDER BY id");
+  return Object.fromEntries(result.rows.map((row) => [rowValue(row, "id"), rowValue(row, "state")]));
+}
+
+async function terminalMissionsWithLiveUnits(db: DatabaseAdapter): Promise<number> {
+  const result = await db.query(
+    `SELECT COUNT(u.id) AS n FROM swarmx_missions m JOIN swarmx_work_units u ON u.mission_pk = m.id
+     WHERE m.state IN ('FINISHED', 'CANCELLED', 'ABANDONED') AND u.state IN (${LIVE_STATES.map(() => "?").join(", ")})`,
+    LIVE_STATES,
+  );
+  return Number(rowValue(result.rows[0], "n"));
+}
+
+describe("mission close barrier", () => {
+  const owner = { missionId: "mission-pk-mission", ownerSessionId: "session" };
+
+  test("closeBlocksNewReservations immediately after OPEN -> CLOSING", async () => {
+    await withWorkUnitDb(async (db) => {
+      await seedMission(db);
+      const closing = await beginMissionClose(db, { ...owner, expectedFence: 1, intent: "finish" });
+      expect(closing).toMatchObject({ state: "CLOSING", close_intent: "finish", fence: 2 });
+      await expect(reserveWorkUnit(db, reservation())).rejects.toBeInstanceOf(MissionClosedError);
+      expect(await unitStates(db)).toEqual({});
+    });
+  });
+
+  test("stale fence or non-owner cannot begin, cascade, or finish close", async () => {
+    await withWorkUnitDb(async (db) => {
+      const pk = await seedMission(db);
+      await seedCloseUnit(db, pk, "u1", "BOUND");
+      await expect(beginMissionClose(db, { ...owner, ownerSessionId: "intruder", expectedFence: 1, intent: "cancel" }))
+        .rejects.toBeInstanceOf(MissionFenceConflictError);
+      await expect(beginMissionClose(db, { ...owner, expectedFence: 0, intent: "cancel" }))
+        .rejects.toBeInstanceOf(MissionFenceConflictError);
+      await beginMissionClose(db, { ...owner, expectedFence: 1, intent: "cancel" });
+      await expect(cascadeMissionClose(db, { ...owner, expectedFence: 1, intent: "cancel" }))
+        .rejects.toBeInstanceOf(MissionFenceConflictError);
+      await expect(cascadeMissionClose(db, { ...owner, ownerSessionId: "intruder", expectedFence: 2, intent: "cancel" }))
+        .rejects.toBeInstanceOf(MissionFenceConflictError);
+      await expect(cascadeMissionClose(db, { ...owner, expectedFence: 2, intent: "abandon" }))
+        .rejects.toBeInstanceOf(MissionFenceConflictError);
+      await expect(finishMissionClose(db, { ...owner, ownerSessionId: "intruder", expectedFence: 2 }))
+        .rejects.toBeInstanceOf(MissionFenceConflictError);
+      expect(await unitStates(db)).toEqual({ u1: "BOUND" });
+    });
+  });
+
+  test("closeWaitsForLiveUnits and finishes only after they settle", async () => {
+    await withWorkUnitDb(async (db) => {
+      const pk = await seedMission(db);
+      await seedCloseUnit(db, pk, "u1", "BOUND");
+      await beginMissionClose(db, { ...owner, expectedFence: 1, intent: "finish" });
+      await expect(finishMissionClose(db, { ...owner, expectedFence: 2 })).rejects.toBeInstanceOf(MissionNotDrainedError);
+      expect(await terminalMissionsWithLiveUnits(db)).toBe(0);
+      await db.query("UPDATE swarmx_work_units SET state = 'DONE' WHERE id = 'u1'");
+      const done = await finishMissionClose(db, { ...owner, expectedFence: 2 });
+      expect(done).toMatchObject({ state: "FINISHED", fence: 3 });
+      expect(await finishMissionClose(db, { ...owner, expectedFence: 2 })).toMatchObject({ state: "FINISHED", fence: 3 });
+    });
+  });
+
+  test("closeThenCascadeCrashIsRecoverable and cascade is idempotent", async () => {
+    await withWorkUnitDb(async (db) => {
+      const pk = await seedMission(db);
+      for (const state of ["RESERVED", "BOUND", "SUBMITTED", "IN_REVIEW"] as const) {
+        await seedCloseUnit(db, pk, state.toLowerCase(), state);
+      }
+      await seedCloseUnit(db, pk, "done", "DONE");
+      await beginMissionClose(db, { ...owner, expectedFence: 1, intent: "abandon" });
+      // crash between begin and cascade: retrying begin with the old fence is a no-op replay
+      expect(await beginMissionClose(db, { ...owner, expectedFence: 1, intent: "abandon" }))
+        .toMatchObject({ state: "CLOSING", close_intent: "abandon", fence: 2 });
+      await expect(beginMissionClose(db, { ...owner, expectedFence: 1, intent: "finish" }))
+        .rejects.toBeInstanceOf(MissionFenceConflictError);
+      const first = await cascadeMissionClose(db, { ...owner, expectedFence: 2, intent: "abandon" });
+      expect(first.unitIds.sort()).toEqual(["bound", "in_review", "reserved", "submitted"]);
+      expect(await cascadeMissionClose(db, { ...owner, expectedFence: 2, intent: "abandon" })).toEqual({ unitIds: [] });
+      expect(await unitStates(db)).toEqual({
+        bound: "ABANDONED", done: "DONE", in_review: "ABANDONED", reserved: "ABANDONED", submitted: "ABANDONED",
+      });
+      expect(await finishMissionClose(db, { ...owner, expectedFence: 2 })).toMatchObject({ state: "ABANDONED" });
+      expect(await terminalMissionsWithLiveUnits(db)).toBe(0);
+    });
+  });
+
+  test("cancelCancelsApprovedWithoutEffects but keeps approved units with issued effects", async () => {
+    await withWorkUnitDb(async (db) => {
+      const pk = await seedMission(db);
+      await seedCloseUnit(db, pk, "bare", "APPROVED");
+      await seedCloseUnit(db, pk, "issued", "APPROVED");
+      await db.query(
+        "INSERT INTO swarmx_effects (effect_id, unit_id, kind, mandatory, unit_fence, state, attempt, updated_at) VALUES ('e1', 'issued', 'backend_complete', 1, 3, 'pending', 0, 0)",
+      );
+      await beginMissionClose(db, { ...owner, expectedFence: 1, intent: "cancel" });
+      expect(await cascadeMissionClose(db, { ...owner, expectedFence: 2, intent: "cancel" })).toEqual({ unitIds: ["bare"] });
+      expect(await unitStates(db)).toEqual({ bare: "CANCELLED", issued: "APPROVED" });
+      await expect(finishMissionClose(db, { ...owner, expectedFence: 2 })).rejects.toBeInstanceOf(MissionNotDrainedError);
+    });
+  });
+
+  test("cancelDrainsPublishingAndReturning instead of cancelling them", async () => {
+    await withWorkUnitDb(async (db) => {
+      const pk = await seedMission(db);
+      await seedCloseUnit(db, pk, "pub", "PUBLISHING");
+      await seedCloseUnit(db, pk, "ret", "RETURNING");
+      await beginMissionClose(db, { ...owner, expectedFence: 1, intent: "cancel" });
+      expect(await cascadeMissionClose(db, { ...owner, expectedFence: 2, intent: "cancel" })).toEqual({ unitIds: [] });
+      expect(await unitStates(db)).toEqual({ pub: "PUBLISHING", ret: "RETURNING" });
+      await expect(finishMissionClose(db, { ...owner, expectedFence: 2 })).rejects.toBeInstanceOf(MissionNotDrainedError);
+      await transitionWorkUnit(db, { unitId: "pub", expectedState: "PUBLISHING", unitFence: 3, nextState: "DONE", patch: { kind: "finalize" } });
+      await transitionWorkUnit(db, { unitId: "ret", expectedState: "RETURNING", unitFence: 3, nextState: "CHANGES_REQUESTED", patch: { kind: "finalize_return" } });
+      expect(await finishMissionClose(db, { ...owner, expectedFence: 2 })).toMatchObject({ state: "CANCELLED" });
+      expect(await terminalMissionsWithLiveUnits(db)).toBe(0);
     });
   });
 });
