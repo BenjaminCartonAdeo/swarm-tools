@@ -14,7 +14,11 @@ import {
   type HiveCellSnapshot,
   type WorkUnitEffectPorts,
 } from "../src/workunit/effects.js";
-import { transitionWorkUnit, beginMissionClose, MissionFenceConflictError } from "../src/workunit/store.js";
+import { transitionWorkUnit, beginMissionClose, MissionFenceConflictError, finalizePublish, finalizeReturn, EffectsNotSettledError } from "../src/workunit/store.js";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { applyExternal, CRASH_EXIT_CODE, readLedger, type CrashBoundary } from "./fixtures/workunit-effect-crash-child.js";
 import { forceMissionClose, ForcedCloseNotAllowedError } from "../src/workunit/effects.js";
 
 const databases: DatabaseAdapter[] = [];
@@ -684,4 +688,120 @@ describe("explicit effect claim recovery", () => {
     const mine = await recoverStaleEffects(db, { hostInstanceId: "host-1", hostname: "worker-a", isProcessAlive: () => false, project: "project" });
     expect(mine).toEqual({ recovered: 1, foreignHostCandidates: [], recoveredEffects: ["effect-1"] });
   });
+});
+
+describe("effect crash recovery at every boundary", () => {
+  const CRASH_HOST = { hostInstanceId: "crash-host", hostname: "crash-box" };
+  const boundaries: CrashBoundary[] = ["before_claim", "after_claim", "after_side_effect", "before_result_write", "after_result_write"];
+  const kinds = [
+    { kind: "backend_complete", unitState: "PUBLISHING", tool: "swarm_complete", request: COMPLETE_ARGS, operationId: "eff-crash", finalState: "DONE" },
+    { kind: "backend_feedback", unitState: "RETURNING", tool: "swarm_review_feedback", request: { project_key: "proj", task_id: "cell-1", status: "needs_changes", issues: "[]" }, operationId: "op-feedback-crash", finalState: "CHANGES_REQUESTED" },
+  ] as const;
+  const crashChild = join(import.meta.dir, "fixtures", "workunit-effect-crash-child.ts");
+
+  for (const spec of kinds) {
+    for (const boundary of boundaries) {
+      test(`crash restart boundary ${spec.kind} ${boundary}`, async () => {
+        await mkdir("/tmp/opencode", { recursive: true });
+        const tempDir = await mkdtemp(join("/tmp/opencode", "swarmx-effect-crash-"));
+        const dbPath = join(tempDir, "swarm.db");
+        const ledgerPath = join(tempDir, "ledger.jsonl");
+        const tokenPath = join(tempDir, "token");
+        let child: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined;
+        let db: DatabaseAdapter | undefined;
+        try {
+          const seedDb = await createLibSQLAdapter({ url: `file:${dbPath}` });
+          try {
+            await ensureWorkUnitSchema(seedDb);
+            await seedDb.query("INSERT INTO swarmx_missions (id, project, session_id, mission_id, epic_id, state, fence, created_at, updated_at) VALUES ('mission-1', 'proj', 'session', 'mission', 'epic-9', 'OPEN', 1, 0, 0)");
+            await seedDb.query(
+              "INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, cell_id, idem_key, attempt_no, state, fence, verification_receipt_json, created_at, updated_at) VALUES ('unit-1', 'proj', 'mission-1', 'call-1', 'cell-1', 'idem-1', 1, ?, 4, ?, 0, 0)",
+              [spec.unitState, RECEIPT_JSON],
+            );
+            await seedDb.query(
+              "INSERT INTO swarmx_effects (effect_id, unit_id, kind, mandatory, operation_id, unit_fence, state, attempt, request_json, updated_at) VALUES ('eff-crash', 'unit-1', ?, 1, ?, 4, 'pending', 0, ?, 0)",
+              [spec.kind, spec.operationId, JSON.stringify(spec.request)],
+            );
+          } finally {
+            await seedDb.close?.();
+          }
+
+          child = Bun.spawn([process.execPath, crashChild], {
+            env: {
+              ...process.env,
+              SWARM_DB_PATH: dbPath,
+              SWARMX_CRASH_AT: boundary,
+              SWARMX_EFFECT_ID: "eff-crash",
+              SWARMX_LEDGER_PATH: ledgerPath,
+              SWARMX_TOKEN_PATH: tokenPath,
+              SWARMX_HOST_INSTANCE_ID: CRASH_HOST.hostInstanceId,
+              SWARMX_HOSTNAME: CRASH_HOST.hostname,
+            },
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "pipe",
+          });
+          const childPid = child.pid;
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const exitCode = await Promise.race([
+            child.exited,
+            new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`crash child ${boundary} did not exit in 15s`)), 15_000); }),
+          ]).finally(() => clearTimeout(timer));
+          const stderr = await new Response(child.stderr).text();
+          expect({ boundary, exitCode, stderr: stderr.trim() }).toEqual({ boundary, exitCode: CRASH_EXIT_CODE, stderr: "" });
+
+          db = await createLibSQLAdapter({ url: `file:${dbPath}` });
+          const afterCrash = await readEffect(db, "eff-crash");
+          const expectedCrashState = boundary === "before_claim" ? "pending" : boundary === "after_result_write" ? "succeeded" : "in_flight";
+          expect({ boundary, state: afterCrash.state }).toEqual({ boundary, state: expectedCrashState });
+          const sideEffectHappened = boundary === "after_side_effect" || boundary === "before_result_write" || boundary === "after_result_write";
+          expect(readLedger(ledgerPath)).toHaveLength(sideEffectHappened ? 1 : 0);
+
+          // DONE / CHANGES_REQUESTED stays blocked until the mandatory effect resolves.
+          const finalize = spec.kind === "backend_complete" ? finalizePublish : finalizeReturn;
+          if (boundary !== "after_result_write") {
+            await expect(finalize(db, { unitId: "unit-1", unitFence: 4 })).rejects.toBeInstanceOf(EffectsNotSettledError);
+          }
+
+          const recovery = await recoverStaleEffects(db, { ...CRASH_HOST, isProcessAlive: (pid) => pid !== childPid });
+          const claimedAtCrash = boundary === "after_claim" || boundary === "after_side_effect" || boundary === "before_result_write";
+          expect(recovery.recoveredEffects).toEqual(claimedAtCrash ? ["eff-crash"] : []);
+          expect((await readEffect(db, "eff-crash")).state).toBe(claimedAtCrash ? "unknown" : expectedCrashState);
+
+          if (boundary !== "before_claim") {
+            const staleToken = readFileSync(tokenPath, "utf8");
+            await expect(recordEffectResult(db, { effectId: "eff-crash", claimToken: staleToken, state: "succeeded", result: {} }))
+              .rejects.toBeInstanceOf(EffectClaimConflictError);
+          }
+
+          const ledgerHasOp = () => readLedger(ledgerPath).some((entry) => entry.operation_id === spec.operationId && entry.applied);
+          const ports = fakePorts({ tool: async (name, args) => applyExternal(ledgerPath, name, args) });
+          ports.readHiveCell = async (projectKey, cellId) => {
+            ports.order.push(`read:${projectKey}:${cellId}`);
+            return ledgerHasOp() ? { status: "closed", completionOperationId: spec.operationId } : { status: "open" };
+          };
+          const drained = await drainWorkUnitEffects(db, { unitId: "unit-1", host: { ...CRASH_HOST, pid: process.pid }, ports });
+          expect(drained.effects.find((effect) => effect.effect_id === "eff-crash")?.state).toBe("succeeded");
+
+          const toolCalls = ports.calls.filter((call) => call.name === spec.tool);
+          const expectReplay = boundary !== "after_result_write" && !(spec.kind === "backend_complete" && sideEffectHappened);
+          expect(toolCalls).toEqual(expectReplay ? [{ name: spec.tool, args: { ...spec.request, operation_id: spec.operationId } }] : []);
+
+          const ledger = readLedger(ledgerPath);
+          expect(ledger.every((entry) => entry.operation_id === spec.operationId)).toBe(true);
+          expect(ledger.filter((entry) => entry.applied)).toHaveLength(1);
+
+          const final = await finalize(db, { unitId: "unit-1", unitFence: 4 });
+          expect({ boundary, state: final.state, fence: final.fence }).toEqual({ boundary, state: spec.finalState, fence: 5 });
+        } finally {
+          if (child !== undefined && child.exitCode === null) {
+            try { child.kill(); } catch { /* already exited */ }
+          }
+          await child?.exited;
+          await db?.close?.();
+          await rm(tempDir, { recursive: true, force: true });
+        }
+      }, 30_000);
+    }
+  }
 });
