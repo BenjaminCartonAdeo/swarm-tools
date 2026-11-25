@@ -72,6 +72,7 @@ describe("FlushManager", () => {
         project_key TEXT NOT NULL,
         timestamp INTEGER NOT NULL,
         data TEXT NOT NULL DEFAULT '{}',
+        operation_id TEXT,
         created_at TEXT
       )
     `);

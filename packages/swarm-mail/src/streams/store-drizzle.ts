@@ -14,6 +14,7 @@
 
 import { and, eq, gte, gt, inArray, lte, sql } from "drizzle-orm";
 import type { SwarmDb } from "../db/client.js";
+import { isOperationIdUniqueViolation } from "../operation-id-conflict.js";
 import type {
   AgentEvent,
   AgentRegisteredEvent,
@@ -46,18 +47,53 @@ export async function appendEventDrizzle(
   event: AgentEvent,
 ): Promise<AgentEvent & { id: number; sequence: number }> {
   const { type, project_key, timestamp, ...rest } = event;
+  const operationId = event.operation_id;
+
+  const loadExisting = async () => {
+    if (!operationId) return null;
+    const found = await db
+      .select()
+      .from(eventsTable)
+      .where(eq(eventsTable.operation_id, operationId))
+      .limit(1);
+    const existing = found[0];
+    if (!existing) return null;
+    return {
+      ...(JSON.parse(existing.data) as Record<string, unknown>),
+      type: existing.type,
+      project_key: existing.project_key,
+      timestamp: Number(existing.timestamp),
+      operation_id: operationId,
+      id: existing.id,
+      sequence: existing.sequence ?? existing.id,
+    } as unknown as AgentEvent & { id: number; sequence: number };
+  };
+
+  // Idempotent replay: return the persisted record, never re-run projections
+  const replayed = await loadExisting();
+  if (replayed) return replayed;
 
   // Insert event
-  const result = await db
-    .insert(eventsTable)
-    .values({
-      type,
-      project_key,
-      timestamp,
-      data: JSON.stringify(rest),
-      // sequence omitted - auto-assigned by database (SERIAL in PGlite, trigger in LibSQL)
-    })
-    .returning({ id: eventsTable.id, sequence: eventsTable.sequence });
+  let result: Array<{ id: number; sequence: number | null }>;
+  try {
+    result = await db
+      .insert(eventsTable)
+      .values({
+        type,
+        project_key,
+        timestamp,
+        data: JSON.stringify(rest),
+        operation_id: operationId ?? null,
+        // sequence omitted - auto-assigned by database (SERIAL in PGlite, trigger in LibSQL)
+      })
+      .returning({ id: eventsTable.id, sequence: eventsTable.sequence });
+  } catch (error) {
+    if (operationId && isOperationIdUniqueViolation(error, "events")) {
+      const raced = await loadExisting();
+      if (raced) return raced;
+    }
+    throw error;
+  }
 
   const row = result[0];
   if (!row || row.sequence === null || row.sequence === undefined) {
@@ -322,6 +358,7 @@ async function handleMessageSentDrizzle(
       importance: event.importance,
       ack_required: event.ack_required,
       created_at: event.timestamp,
+      operation_id: event.operation_id ?? null,
     })
     .returning({ id: messagesTable.id });
 

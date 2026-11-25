@@ -109,6 +109,40 @@ import {
   type MessageSentEvent,
   type FileReservedEvent,
 } from "./events";
+import { isOperationIdUniqueViolation } from "../operation-id-conflict.js";
+
+/**
+ * Load the persisted event recorded under an idempotency key, or null.
+ * Duplicate operation-keyed appends return this record and skip projections.
+ */
+export async function findEventByOperationId(
+  db: DatabaseAdapter,
+  operationId: string,
+): Promise<(Record<string, unknown> & { id: number; sequence: number }) | null> {
+  const found = await db.query<{
+    id: number;
+    type: string;
+    project_key: string;
+    timestamp: number;
+    sequence: number;
+    data: string;
+  }>(
+    `SELECT id, type, project_key, timestamp, sequence, data
+     FROM events WHERE operation_id = $1`,
+    [operationId],
+  );
+  const row = found.rows[0];
+  if (!row) return null;
+  return {
+    ...(JSON.parse(row.data) as Record<string, unknown>),
+    type: row.type,
+    project_key: row.project_key,
+    timestamp: Number(row.timestamp),
+    operation_id: operationId,
+    id: Number(row.id),
+    sequence: Number(row.sequence ?? row.id),
+  };
+}
 
 // ============================================================================
 // Timestamp Parsing
@@ -164,16 +198,31 @@ export async function appendEvent(
 ): Promise<AgentEvent & { id: number; sequence: number }> {
   const db = await getOrCreateAdapter(dbOverride, projectPath);
 
+  const operationId = event.operation_id;
+  if (operationId) {
+    const existing = await findEventByOperationId(db, operationId);
+    if (existing) return existing as AgentEvent & { id: number; sequence: number };
+  }
+
   // Extract common fields
   const { type, project_key, timestamp, ...rest } = event;
 
   // Insert event
-  const result = await db.query<{ id: number; sequence: number }>(
-    `INSERT INTO events (type, project_key, timestamp, data)
-     VALUES ($1, $2, $3, $4)
-     RETURNING id, sequence`,
-    [type, project_key, timestamp, JSON.stringify(rest)],
-  );
+  let result: { rows: Array<{ id: number; sequence: number }> };
+  try {
+    result = await db.query<{ id: number; sequence: number }>(
+      `INSERT INTO events (type, project_key, timestamp, data, operation_id)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, sequence`,
+      [type, project_key, timestamp, JSON.stringify(rest), operationId ?? null],
+    );
+  } catch (error) {
+    if (operationId && isOperationIdUniqueViolation(error, "events")) {
+      const existing = await findEventByOperationId(db, operationId);
+      if (existing) return existing as AgentEvent & { id: number; sequence: number };
+    }
+    throw error;
+  }
 
   const row = result.rows[0];
   if (!row) {
@@ -712,8 +761,8 @@ async function handleMessageSent(
 
   // Insert message
   const result = await db.query<{ id: number }>(
-    `INSERT INTO messages (project_key, from_agent, subject, body, thread_id, importance, ack_required, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `INSERT INTO messages (project_key, from_agent, subject, body, thread_id, importance, ack_required, created_at, operation_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      RETURNING id`,
     [
       event.project_key,
@@ -724,6 +773,7 @@ async function handleMessageSent(
       event.importance,
       event.ack_required,
       event.timestamp,
+      event.operation_id ?? null,
     ],
   );
 

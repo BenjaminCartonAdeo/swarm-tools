@@ -15,11 +15,12 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import {
 	type SwarmMailAdapter,
 	clearAdapterCache,
+	getSwarmMailDatabaseAdapter,
 	getSwarmMailLibSQL,
 } from "swarm-mail";
 import {
@@ -28,7 +29,7 @@ import {
 	hive_create,
 	setHiveWorkingDirectory,
 } from "./hive";
-import { swarm_review, swarm_review_feedback } from "./swarm-review";
+import { getReviewStatus, swarm_reset, swarm_review, swarm_review_feedback } from "./swarm-review";
 
 const mockContext = {
 	sessionID: `test-review-integration-${Date.now()}`,
@@ -283,5 +284,105 @@ describe("swarm_review integration", () => {
 			{ limit: 10 }
 		);
 		expect(messages.length).toBe(0);
+	});
+});
+
+describe("swarm_review_feedback operation-keyed path", () => {
+	let dir: string;
+	let previousDbPath: string | undefined;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "swarm-review-keyed-"));
+		previousDbPath = process.env.SWARM_DB_PATH;
+		process.env.SWARM_DB_PATH = join(dir, "swarm.db");
+		clearAdapterCache();
+	});
+
+	afterEach(() => {
+		clearAdapterCache();
+		if (previousDbPath === undefined) delete process.env.SWARM_DB_PATH;
+		else process.env.SWARM_DB_PATH = previousDbPath;
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	const PROJECT = "/tmp/keyed-review-project";
+	const ISSUES = JSON.stringify([{ file: "a.ts", line: 1, issue: "bug" }]);
+
+	async function count(sql: string, params: unknown[] = []): Promise<number> {
+		const db = await getSwarmMailDatabaseAdapter();
+		const result = await db.query<{ n: number }>(sql, params);
+		return Number(result.rows[0]?.n ?? 0);
+	}
+
+	const feedback = (operationId: string, status: "approved" | "needs_changes", taskId = "keyed-epic.1") =>
+		swarm_review_feedback.execute(
+			{
+				project_key: PROJECT,
+				task_id: taskId,
+				worker_id: "KeyedWorker",
+				status,
+				summary: "keyed",
+				...(status === "needs_changes" ? { issues: ISSUES } : {}),
+				operation_id: operationId,
+			},
+			mockContext,
+		);
+
+	test("replayedFeedbackOperationReturnsSavedResult", async () => {
+		const first = JSON.parse(await feedback("op-approve", "approved"));
+		const replay = JSON.parse(await feedback("op-approve", "approved"));
+		expect(first.success).toBe(true);
+		expect(first.duplicate).toBeUndefined();
+		expect(replay).toEqual({ ...first, duplicate: true });
+
+		expect(await count("SELECT COUNT(id) AS n FROM events WHERE type = 'review_completed' AND operation_id = 'op-approve'")).toBe(1);
+		expect(await count("SELECT COUNT(id) AS n FROM events WHERE type = 'review_completed'")).toBe(1);
+		expect(await count("SELECT COUNT(*) AS n FROM decision_traces WHERE operation_id = 'op-approve'")).toBe(1);
+		expect(await count("SELECT COUNT(*) AS n FROM decision_traces")).toBe(1);
+		expect(await count("SELECT COUNT(id) AS n FROM messages WHERE operation_id = 'op-approve:worker-message'")).toBe(1);
+		expect(await count("SELECT COUNT(id) AS n FROM messages")).toBe(1);
+	});
+
+	test("keyedCallsDoNotMutateProcessLocalMaps", async () => {
+		await feedback("op-map-1", "needs_changes", "map-epic.1");
+		await feedback("op-map-2", "approved", "map-epic.1");
+		const status = getReviewStatus("map-epic.1");
+		expect(status.approved).toBe(false);
+		expect(status.attempt_count).toBe(0);
+	});
+
+	test("attemptNumberSurvivesProcessRestart", async () => {
+		const one = JSON.parse(await feedback("op-restart-1", "needs_changes"));
+		expect(one.attempt).toBe(1);
+		await swarm_reset.execute({}, mockContext);
+		clearAdapterCache();
+		const two = JSON.parse(await feedback("op-restart-2", "needs_changes"));
+		expect(two.attempt).toBe(2);
+		expect(two.remaining_attempts).toBe(1);
+		const replayOne = JSON.parse(await feedback("op-restart-1", "needs_changes"));
+		expect(replayOne.attempt).toBe(1);
+		expect(replayOne.duplicate).toBe(true);
+	});
+
+	test("concurrentSameOperationIdIncrementsAttemptOnce", async () => {
+		const results = (
+			await Promise.all([feedback("op-concurrent", "needs_changes"), feedback("op-concurrent", "needs_changes")])
+		).map((r) => JSON.parse(r));
+		const executed = results.filter((r) => r.success === true && r.duplicate !== true);
+		expect(executed).toHaveLength(1);
+		for (const r of results) expect(r.attempt).toBe(1);
+		const loser = results.find((r) => r !== executed[0]);
+		expect(loser.busy === true || loser.duplicate === true).toBe(true);
+		expect(JSON.stringify(loser)).not.toContain("claim");
+		expect(await count("SELECT COUNT(id) AS n FROM events WHERE type = 'review_completed'")).toBe(1);
+		expect(await count("SELECT COUNT(*) AS n FROM decision_traces")).toBe(1);
+		expect(await count("SELECT COUNT(*) AS n FROM review_feedback_operations")).toBe(1);
+	});
+
+	test("operationIdReusedWithDifferentRequestIsRejected", async () => {
+		await feedback("op-reuse", "approved");
+		const conflict = JSON.parse(await feedback("op-reuse", "needs_changes"));
+		expect(conflict.success).toBe(false);
+		expect(conflict.error).toContain("operation_id");
 	});
 });

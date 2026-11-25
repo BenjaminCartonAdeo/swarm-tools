@@ -30,6 +30,8 @@ export const BaseEventSchema = z.object({
   timestamp: z.number(), // Unix ms
   /** Sequence number for ordering */
   sequence: z.number().optional(),
+  /** Optional idempotency key; a non-null value is unique across events */
+  operation_id: z.string().min(1).optional(),
 });
 
 // ============================================================================

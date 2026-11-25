@@ -422,3 +422,18 @@ export {
 	type LegacyDependency,
 	type MigrationSummary as LegacyHiveMigrationSummary,
 } from "./migrations/legacy-hive-transformer";
+
+// Durable operation-keyed review feedback (idempotent swarm_review_feedback)
+export {
+	claimReviewFeedback,
+	completeReviewFeedback,
+	markReviewFeedbackStarted,
+	recoverReviewFeedbackOperation,
+	recoverStaleReviewFeedback,
+	StaleReviewFeedbackClaimError,
+	type ClaimReviewFeedbackInput,
+	type ClaimReviewFeedbackOutcome,
+	type ReviewFeedbackResult,
+} from "./streams/review-feedback-store";
+export { isOperationIdUniqueViolation } from "./operation-id-conflict";
+export { createDecisionTraceWithReplay } from "./streams/decision-trace-store";

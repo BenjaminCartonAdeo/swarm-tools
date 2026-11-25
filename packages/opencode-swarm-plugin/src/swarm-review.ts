@@ -16,6 +16,8 @@
 
 import { tool } from "@opencode-ai/plugin";
 import { z } from "zod";
+import { createHash, randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import { sendSwarmMessage, type HiveAdapter } from "swarm-mail";
 import { getHiveAdapter } from "./hive";
 import { captureCoordinatorEvent } from "./eval-capture.js";
@@ -494,6 +496,224 @@ export const swarm_review = tool({
   },
 });
 
+/** Stable identity of this host process for durable feedback claims. */
+const HOST_INSTANCE_ID = randomUUID();
+
+interface KeyedFeedbackArgs {
+  project_key: string;
+  task_id: string;
+  worker_id: string;
+  status: "approved" | "needs_changes";
+  summary?: string;
+  operation_id: string;
+}
+
+/**
+ * Operation-keyed swarm_review_feedback.
+ *
+ * The durable claim (global DB) allocates the attempt once per operation_id
+ * before any side effect; replays return the saved result. Side effects use
+ * deterministic idempotency keys: operation_id for the review_completed event
+ * and decision trace, `${operation_id}:worker-message` for the worker mail.
+ * Never reads or writes the process-local reviewAttempts/reviewStatus maps.
+ */
+async function executeKeyedReviewFeedback(
+  args: KeyedFeedbackArgs,
+  parsedIssues: ReviewIssue[],
+  epicId: string,
+  sessionId: string,
+): Promise<string> {
+  const {
+    claimReviewFeedback,
+    markReviewFeedbackStarted,
+    completeReviewFeedback,
+    createEvent,
+    appendEvent,
+  } = await import("swarm-mail");
+  const operationId = args.operation_id;
+  const requestHash = createHash("sha256")
+    .update(
+      JSON.stringify([
+        args.project_key,
+        args.task_id,
+        args.worker_id,
+        args.status,
+        args.summary ?? null,
+        parsedIssues,
+      ]),
+    )
+    .digest("hex");
+
+  let claim: Awaited<ReturnType<typeof claimReviewFeedback>>;
+  try {
+    claim = await claimReviewFeedback({
+      operationId,
+      projectKey: args.project_key,
+      taskId: args.task_id,
+      workerId: args.worker_id,
+      requestHash,
+      status: args.status,
+      hostInstanceId: HOST_INSTANCE_ID,
+      hostname: hostname(),
+      pid: process.pid,
+    });
+  } catch (error) {
+    if ((error as { name?: string }).name === "OperationIdConflictError") {
+      return JSON.stringify(
+        {
+          success: false,
+          operation_id: operationId,
+          error: `operation_id ${operationId} was already used for a different review request`,
+        },
+        null,
+        2,
+      );
+    }
+    throw error;
+  }
+
+  if (claim.kind === "done") {
+    return JSON.stringify({ ...claim.result, duplicate: true }, null, 2);
+  }
+  if (claim.kind === "busy") {
+    return JSON.stringify(
+      {
+        success: false,
+        busy: true,
+        operation_id: operationId,
+        task_id: args.task_id,
+        attempt: claim.attempt,
+        error: "Review feedback for this operation_id is already in progress",
+      },
+      null,
+      2,
+    );
+  }
+
+  const { claimToken, attempt } = claim;
+  await markReviewFeedbackStarted(operationId, claimToken);
+
+  const approved = args.status === "approved";
+  const remaining = approved ? MAX_REVIEW_ATTEMPTS : MAX_REVIEW_ATTEMPTS - attempt;
+
+  try {
+    captureCoordinatorEvent({
+      session_id: sessionId,
+      epic_id: epicId,
+      timestamp: new Date().toISOString(),
+      event_type: "DECISION",
+      decision_type: "review_completed",
+      payload: approved
+        ? { task_id: args.task_id, status: "approved", retry_count: 0 }
+        : {
+            task_id: args.task_id,
+            status: "needs_changes",
+            retry_count: attempt,
+            remaining_attempts: remaining,
+            issues_count: parsedIssues.length,
+          },
+    });
+  } catch (error) {
+    console.warn("[swarm_review_feedback] Failed to capture review_completed:", error);
+  }
+
+  await traceReviewDecision({
+    projectKey: args.project_key,
+    agentName: "coordinator",
+    epicId,
+    beadId: args.task_id,
+    workerId: args.worker_id,
+    status: args.status,
+    summary: args.summary,
+    issues: approved ? undefined : parsedIssues,
+    attemptNumber: attempt,
+    remainingAttempts: remaining,
+    rationale:
+      args.summary ||
+      (approved ? "Review approved" : `Review rejected: ${parsedIssues.length} issue(s) found`),
+    operationId,
+  });
+
+  await appendEvent(
+    createEvent("review_completed", {
+      project_key: args.project_key,
+      epic_id: epicId,
+      bead_id: args.task_id,
+      status: approved ? "approved" : remaining <= 0 ? "blocked" : "needs_changes",
+      attempt,
+      operation_id: operationId,
+    }),
+    args.project_key,
+  );
+
+  let result: Record<string, unknown> & {
+    success: true;
+    status: "approved" | "needs_changes";
+    task_id: string;
+  };
+  if (approved) {
+    await sendSwarmMessage({
+      projectPath: args.project_key,
+      fromAgent: "coordinator",
+      toAgents: [args.worker_id],
+      subject: `APPROVED: ${args.task_id}`,
+      body: `## Review Approved ✓
+
+${args.summary || "Your work has been approved."}
+
+You may now complete the task with \`swarm_complete\`.`,
+      threadId: epicId,
+      importance: "normal",
+      operationId: `${operationId}:worker-message`,
+    });
+    result = {
+      success: true,
+      status: "approved",
+      task_id: args.task_id,
+      attempt,
+      message: "Review approved. Worker can now complete the task.",
+    };
+  } else if (remaining <= 0) {
+    const adapter = await getHiveAdapterSafe(args.project_key);
+    if (adapter) {
+      try {
+        await adapter.changeCellStatus(args.project_key, args.task_id, "blocked");
+      } catch {
+        // Continue even if status update fails
+      }
+    }
+    result = {
+      success: true,
+      status: "needs_changes",
+      task_failed: true,
+      task_id: args.task_id,
+      attempt,
+      remaining_attempts: 0,
+      message: `Task failed after ${MAX_REVIEW_ATTEMPTS} review attempts`,
+    };
+  } else {
+    result = {
+      success: true,
+      status: "needs_changes",
+      task_id: args.task_id,
+      attempt,
+      remaining_attempts: remaining,
+      issues: parsedIssues,
+      message: `Review feedback ready. ${remaining} attempt(s) remaining.`,
+      retry_context: {
+        task_id: args.task_id,
+        attempt,
+        max_attempts: MAX_REVIEW_ATTEMPTS,
+        issues: parsedIssues,
+        next_action: "Use swarm_spawn_retry to spawn new worker with these issues",
+      },
+    };
+  }
+
+  await completeReviewFeedback(operationId, claimToken, result);
+  return JSON.stringify(result, null, 2);
+}
+
 /**
  * Send review feedback to a worker
  *
@@ -551,6 +771,15 @@ export const swarm_review_feedback = tool({
     const epicId = args.task_id.includes(".")
       ? args.task_id.split(".")[0]
       : args.task_id;
+
+    if (args.operation_id) {
+      return executeKeyedReviewFeedback(
+        { ...args, operation_id: args.operation_id },
+        parsedIssues,
+        epicId,
+        _ctx.sessionID || "unknown",
+      );
+    }
 
     if (args.status === "approved") {
       // Mark as approved and clear attempts

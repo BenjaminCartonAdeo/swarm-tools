@@ -463,3 +463,148 @@ describe("libSQL streams schema", () => {
     });
   });
 });
+
+describe("operation_id upgrade of existing streams schema", () => {
+  const LEGACY_DDL = [
+    `CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL,
+      project_key TEXT NOT NULL,
+      timestamp INTEGER NOT NULL,
+      sequence INTEGER GENERATED ALWAYS AS (id) STORED,
+      data TEXT NOT NULL
+    )`,
+    `CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_key TEXT NOT NULL,
+      from_agent TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      body TEXT NOT NULL,
+      thread_id TEXT,
+      importance TEXT DEFAULT 'normal',
+      ack_required INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL
+    )`,
+    `CREATE TABLE decision_traces (
+      id TEXT PRIMARY KEY,
+      decision_type TEXT NOT NULL,
+      epic_id TEXT,
+      bead_id TEXT,
+      agent_name TEXT NOT NULL,
+      project_key TEXT NOT NULL,
+      decision TEXT NOT NULL,
+      rationale TEXT,
+      inputs_gathered TEXT,
+      policy_evaluated TEXT,
+      alternatives TEXT,
+      precedent_cited TEXT,
+      outcome_event_id INTEGER,
+      quality_score REAL,
+      timestamp INTEGER NOT NULL
+    )`,
+  ];
+
+  async function legacyDb(): Promise<DatabaseAdapter> {
+    const legacy = await createLibSQLAdapter({ url: ":memory:" });
+    for (const ddl of LEGACY_DDL) await legacy.exec(ddl);
+    await legacy.query(
+      "INSERT INTO events (type, project_key, timestamp, data) VALUES ('legacy', '/p', 1, '{}')",
+    );
+    await legacy.query(
+      "INSERT INTO messages (project_key, from_agent, subject, body, created_at) VALUES ('/p', 'a', 's', 'b', 1)",
+    );
+    await legacy.query(
+      "INSERT INTO decision_traces (id, decision_type, agent_name, project_key, decision, timestamp) VALUES ('dt-legacy', 't', 'a', '/p', '{}', 1)",
+    );
+    return legacy;
+  }
+
+  async function columns(target: DatabaseAdapter, table: string): Promise<string[]> {
+    const result = await target.query<{ name: string }>(`PRAGMA table_xinfo('${table}')`);
+    return result.rows.map((r) => r.name);
+  }
+
+  test("existingStreamsSchemaGetsOperationIdColumnsIdempotently", async () => {
+    const legacy = await legacyDb();
+    try {
+      await createLibSQLStreamsSchema(legacy);
+      await createLibSQLStreamsSchema(legacy);
+      for (const table of ["events", "messages", "decision_traces"]) {
+        const names = await columns(legacy, table);
+        expect(names.filter((n) => n === "operation_id")).toEqual(["operation_id"]);
+      }
+      const indexes = await legacy.query<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type='index' AND name IN
+         ('idx_events_operation_id','idx_messages_operation_id','idx_decision_traces_operation_id')
+         ORDER BY name`,
+      );
+      expect(indexes.rows.map((r) => r.name)).toEqual([
+        "idx_decision_traces_operation_id",
+        "idx_events_operation_id",
+        "idx_messages_operation_id",
+      ]);
+      expect(await validateLibSQLStreamsSchema(legacy)).toBe(true);
+    } finally {
+      await legacy.close?.();
+    }
+  });
+
+  test("legacyRowsSurviveOperationIdUpgrade", async () => {
+    const legacy = await legacyDb();
+    try {
+      await createLibSQLStreamsSchema(legacy);
+      const ev = await legacy.query<{ type: string; operation_id: string | null }>(
+        "SELECT type, operation_id FROM events",
+      );
+      expect(ev.rows).toEqual([{ type: "legacy", operation_id: null }]);
+      const msg = await legacy.query<{ subject: string; operation_id: string | null }>(
+        "SELECT subject, operation_id FROM messages",
+      );
+      expect(msg.rows).toEqual([{ subject: "s", operation_id: null }]);
+      const dt = await legacy.query<{ id: string; operation_id: string | null }>(
+        "SELECT id, operation_id FROM decision_traces",
+      );
+      expect(dt.rows).toEqual([{ id: "dt-legacy", operation_id: null }]);
+    } finally {
+      await legacy.close?.();
+    }
+  });
+
+  test("operationIdIndexesRejectNonNullDuplicatesButAllowNulls", async () => {
+    const fresh = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      await createLibSQLStreamsSchema(fresh);
+      const insertEvent = (op: string | null) =>
+        fresh.query(
+          "INSERT INTO events (type, project_key, timestamp, data, operation_id) VALUES ('t', '/p', 1, '{}', ?)",
+          [op],
+        );
+      await insertEvent(null);
+      await insertEvent(null);
+      await insertEvent("op-1");
+      await expect(insertEvent("op-1")).rejects.toThrow(/UNIQUE/);
+
+      const insertMessage = (op: string | null) =>
+        fresh.query(
+          "INSERT INTO messages (project_key, from_agent, subject, body, created_at, operation_id) VALUES ('/p', 'a', 's', 'b', 1, ?)",
+          [op],
+        );
+      await insertMessage(null);
+      await insertMessage(null);
+      await insertMessage("op-1");
+      await expect(insertMessage("op-1")).rejects.toThrow(/UNIQUE/);
+
+      const insertTrace = (id: string, op: string | null) =>
+        fresh.query(
+          "INSERT INTO decision_traces (id, decision_type, agent_name, project_key, decision, timestamp, operation_id) VALUES (?, 't', 'a', '/p', '{}', 1, ?)",
+          [id, op],
+        );
+      await insertTrace("dt-1", null);
+      await insertTrace("dt-2", null);
+      await insertTrace("dt-3", "op-1");
+      await expect(insertTrace("dt-4", "op-1")).rejects.toThrow(/UNIQUE/);
+    } finally {
+      await fresh.close?.();
+    }
+  });
+});

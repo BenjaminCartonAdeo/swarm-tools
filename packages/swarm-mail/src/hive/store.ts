@@ -25,41 +25,13 @@ import { withTiming } from "../streams/index.js";
 import type { DatabaseAdapter } from "../types/database.js";
 import { buildCellCreatedProjectionStatements, updateProjectionsDrizzle } from "./projections-drizzle.js";
 import type { CellEvent } from "./events.js";
+import { OperationIdConflictError, isOperationIdUniqueViolation } from "../operation-id-conflict.js";
 
 /**
  * Typed conflict: a cell_created lost the unique race on beads.operation_id.
  * The whole batch (event + projection) was rolled back.
  */
-export class OperationIdConflictError extends Error {
-  readonly operationId: string;
-  constructor(operationId: string, cause: unknown) {
-    super(`[BeadsStore] operation_id already used: ${operationId}`, { cause });
-    this.name = "OperationIdConflictError";
-    this.operationId = operationId;
-  }
-}
-
-/** SQLite extended result code SQLITE_CONSTRAINT_UNIQUE */
-const SQLITE_CONSTRAINT_UNIQUE = 2067;
-
-/**
- * Driver-level identification: extended code must be SQLITE_CONSTRAINT_UNIQUE
- * and the violated constraint must be exactly beads.operation_id (SQLite names
- * the constrained column(s) as `UNIQUE constraint failed: <table>.<col>`).
- */
-function isOperationIdUniqueViolation(error: unknown): boolean {
-  let current: unknown = error;
-  for (let depth = 0; current && depth < 5; depth++) {
-    const e = current as { code?: unknown; rawCode?: unknown; message?: unknown };
-    const isUnique = e.rawCode === SQLITE_CONSTRAINT_UNIQUE || e.code === "SQLITE_CONSTRAINT_UNIQUE";
-    if (isUnique) {
-      const detail = String(e.message ?? "").split("UNIQUE constraint failed:")[1]?.trim();
-      return detail === "beads.operation_id";
-    }
-    current = (current as { cause?: unknown }).cause;
-  }
-  return false;
-}
+export { OperationIdConflictError };
 
 async function resolveSequence(db: SwarmDb, id: number, sequence: number | null): Promise<number> {
   if (sequence != null) return sequence;
@@ -156,7 +128,7 @@ export async function appendCellEventDrizzle(
     try {
       [batchResult] = await db.batch([insertEvent, beadInsert, dirtyInsert]);
     } catch (error) {
-      if (isOperationIdUniqueViolation(error)) {
+      if (isOperationIdUniqueViolation(error, "beads")) {
         throw new OperationIdConflictError(
           (event as { operation_id?: string }).operation_id ?? "",
           error,

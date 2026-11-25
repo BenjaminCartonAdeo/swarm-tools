@@ -19,7 +19,7 @@
  * @module db/schema/streams
  */
 
-import { index, integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 
 /**
@@ -39,9 +39,13 @@ export const eventsTable = sqliteTable(
     // We mark it as generated so Drizzle doesn't try to INSERT into it
     sequence: integer("sequence").generatedAlwaysAs(sql`id`),
     data: text("data").notNull(), // JSON string
+    operation_id: text("operation_id"),
   },
   (table) => ({
     projectKeyIdx: index("idx_events_project_key").on(table.project_key),
+    operationIdIdx: uniqueIndex("idx_events_operation_id")
+      .on(table.operation_id)
+      .where(sql`operation_id IS NOT NULL`),
     typeIdx: index("idx_events_type").on(table.type),
     timestampIdx: index("idx_events_timestamp").on(table.timestamp),
     projectTypeIdx: index("idx_events_project_type").on(table.project_key, table.type),
@@ -90,9 +94,13 @@ export const messagesTable = sqliteTable(
     importance: text("importance").default("normal"),
     ack_required: integer("ack_required", { mode: "boolean" }).default(false),
     created_at: integer("created_at").notNull(),
+    operation_id: text("operation_id"),
   },
   (table) => ({
     projectIdx: index("idx_messages_project").on(table.project_key),
+    operationIdIdx: uniqueIndex("idx_messages_operation_id")
+      .on(table.operation_id)
+      .where(sql`operation_id IS NOT NULL`),
     threadIdIdx: index("idx_messages_thread").on(table.thread_id),
     createdIdx: index("idx_messages_created").on(table.created_at),
     senderTimeIdx: index("idx_messages_sender_time").on(table.project_key, table.from_agent, table.created_at),
@@ -267,9 +275,13 @@ export const decisionTracesTable = sqliteTable(
     outcome_event_id: integer("outcome_event_id"),
     quality_score: real("quality_score"), // Computed from outcome events
     timestamp: integer("timestamp").notNull(),
+    operation_id: text("operation_id"),
   },
   (table) => ({
     epicIdx: index("idx_decision_traces_epic").on(table.epic_id),
+    operationIdIdx: uniqueIndex("idx_decision_traces_operation_id")
+      .on(table.operation_id)
+      .where(sql`operation_id IS NOT NULL`),
     typeIdx: index("idx_decision_traces_type").on(table.decision_type),
     agentIdx: index("idx_decision_traces_agent").on(table.agent_name),
     timestampIdx: index("idx_decision_traces_timestamp").on(table.timestamp),
@@ -278,6 +290,37 @@ export const decisionTracesTable = sqliteTable(
 
 export type DecisionTrace = typeof decisionTracesTable.$inferSelect;
 export type NewDecisionTrace = typeof decisionTracesTable.$inferInsert;
+
+/**
+ * Review Feedback Operations Table
+ *
+ * Durable claim/result record for operation-keyed swarm_review_feedback calls.
+ * operation_id is the authoritative unit binding; unit_id is metadata only.
+ */
+export const reviewFeedbackOperationsTable = sqliteTable(
+  "review_feedback_operations",
+  {
+    operation_id: text("operation_id").primaryKey(),
+    project_key: text("project_key").notNull(),
+    unit_id: text("unit_id"),
+    task_id: text("task_id").notNull(),
+    worker_id: text("worker_id").notNull(),
+    status: text("status").notNull(),
+    request_hash: text("request_hash").notNull(),
+    attempt: integer("attempt").notNull(),
+    state: text("state").notNull(), // claimed | in_progress | done
+    claim_token: text("claim_token"),
+    host_instance_id: text("host_instance_id"),
+    hostname: text("hostname"),
+    pid: integer("pid"),
+    result: text("result"), // JSON
+    created_at: integer("created_at").notNull(),
+    updated_at: integer("updated_at").notNull(),
+  },
+  (table) => ({
+    taskIdx: index("idx_review_feedback_operations_task").on(table.project_key, table.task_id),
+  }),
+);
 
 /**
  * Entity Links table - relationships between decisions and entities.

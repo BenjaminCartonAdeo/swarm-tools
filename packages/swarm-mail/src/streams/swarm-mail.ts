@@ -106,12 +106,16 @@ export interface SendSwarmMessageOptions {
   threadId?: string;
   importance?: "low" | "normal" | "high" | "urgent";
   ackRequired?: boolean;
+  /** Optional idempotency key; a replay returns the persisted message */
+  operationId?: string;
   dbOverride?: any;
 }
 
 export interface SendSwarmMessageResult {
   success: boolean;
   messageId: number;
+  /** True when operationId matched an already persisted message */
+  duplicate?: boolean;
   threadId?: string;
   recipientCount: number;
 }
@@ -286,8 +290,28 @@ export async function sendSwarmMessage(
     threadId,
     importance = "normal",
     ackRequired = false,
+    operationId,
     dbOverride,
   } = options;
+
+  if (operationId) {
+    const { getOrCreateAdapter } = await import("./store-drizzle");
+    const adapter = await getOrCreateAdapter(projectPath, dbOverride);
+    const existing = await adapter.query(
+      "SELECT id, thread_id FROM messages WHERE operation_id = ?",
+      [operationId],
+    );
+    const row = existing.rows[0] as { id: number; thread_id: string | null } | undefined;
+    if (row) {
+      return {
+        success: true,
+        messageId: Number(row.id),
+        threadId: row.thread_id ?? undefined,
+        recipientCount: toAgents.length,
+        duplicate: true,
+      };
+    }
+  }
 
   // Check if thread exists (for thread_created event)
   let isNewThread = false;
@@ -341,6 +365,7 @@ export async function sendSwarmMessage(
     body_length: body.length,
     recipient_count: toAgents.length,
     is_broadcast: toAgents.length > 2,
+    ...(operationId ? { operation_id: operationId } : {}),
   });
   await appendEvent(messageEvent, projectPath, dbOverride);
 
@@ -352,6 +377,7 @@ export async function sendSwarmMessage(
       epic_id: epicId,
       initial_subject: subject,
       creator_agent: fromAgent,
+      ...(operationId ? { operation_id: `${operationId}:thread-created` } : {}),
     });
     await appendEvent(threadCreatedEvent, projectPath, dbOverride);
   }
@@ -369,7 +395,9 @@ export async function sendSwarmMessage(
   const result = await swarmDb
     .select({ id: messagesTable.id })
     .from(messagesTable)
-    .where(and(
+    .where(operationId
+      ? eq(messagesTable.operation_id, operationId)
+      : and(
       eq(messagesTable.project_key, projectPath),
       eq(messagesTable.from_agent, fromAgent),
       eq(messagesTable.subject, subject)
