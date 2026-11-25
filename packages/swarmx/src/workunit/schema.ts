@@ -111,6 +111,7 @@ export interface WorkUnitEffect {
   claimed_at: number | null;
   result_json: string | null;
   error_json: string | null;
+  request_json: string | null;
   updated_at: number;
 }
 
@@ -181,6 +182,7 @@ const schemaStatements = [
     claimed_at INTEGER,
     result_json TEXT,
     error_json TEXT,
+    request_json TEXT,
     updated_at INTEGER NOT NULL
   )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS swarmx_effects_unit_kind_uq
@@ -212,5 +214,12 @@ export async function ensureWorkUnitSchema(db: DatabaseAdapter): Promise<void> {
   );
   if (!hasEpicId) {
     await db.exec("ALTER TABLE swarmx_missions ADD COLUMN epic_id TEXT");
+  }
+  const effectColumns = await db.query("PRAGMA table_info(swarmx_effects)");
+  const hasRequestJson = effectColumns.rows.some(
+    (row) => typeof row === "object" && row !== null && "name" in row && Reflect.get(row, "name") === "request_json",
+  );
+  if (!hasRequestJson) {
+    await db.exec("ALTER TABLE swarmx_effects ADD COLUMN request_json TEXT");
   }
 }
