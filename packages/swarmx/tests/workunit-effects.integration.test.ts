@@ -20,6 +20,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { applyExternal, CRASH_EXIT_CODE, readLedger, type CrashBoundary } from "./fixtures/workunit-effect-crash-child.js";
 import { forceMissionClose, ForcedCloseNotAllowedError } from "../src/workunit/effects.js";
+import { createWorkUnitEffectPorts } from "../src/workunit/ports.js";
+import { LocalToolError } from "../src/types.js";
 
 const databases: DatabaseAdapter[] = [];
 
@@ -595,6 +597,58 @@ describe("work unit effect runner", () => {
     expect(states).toEqual({ "e-complete": "succeeded", "e-f0": "failed_optional", "e-start": "failed_optional" });
     const done = await transitionWorkUnit(db, { unitId: "unit-1", expectedState: "PUBLISHING", unitFence: result.unit.fence, nextState: "DONE", patch: { kind: "finalize" } });
     expect(done.state).toBe("DONE");
+  });
+});
+
+describe("work unit effect port error classification", () => {
+  test("hiveReadLocalErrorIsDefinite", async () => {
+    const readHiveCell = (error: unknown) => createWorkUnitEffectPorts({
+      runTool: async () => { throw error; },
+    }).readHiveCell("/project", "cell-1");
+    const localError = new LocalToolError("hive_cells", "not_found", "cell-1");
+
+    await expect(readHiveCell(localError)).rejects.toMatchObject({
+      name: "DefiniteEffectError",
+      message: localError.message,
+    });
+
+    const definiteError = new DefiniteEffectError("already classified");
+    await expect(readHiveCell(definiteError)).rejects.toBe(definiteError);
+
+    const ambiguousError = new Error("transport unavailable");
+    await expect(readHiveCell(ambiguousError)).rejects.toBe(ambiguousError);
+  });
+});
+
+describe("explicit effect claim recovery", () => {
+  // Characterization: explicit recovery already clears the CAS claim; this proves the missing
+  // end-to-end contract that the live effect can then be claimed and executed again.
+  test("explicitRecoveryReleasesLiveEffectClaim", async () => {
+    const db = await seedUnit([{
+      effectId: "eff-c",
+      kind: "backend_complete",
+      mandatory: true,
+      request: COMPLETE_ARGS,
+      state: "in_flight",
+    }]);
+    const claimToken = "known-live-claim";
+    await db.query(
+      "UPDATE swarmx_effects SET claim_token = ?, host_instance_id = 'host-live', claimed_hostname = 'worker-live', claimed_by_pid = ?, claimed_at = 1 WHERE effect_id = 'eff-c'",
+      [claimToken, process.pid],
+    );
+
+    const recovered = await recoverEffectClaim(db, {
+      effectId: "eff-c",
+      expectedClaimToken: claimToken,
+      project: "proj",
+    });
+
+    expect(recovered).toMatchObject({ state: "unknown", claim_token: null });
+    const ports = fakePorts({ cells: [{ status: "open" }, { status: "closed", completionOperationId: "eff-c" }] });
+    const retried = await runWorkUnitEffect(db, { effectId: "eff-c", host: HOST, ports });
+
+    expect(retried.state).toBe("succeeded");
+    expect(ports.calls).toEqual([{ name: "swarm_complete", args: { ...COMPLETE_ARGS, operation_id: "eff-c" } }]);
   });
 });
 

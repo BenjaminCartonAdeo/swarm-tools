@@ -58,7 +58,15 @@ function firstCell(output: unknown, cellId: string): Record<string, unknown> | n
 export function createWorkUnitEffectPorts(runtime: Pick<SwarmxRuntime, "runTool">): WorkUnitEffectPorts {
   return {
     async readHiveCell(projectKey, cellId): Promise<HiveCellSnapshot | null> {
-      const cell = firstCell(await runtime.runTool(HIVE_CELLS_TOOL, { project_key: projectKey, id: cellId }), cellId);
+      let result: unknown;
+      try {
+        result = await runtime.runTool(HIVE_CELLS_TOOL, { project_key: projectKey, id: cellId });
+      } catch (error) {
+        if (error instanceof DefiniteEffectError) throw error;
+        if (error instanceof LocalToolError) throw new DefiniteEffectError(error.message);
+        throw error;
+      }
+      const cell = firstCell(result, cellId);
       if (cell === null || typeof cell.status !== "string") return null;
       const completion = cell.completion_operation_id;
       return {
