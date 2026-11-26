@@ -287,6 +287,71 @@ describe("swarmx unit revoke", () => {
   });
 });
 
+describe("swarmx mission force-close", () => {
+  async function seedStuck(db: DatabaseAdapter, effectState: string): Promise<void> {
+    await db.query(
+      "INSERT INTO swarmx_missions (id, project, session_id, mission_id, state, close_intent, fence, created_at, updated_at) VALUES ('mf', ?, 'ses-mf', 'm-mf', 'CLOSING', 'finish', 2, 0, 0)",
+      [P],
+    );
+    await seedUnit(db, P, "mf", "uf", "PUBLISHING", 7);
+    await db.query(
+      "INSERT INTO swarmx_effects (effect_id, unit_id, kind, mandatory, operation_id, unit_fence, state, attempt, updated_at) VALUES ('ef', 'uf', 'backend_complete', 1, 'op-ef', 7, ?, 1, 0)",
+      [effectState],
+    );
+  }
+
+  // Break: failed_mandatory units staying live forever with no operator path.
+  test("forceCloseClosesFailedMandatoryMission", async () => {
+    const box = await sandbox();
+    await seedStuck(box.db, "failed_mandatory");
+    const ok = cli(box, "mission", "force-close", "mf", "--expected-fence", "2", "--owner-session", "ses-mf", "--reason", "backend gone", "--json");
+    expect(ok.code).toBe(0);
+    expect(ok.json).toEqual({ missionId: "mf", state: "FINISHED", fence: 3, reason: "backend gone" });
+    expect((await box.db.query("SELECT state FROM swarmx_work_units WHERE id = 'uf'")).rows[0]).toMatchObject({ state: "FAILED" });
+  });
+
+  // Break: force-close without evidence, stale fence or foreign owner succeeding.
+  test("forceCloseRefusesWithoutEvidenceOrWithStaleFenceOrOwner", async () => {
+    const box = await sandbox();
+    await seedStuck(box.db, "pending");
+    const refused = cli(box, "mission", "force-close", "mf", "--expected-fence", "2", "--owner-session", "ses-mf", "--reason", "r", "--json");
+    expect(refused.code).toBe(1);
+    expect(refused.json.error.code).toBe("forced_close_not_allowed");
+    const stale = cli(box, "mission", "force-close", "mf", "--expected-fence", "1", "--owner-session", "ses-mf", "--reason", "r", "--json");
+    expect(stale.code).toBe(1);
+    expect(stale.json.error.code).toBe("fence_conflict");
+    const intruder = cli(box, "mission", "force-close", "mf", "--expected-fence", "2", "--owner-session", "other", "--reason", "r", "--json");
+    expect(intruder.code).toBe(1);
+    expect(intruder.json.error.code).toBe("fence_conflict");
+    expect((await box.db.query("SELECT state, fence FROM swarmx_missions WHERE id = 'mf'")).rows[0]).toMatchObject({ state: "CLOSING", fence: 2 });
+  });
+
+  // Break: force-close accepting missing owner/fence/reason.
+  test("forceCloseRequiresOwnerFenceAndReason", async () => {
+    const box = await sandbox();
+    await seedStuck(box.db, "failed_mandatory");
+    const base = ["mission", "force-close", "mf"];
+    expect(cli(box, ...base, "--owner-session", "ses-mf", "--reason", "r", "--json").code).toBe(2);
+    expect(cli(box, ...base, "--expected-fence", "x", "--owner-session", "ses-mf", "--reason", "r", "--json").code).toBe(2);
+    expect(cli(box, ...base, "--expected-fence", "2", "--reason", "r", "--json").code).toBe(2);
+    const blank = cli(box, ...base, "--expected-fence", "2", "--owner-session", "ses-mf", "--reason", " ", "--json");
+    expect(blank.code).toBe(2);
+    expect(blank.json.error.code).toBe("usage_error");
+    expect(cli(box, "mission", "force-close", "--expected-fence", "2", "--owner-session", "ses-mf", "--reason", "r", "--json").code).toBe(2);
+    expect((await box.db.query("SELECT state FROM swarmx_missions WHERE id = 'mf'")).rows[0]).toMatchObject({ state: "CLOSING" });
+  });
+
+  // Break: help hiding the all-project recover scan or the force-close command.
+  test("helpDocumentsLifecycleCommands", async () => {
+    const box = await sandbox();
+    const help = cli(box, "--help");
+    expect(help.code).toBe(0);
+    expect(help.stdout).toContain("mission force-close <mission-pk> --expected-fence <n> --owner-session <session-id> --reason <reason>");
+    expect(help.stdout).toMatch(/recover.*without --project.*all projects/is);
+    expect(help.stdout).toContain("install");
+  });
+});
+
 describe("swarmx downgrade", () => {
   // Break: downgrade request accepted while a mission is live.
   test("downgradeRefusesLiveMission", async () => {

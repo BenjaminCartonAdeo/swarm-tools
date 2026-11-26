@@ -552,6 +552,16 @@ Commands:
   doctor      Verify installed assets and manifest
   uninstall   Remove managed assets only
 
+Lifecycle operator commands (CLI-only; exit 0 success, 1 refusal, 2 usage):
+  recover [--project <p>] [--effect <id> | --feedback <op>] [--json]
+              Recover stale effect/feedback claims; without --project it scans all projects
+  unit revoke <unit-id> --expected-fence <n> --reason <reason> [--json]
+              Fenced revoke of a RESERVED/BOUND/SUBMITTED WorkUnit
+  mission force-close <mission-pk> --expected-fence <n> --owner-session <session-id> --reason <reason> [--json]
+              Close a CLOSING mission whose live units have failed mandatory effects
+  downgrade --project <p> --yes [--json]
+              Request legacy downgrade; refuses while any mission is OPEN or CLOSING
+
 Options:
   --global, -g            Use global OpenCode directory
   --target, --dir, -t     Target .opencode directory
@@ -567,12 +577,13 @@ Options:
 //
 //   recover   [--project <p>] [--effect <id> | --feedback <op>] [--json]
 //   unit revoke <unit-id> --expected-fence <n> --reason <reason> [--json]
+//   mission force-close <mission-pk> --expected-fence <n> --owner-session <session-id> --reason <reason> [--json]
 //   downgrade --project <p> --yes [--json]
 //
 // Exit codes: 0 success, 1 refusal/error, 2 usage.
 // ---------------------------------------------------------------------------
 
-const LIFECYCLE_COMMANDS = new Set(["recover", "unit", "downgrade"]);
+const LIFECYCLE_COMMANDS = new Set(["recover", "unit", "mission", "downgrade"]);
 
 class UsageError extends Error {}
 
@@ -580,6 +591,7 @@ type LifecycleErrorCode =
   | "usage_error"
   | "live_mission"
   | "fence_conflict"
+  | "forced_close_not_allowed"
   | "claim_conflict"
   | "not_found"
   | "illegal_transition"
@@ -624,7 +636,10 @@ function lifecycleErrorCode(error: unknown): { code: LifecycleErrorCode; exit: n
     case "LiveMissionError":
       return { code: "live_mission", exit: 1 };
     case "FenceConflictError":
+    case "MissionFenceConflictError":
       return { code: "fence_conflict", exit: 1 };
+    case "ForcedCloseNotAllowedError":
+      return { code: "forced_close_not_allowed", exit: 1 };
     case "EffectClaimConflictError":
       return { code: "claim_conflict", exit: 1 };
     case "EffectNotFoundError":
@@ -713,6 +728,23 @@ async function runUnitRevoke(flags: LifecycleFlags): Promise<Record<string, unkn
   return { unitId: unit.id, state: "REVOKED", fence: Number(unit.fence), reason: unit.reason };
 }
 
+async function runMissionForceClose(flags: LifecycleFlags): Promise<Record<string, unknown>> {
+  const usage = "Usage: swarmx mission force-close <mission-pk> --expected-fence <n> --owner-session <session-id> --reason <reason>";
+  const [, sub, missionPk, ...rest] = flags.positional;
+  if (sub !== "force-close") throw new UsageError(usage);
+  if (missionPk === undefined || rest.length > 0) throw new UsageError("mission force-close requires exactly one <mission-pk>");
+  const fenceRaw = flags.values.get("--expected-fence");
+  if (fenceRaw === undefined || !/^\d+$/.test(fenceRaw)) throw new UsageError("--expected-fence <n> is required");
+  const owner = flags.values.get("--owner-session");
+  if (owner === undefined || owner.trim().length === 0) throw new UsageError("--owner-session <session-id> is required");
+  const reason = flags.values.get("--reason")?.trim();
+  if (reason === undefined || reason.length === 0) throw new UsageError("--reason <reason> is required and nonblank");
+  const { db } = await openLifecycleDb();
+  const { forceMissionClose } = await import("../src/workunit/effects.js");
+  const mission = await forceMissionClose(db, { missionPk, expectedFence: Number(fenceRaw), ownerSessionId: owner });
+  return { missionId: mission.id, state: mission.state, fence: Number(mission.fence), reason };
+}
+
 async function runDowngrade(flags: LifecycleFlags): Promise<Record<string, unknown>> {
   if (flags.positional.length > 1) throw new UsageError("downgrade takes no positional arguments");
   const project = flags.values.get("--project");
@@ -736,6 +768,10 @@ export async function runLifecycleCommand(argv: string[]): Promise<number> {
       const flags = parseLifecycleFlags(argv, ["--expected-fence", "--reason"], []);
       json = flags.json;
       result = await runUnitRevoke(flags);
+    } else if (command === "mission") {
+      const flags = parseLifecycleFlags(argv, ["--expected-fence", "--owner-session", "--reason"], []);
+      json = flags.json;
+      result = await runMissionForceClose(flags);
     } else {
       const flags = parseLifecycleFlags(argv, ["--project"], ["--yes"]);
       json = flags.json;

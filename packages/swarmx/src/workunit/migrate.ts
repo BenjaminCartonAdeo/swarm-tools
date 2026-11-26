@@ -1,10 +1,12 @@
 /**
  * One-shot import of the legacy KV lifecycle into the WorkUnit tables.
  *
- * The import is deterministic (stable ids, `ON CONFLICT DO NOTHING`), so it can
- * run again safely. It never terminalizes a live worker because a record is
- * old: ambiguous attempts import as BOUND with `legacy_ambiguous` for manual
- * reconciliation. The KV tombstone is written last, after every row landed.
+ * The import is deterministic (stable ids, `ON CONFLICT(id) DO NOTHING` with identity
+ * verification on replay), so it can run again safely; any other uniqueness conflict aborts
+ * without tombstoning. A project tombstone short-circuits before any read. It never
+ * terminalizes a live worker of an active mission because a record is old: ambiguous attempts
+ * import as BOUND with `legacy_ambiguous`. Attempts of inactive missions reconcile to REVOKED.
+ * The KV tombstone is written last, after every row landed.
  */
 import { createHash } from "node:crypto";
 import type { DatabaseAdapter } from "swarm-mail";
@@ -24,7 +26,65 @@ export type { LegacyLifecycleReader, LegacyLifecycleStore };
 export interface LegacyImportResult {
   imported: number;
   skipped: number;
+  /** Nonterminal attempts of inactive missions reconciled to REVOKED. */
+  reconciled: number;
   tombstoned: boolean;
+}
+
+/** A legacy row collides with a different existing row (identity or uniqueness); nothing is tombstoned. */
+export class LegacyImportConflictError extends Error {
+  readonly project: string;
+  readonly rowId: string;
+  constructor(project: string, table: string, rowId: string, detail: string) {
+    super(`Legacy import conflict in ${table} for ${project}/${rowId}: ${detail}`);
+    this.name = "LegacyImportConflictError";
+    this.project = project;
+    this.rowId = rowId;
+  }
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  const text = error instanceof Error ? `${error.message} ${String(Reflect.get(error, "code") ?? "")}` : String(error);
+  return /UNIQUE constraint|SQLITE_CONSTRAINT/i.test(text);
+}
+
+/** Inserts with `ON CONFLICT(id) DO NOTHING`; any other uniqueness violation is a typed conflict. */
+async function insertById(
+  db: DatabaseAdapter,
+  project: string,
+  table: string,
+  id: string,
+  sql: string,
+  params: unknown[],
+): Promise<boolean> {
+  try {
+    return (await db.query(sql, params)).rows.length > 0;
+  } catch (error) {
+    if (isUniqueViolation(error)) throw new LegacyImportConflictError(project, table, id, "uniqueness conflict");
+    throw error;
+  }
+}
+
+/** Primary-key replay must match the immutable identity the import would have written. */
+async function assertSameIdentity(
+  db: DatabaseAdapter,
+  project: string,
+  table: string,
+  id: string,
+  expected: Record<string, unknown>,
+): Promise<void> {
+  const columns = Object.keys(expected);
+  const result = await db.query(`SELECT ${columns.join(", ")} FROM ${table} WHERE id = ?`, [id]);
+  const row: unknown = result.rows[0];
+  if (typeof row !== "object" || row === null) {
+    throw new LegacyImportConflictError(project, table, id, "row vanished during replay");
+  }
+  for (const column of columns) {
+    const actual = Reflect.get(row, column) ?? null;
+    if (actual !== (expected[column] ?? null)) {
+      throw new LegacyImportConflictError(project, table, id, `existing ${column} differs`);
+    }
+  }
 }
 
 /** A native live mission already owns the session; importing would orphan legacy attempts. */
@@ -48,6 +108,10 @@ interface ImportedMission {
 }
 
 const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
+
+const LEGACY_TERMINAL_STATES = new Set<WorkUnitState>([
+  "DONE", "CHANGES_REQUESTED", "REJECTED", "CANCELLED", "ABANDONED", "REVOKED", "FAILED",
+]);
 
 function missionIdOf(mission: MissionState): string {
   return mission.missionID ?? `legacy:${mission.createdAt}`;
@@ -104,8 +168,13 @@ export async function migrateLegacyLifecycle(
   input: { project: string; legacyStore: LegacyLifecycleStore },
 ): Promise<LegacyImportResult> {
   const { project, legacyStore } = input;
+  // A completed import is final: never re-read or re-preflight legacy KV once tombstoned.
+  if (await legacyStore.isTombstoned(project)) {
+    return { imported: 0, skipped: 0, reconciled: 0, tombstoned: true };
+  }
   let imported = 0;
   let skipped = 0;
+  let reconciled = 0;
   const now = Date.now();
 
   const attempts = await legacyStore.listAttempts(project);
@@ -157,18 +226,19 @@ export async function migrateLegacyLifecycle(
       ...(mission.active ? {} : { close_intent_ambiguous: true }),
     });
     const epicId = mission.consolidation?.epicID ?? attempts.find((a) => a.sessionID === session && a.epicID)?.epicID ?? null;
-    const result = await db.query(
+    const missionState = mission.active ? "OPEN" : "FINISHED";
+    const inserted = await insertById(db, project, "swarmx_missions", pk,
       `INSERT INTO swarmx_missions (id, project, session_id, mission_id, epic_id, state, close_intent, fence,
          budget_limit, legacy_source, mode, budget_policy_json, consolidation_json, retry_causes_json, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT DO NOTHING RETURNING id`,
+       ON CONFLICT(id) DO NOTHING RETURNING id`,
       [
         pk,
         project,
         session,
         missionID,
         epicId,
-        mission.active ? "OPEN" : "FINISHED",
+        missionState,
         mission.budget.maxSpawns,
         legacySource,
         mission.mode,
@@ -184,7 +254,11 @@ export async function migrateLegacyLifecycle(
         toMs(mission.updatedAt),
       ],
     );
-    imported += result.rows.length;
+    if (inserted) {
+      imported += 1;
+    } else {
+      await assertSameIdentity(db, project, "swarmx_missions", pk, { project, session_id: session, mission_id: missionID });
+    }
   }
 
   const completionByCall = new Map(completions.map((c) => [c.attemptCallID, c]));
@@ -207,6 +281,11 @@ export async function migrateLegacyLifecycle(
     const completion = completionByCall.get(attempt.callID);
     const receipt = receiptByCall.get(attempt.callID);
     const mapped = mapAttempt(attempt, completion, receipt);
+    // An inactive legacy mission is imported as FINISHED; its nonterminal attempts must not
+    // hold the live-cell index, so they reconcile to REVOKED with their evidence intact.
+    const reconcile = !owner.mission.active && !LEGACY_TERMINAL_STATES.has(mapped.state);
+    const state: WorkUnitState = reconcile ? "REVOKED" : mapped.state;
+    const ambiguous = mapped.ambiguous || reconcile;
     const evidenceJson =
       completion === undefined
         ? null
@@ -216,13 +295,13 @@ export async function migrateLegacyLifecycle(
             submittedAt: completion.submittedAt,
             verification: completion.verification ?? null,
           });
-    const result = await db.query(
+    const inserted = await insertById(db, project, "swarmx_work_units", id,
       `INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, cell_id, idem_key, attempt_no, retry_of, state,
          fence, dispatch_token, worker_session, worker_agent, budget_charge, evidence_hash, diff_hash, evidence_json,
          review_verdict, review_by, review_feedback_json, verification_receipt_json, reason, error_json, legacy_source,
          created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
-       ON CONFLICT DO NOTHING RETURNING id`,
+       ON CONFLICT(id) DO NOTHING RETURNING id`,
       [
         id,
         project,
@@ -232,7 +311,7 @@ export async function migrateLegacyLifecycle(
         sha256(`${project}|${owner.missionID}|${attempt.cellID}|${attemptNo}`),
         attemptNo,
         previous?.id ?? null,
-        mapped.state,
+        state,
         attempt.dispatchToken ?? null,
         attempt.workerSessionID ?? completion?.workerSessionID ?? null,
         attempt.agent,
@@ -244,22 +323,27 @@ export async function migrateLegacyLifecycle(
         receipt?.assignedAgentID ?? null,
         null,
         receipt === undefined ? null : JSON.stringify(receipt),
-        completion?.canceled === true ? (completion.cancelReason ?? "legacy_canceled") : null,
+        completion?.canceled === true
+          ? (completion.cancelReason ?? "legacy_canceled")
+          : reconcile ? "legacy_mission_inactive" : null,
         JSON.stringify({
           kind: "legacy_attempt",
           raw: attempt,
           ...(completion === undefined ? {} : { completion }),
-          ...(mapped.ambiguous ? { legacy_ambiguous: true } : {}),
+          ...(ambiguous ? { legacy_ambiguous: true } : {}),
+          ...(reconcile ? { legacy_reconciled: "mission_inactive" } : {}),
         }),
         toMs(attempt.ts),
         toMs(attempt.revokedAt ?? attempt.ts),
       ],
     );
-    if (result.rows.length > 0) {
+    if (inserted) {
       imported += 1;
+      if (reconcile) reconciled += 1;
     } else {
-      const existing = await db.query("SELECT id FROM swarmx_work_units WHERE id = ?", [id]);
-      if (existing.rows.length === 0) skipped += 1;
+      await assertSameIdentity(db, project, "swarmx_work_units", id, {
+        project, mission_pk: owner.pk, call_id: attempt.callID, cell_id: attempt.cellID,
+      });
     }
     cellsWithUnits.add(`${owner.pk}|${attempt.cellID}`);
     projectCellsWithUnits.add(attempt.cellID);
@@ -320,5 +404,5 @@ export async function migrateLegacyLifecycle(
     imported,
     skipped,
   });
-  return { imported, skipped, tombstoned: true };
+  return { imported, skipped, reconciled, tombstoned: true };
 }

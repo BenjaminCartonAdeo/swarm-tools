@@ -2,8 +2,8 @@
 "swarm-tools": minor
 ---
 
-> « The purpose of abstraction is not to be vague, it is to create a new semantic level. »
-> — Barbara Liskov
+> « The purpose of abstracting is not to be vague, but to create a new semantic level in which one can be absolutely precise. »
+> — Edsger W. Dijkstra, *The Humble Programmer* (1972)
 
 ## MCP keeps optional operation identity intact
 

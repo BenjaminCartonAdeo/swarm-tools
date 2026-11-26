@@ -34,9 +34,15 @@ export class IllegalTransitionError extends Error {
 }
 
 export class FenceConflictError extends Error {
-  constructor(unitId: string, expectedState: WorkUnitState, unitFence: number) {
-    super(`WorkUnit fence conflict for ${unitId} at ${expectedState}/${unitFence}`);
+  /** Fence observed on the row at refusal time, when known. */
+  readonly currentFence: number | undefined;
+  constructor(unitId: string, expectedState: WorkUnitState, unitFence: number, currentFence?: number) {
+    super(
+      `WorkUnit fence conflict for ${unitId} at ${expectedState}/${unitFence}`
+        + (currentFence === undefined ? "" : ` (current fence ${currentFence})`),
+    );
     this.name = "FenceConflictError";
+    this.currentFence = currentFence;
   }
 }
 
@@ -601,6 +607,29 @@ export async function beginMissionClose(
   throw new MissionFenceConflictError(input.missionPk, input.expectedFence);
 }
 
+/**
+ * Fenced CLOSING/finish -> CLOSING/cancel|abandon, incrementing the fence. Replaying with the
+ * pre-escalation fence and the same intent returns the escalated row.
+ */
+export async function escalateMissionCloseIntent(
+  db: DatabaseAdapter,
+  input: MissionCloseFence & { intent: "cancel" | "abandon" },
+): Promise<Mission> {
+  const result = await db.query(
+    `UPDATE swarmx_missions SET close_intent = ?, fence = fence + 1, updated_at = ?
+     WHERE id = ? AND session_id = ? AND fence = ? AND state = 'CLOSING' AND close_intent = 'finish' RETURNING *`,
+    [input.intent, Date.now(), input.missionPk, input.ownerSessionId, input.expectedFence],
+  );
+  const row: unknown = result.rows[0];
+  if (isRecord(row)) return row as unknown as Mission;
+  const current = await getMissionByPk(db, input.missionPk);
+  if (current !== null && current.session_id === input.ownerSessionId && current.state === "CLOSING"
+    && current.close_intent === input.intent && Number(current.fence) === input.expectedFence + 1) {
+    return current;
+  }
+  throw new MissionFenceConflictError(input.missionPk, input.expectedFence);
+}
+
 /** Idempotent cancel/abandon cascade; PUBLISHING/RETURNING and APPROVED-with-effects are left to drain. */
 export async function cascadeMissionClose(
   db: DatabaseAdapter,
@@ -1112,17 +1141,26 @@ export async function revokeWorkUnit(
   const unit = await getWorkUnit(db, input.unitId);
   if (unit === null) throw new WorkUnitNotFoundError(input.unitId);
   const state = unit.state;
-  if (!REVOCABLE_STATES.has(state)) {
-    if (Number(unit.fence) !== input.expectedFence) throw new FenceConflictError(input.unitId, state, input.expectedFence);
-    throw new IllegalTransitionError(state, "REVOKED");
+  const currentFence = Number(unit.fence);
+  if (currentFence !== input.expectedFence) {
+    throw new FenceConflictError(input.unitId, state, input.expectedFence, currentFence);
   }
-  return transitionWorkUnit(db, {
-    unitId: input.unitId,
-    expectedState: state,
-    unitFence: input.expectedFence,
-    nextState: "REVOKED",
-    patch: { kind: "revoke", reason },
-  });
+  if (!REVOCABLE_STATES.has(state)) throw new IllegalTransitionError(state, "REVOKED");
+  try {
+    return await transitionWorkUnit(db, {
+      unitId: input.unitId,
+      expectedState: state,
+      unitFence: input.expectedFence,
+      nextState: "REVOKED",
+      patch: { kind: "revoke", reason },
+    });
+  } catch (error) {
+    if (error instanceof FenceConflictError) {
+      const observed = await getWorkUnit(db, input.unitId);
+      throw new FenceConflictError(input.unitId, state, input.expectedFence, observed === null ? undefined : Number(observed.fence));
+    }
+    throw error;
+  }
 }
 
 export class LiveMissionError extends Error {

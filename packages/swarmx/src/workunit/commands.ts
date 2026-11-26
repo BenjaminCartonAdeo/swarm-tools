@@ -19,6 +19,7 @@ import {
   beginReviewWorkUnit,
   bindWorkUnit,
   cascadeMissionClose,
+  escalateMissionCloseIntent,
   failDispatch,
   finalizePublish,
   finalizeReturn,
@@ -304,6 +305,11 @@ export function createMissionCommands(db: DatabaseAdapter, opts: MissionCommands
       mission = await beginMissionClose(db, { missionPk, expectedFence: Number(mission.fence), ownerSessionId: actor.sessionId, intent });
     }
     if (mission.state !== "CLOSING") return mission;
+    if (intent === "cancel" && mission.close_intent === "finish") {
+      mission = await escalateMissionCloseIntent(db, {
+        missionPk, expectedFence: Number(mission.fence), ownerSessionId: actor.sessionId, intent,
+      });
+    }
     const fence = { missionPk, expectedFence: Number(mission.fence), ownerSessionId: actor.sessionId };
     if (intent === "cancel") await cascadeMissionClose(db, { ...fence, intent });
     return finishMissionClose(db, fence);

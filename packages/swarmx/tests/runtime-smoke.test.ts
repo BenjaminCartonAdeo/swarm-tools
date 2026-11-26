@@ -1782,6 +1782,7 @@ describe("WorkUnit runtime setup (additive)", () => {
         getBuildLock: async () => undefined,
         getCleanupClaim: async () => undefined,
         setTombstone: async () => undefined,
+        isTombstoned: async () => false,
       };
       await setupWorkUnitRuntime(db, {
         host: { hostInstanceId: "h", hostname: "box", pid: 42 },

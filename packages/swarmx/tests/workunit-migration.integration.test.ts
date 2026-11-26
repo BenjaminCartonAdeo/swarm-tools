@@ -231,7 +231,7 @@ describe("legacy lifecycle import", () => {
     const { db, legacyStore } = await setup();
     await migrateLegacyLifecycle(db, { project: P, legacyStore });
     expect(await unit(db, "a-succ")).toMatchObject({ state: "BOUND", budget_charge: 1 });
-    expect(await unit(db, "a-s2")).toMatchObject({ state: "BOUND", mission_pk: expect.stringContaining("s2") });
+    expect(await unit(db, "a-s2")).toMatchObject({ state: "REVOKED", reason: "legacy_mission_inactive", mission_pk: expect.stringContaining("s2") });
   });
 
   test("followupAttemptImportsZeroCharge", async () => {
@@ -355,6 +355,7 @@ describe("legacy lifecycle import", () => {
       listReviewReceipts: (p) => (calls.push("listReviewReceipts"), legacyStore.listReviewReceipts(p)),
       getBuildLock: (p) => (calls.push("getBuildLock"), legacyStore.getBuildLock(p)),
       getCleanupClaim: (p) => (calls.push("getCleanupClaim"), legacyStore.getCleanupClaim(p)),
+      isTombstoned: (p) => legacyStore.isTombstoned(p),
       setTombstone: async (p, s, v) => {
         calls.push("setTombstone");
         unitsAtTombstone = await count(db, "swarmx_work_units");
@@ -563,5 +564,95 @@ describe("schema upgrade", () => {
     await ensureWorkUnitSchema(db);
     expect((await db.query("SELECT id, evidence_json, completion_amendment_json, review_diff_hash FROM swarmx_work_units")).rows)
       .toEqual([{ id: "u", evidence_json: "{}", completion_amendment_json: null, review_diff_hash: null }]);
+  });
+});
+
+describe("Task 21: final review fixes", () => {
+  const throwingReads = (base: LegacyLifecycleStore, reads: string[]): LegacyLifecycleStore => {
+    const fail = (name: string) => async () => {
+      reads.push(name);
+      throw new Error(`unexpected read ${name}`);
+    };
+    return {
+      listMissions: fail("listMissions"),
+      getMission: fail("getMission"),
+      listAttempts: fail("listAttempts"),
+      listAssignments: fail("listAssignments"),
+      listPendingCompletions: fail("listPendingCompletions"),
+      listReviewReceipts: fail("listReviewReceipts"),
+      getBuildLock: fail("getBuildLock"),
+      getCleanupClaim: fail("getCleanupClaim"),
+      setTombstone: fail("setTombstone"),
+      isTombstoned: (p) => base.isTombstoned(p),
+    };
+  };
+
+  // Break: re-import re-reading/preflighting after the tombstone and blocking setup forever.
+  test("tombstoned re-import is a no-op even with a newer native mission on the same session", async () => {
+    const { db, legacyStore } = await setup();
+    await migrateLegacyLifecycle(db, { project: P, legacyStore });
+    await db.query("UPDATE swarmx_missions SET state = 'FINISHED' WHERE session_id = 's1'");
+    await db.query(
+      "INSERT INTO swarmx_missions (id, project, session_id, mission_id, state, fence, created_at, updated_at) VALUES ('native', 'p', 's1', 'native-m', 'OPEN', 1, 0, 0)",
+    );
+    const reads: string[] = [];
+    const again = await migrateLegacyLifecycle(db, { project: P, legacyStore: throwingReads(legacyStore, reads) });
+    expect(again).toEqual({ imported: 0, skipped: 0, reconciled: 0, tombstoned: true });
+    expect(reads).toEqual([]);
+
+    const { setupWorkUnitRuntime } = await import("../src/index");
+    await setupWorkUnitRuntime(db, {
+      host: { hostInstanceId: "h", hostname: "box", pid: 42 },
+      isProcessAlive: () => false,
+      projectID: P,
+      migrate: { project: P, legacyStore: throwingReads(legacyStore, reads) },
+    });
+    expect(reads).toEqual([]);
+  });
+
+  // Break: inactive legacy missions leaving nonterminal attempts holding the live-cell index.
+  test("inactive mission attempts reconcile to REVOKED and free the cell", async () => {
+    const { db, legacyStore } = await setup();
+    const result = await migrateLegacyLifecycle(db, { project: P, legacyStore });
+    expect(result.reconciled).toBe(1);
+    const row = await unit(db, "a-s2");
+    expect(row).toMatchObject({ state: "REVOKED", reason: "legacy_mission_inactive", budget_charge: 1 });
+    const source = JSON.parse(String(row.legacy_source));
+    expect(source).toMatchObject({ legacy_ambiguous: true, legacy_reconciled: "mission_inactive" });
+    expect(source.raw.callID).toBe("a-s2");
+    expect(await unit(db, "a-live")).toMatchObject({ state: "BOUND" });
+    await db.query(
+      "INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, cell_id, idem_key, attempt_no, state, fence, created_at, updated_at) VALUES ('fresh', 'p', 'native', 'call-fresh', 'c20', 'idem-fresh', 1, 'RESERVED', 1, 0, 0)",
+    );
+    expect((await db.query("SELECT state FROM swarmx_work_units WHERE id = 'fresh'")).rows).toHaveLength(1);
+  });
+
+  // Break: primary-key replay with different identity silently accepted.
+  test("primary-key replay with the same identity is accepted; different identity aborts without tombstone", async () => {
+    const { db, legacyStore, storage } = await setup();
+    await migrateLegacyLifecycle(db, { project: P, legacyStore });
+    storage.map.delete(legacyTombstoneKey(P, "*"));
+    const replay = await migrateLegacyLifecycle(db, { project: P, legacyStore });
+    expect(replay.imported).toBe(0);
+    expect(await count(db, "swarmx_work_units")).toBe(14);
+
+    const fresh = await setup();
+    await fresh.db.query(
+      "INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, cell_id, idem_key, attempt_no, state, fence, created_at, updated_at) VALUES ('unit:p:m1:a-succ', 'p', 'other-mission', 'other-call', 'c2', 'idem-x', 1, 'DONE', 1, 0, 0)",
+    );
+    const { LegacyImportConflictError } = await import("../src/workunit/migrate.js");
+    await expect(migrateLegacyLifecycle(fresh.db, { project: P, legacyStore: fresh.legacyStore })).rejects.toBeInstanceOf(LegacyImportConflictError);
+    expect([...fresh.storage.map.keys()].some((k) => k.startsWith("legacy-tombstone:"))).toBe(false);
+  });
+
+  // Break: untargeted ON CONFLICT swallowing a live-cell collision and still tombstoning.
+  test("live-cell collision aborts typed without tombstone", async () => {
+    const { db, legacyStore, storage } = await setup();
+    await db.query(
+      "INSERT INTO swarmx_work_units (id, project, mission_pk, call_id, cell_id, idem_key, attempt_no, state, fence, created_at, updated_at) VALUES ('native-u', 'p', 'native', 'native-call', 'c1', 'idem-native', 1, 'BOUND', 1, 0, 0)",
+    );
+    const { LegacyImportConflictError } = await import("../src/workunit/migrate.js");
+    await expect(migrateLegacyLifecycle(db, { project: P, legacyStore })).rejects.toBeInstanceOf(LegacyImportConflictError);
+    expect([...storage.map.keys()].some((k) => k.startsWith("legacy-tombstone:"))).toBe(false);
   });
 });

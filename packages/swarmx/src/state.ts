@@ -749,6 +749,8 @@ export interface LegacyLifecycleReader {
 
 export interface LegacyLifecycleStore extends LegacyLifecycleReader {
   setTombstone(project: string, session: string, value: JsonValue): Promise<void>;
+  /** True when the project-wide import tombstone exists. */
+  isTombstoned(project: string): Promise<boolean>;
 }
 
 const isStr = (value: unknown): value is string => typeof value === "string" && value.length > 0;
@@ -854,5 +856,6 @@ export function createLegacyLifecycleStore(store: LegacyMissionStateStore): Lega
     async setTombstone(project, session, value) {
       await store.storage.set(legacyTombstoneKey(project, session), value);
     },
+    isTombstoned: (project) => isLegacyLifecycleTombstoned(store.storage, project, undefined),
   };
 }

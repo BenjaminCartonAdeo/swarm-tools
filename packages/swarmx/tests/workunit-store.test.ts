@@ -962,3 +962,71 @@ describe("WorkUnit completion amendment", () => {
     });
   });
 });
+
+describe("Task 21: close-intent escalation and revoke diagnostics", () => {
+  const owner = { missionPk: "mission-pk-mission", ownerSessionId: "session" };
+
+  // Break: CLOSING/finish could never be cancelled because the cascade requires a matching intent.
+  for (const intent of ["cancel", "abandon"] as const) {
+    test(`escalateMissionCloseIntent finish -> ${intent} cascades live units and is idempotent`, async () => {
+      const { escalateMissionCloseIntent } = await import("../src/workunit/store.js");
+      await withWorkUnitDb(async (db) => {
+        const pk = await seedMission(db);
+        await seedCloseUnit(db, pk, "u1", "BOUND");
+        await beginMissionClose(db, { ...owner, expectedFence: 1, intent: "finish" });
+        const escalated = await escalateMissionCloseIntent(db, { ...owner, expectedFence: 2, intent });
+        expect(escalated).toMatchObject({ state: "CLOSING", close_intent: intent, fence: 3 });
+        // Replay with the original fence returns the escalated row without another bump.
+        expect(await escalateMissionCloseIntent(db, { ...owner, expectedFence: 2, intent })).toMatchObject({ close_intent: intent, fence: 3 });
+        await cascadeMissionClose(db, { ...owner, expectedFence: 3, intent });
+        const done = await finishMissionClose(db, { ...owner, expectedFence: 3 });
+        expect(done.state).toBe(intent === "cancel" ? "CANCELLED" : "ABANDONED");
+        expect(await unitStates(db)).toEqual({ u1: intent === "cancel" ? "CANCELLED" : "ABANDONED" });
+      });
+    });
+  }
+
+  // Break: escalation ignoring the fence/owner guard.
+  test("escalateMissionCloseIntent rejects stale fence and non-owner", async () => {
+    const { escalateMissionCloseIntent } = await import("../src/workunit/store.js");
+    await withWorkUnitDb(async (db) => {
+      await seedMission(db);
+      await beginMissionClose(db, { ...owner, expectedFence: 1, intent: "finish" });
+      await expect(escalateMissionCloseIntent(db, { ...owner, expectedFence: 1, intent: "cancel" }))
+        .rejects.toBeInstanceOf(MissionFenceConflictError);
+      await expect(escalateMissionCloseIntent(db, { ...owner, ownerSessionId: "intruder", expectedFence: 2, intent: "cancel" }))
+        .rejects.toBeInstanceOf(MissionFenceConflictError);
+      const row = (await db.query("SELECT close_intent, fence FROM swarmx_missions")).rows[0];
+      expect(row).toMatchObject({ close_intent: "finish", fence: 2 });
+    });
+  });
+
+  // Break: commands.cancel on a CLOSING/finish mission throwing fence conflict instead of cancelling.
+  test("commands.cancel escalates a CLOSING finish mission", async () => {
+    const { createMissionCommands } = await import("../src/workunit/commands.js");
+    await withWorkUnitDb(async (db) => {
+      const pk = await seedMission(db);
+      await seedCloseUnit(db, pk, "u1", "BOUND");
+      const commands = createMissionCommands(db, { host: { hostInstanceId: "h", hostname: "box", pid: 1 } });
+      const actor = { kind: "coordinator" as const, sessionId: "session" };
+      await expect(commands.finish(actor, { missionPk: pk })).rejects.toBeInstanceOf(MissionNotDrainedError);
+      const cancelled = await commands.cancel(actor, { missionPk: pk });
+      expect(cancelled.state).toBe("CANCELLED");
+      expect(await unitStates(db)).toEqual({ u1: "CANCELLED" });
+    });
+  });
+
+  // Break: revoke fence mismatch hiding the observed fence from the operator.
+  test("revokeWorkUnit fence mismatch reports the current fence", async () => {
+    const { revokeWorkUnit } = await import("../src/workunit/store.js");
+    await withWorkUnitDb(async (db) => {
+      const pk = await seedMission(db);
+      await seedCloseUnit(db, pk, "u1", "BOUND");
+      await seedCloseUnit(db, pk, "u2", "DONE");
+      await expect(revokeWorkUnit(db, { unitId: "u1", expectedFence: 1, reason: "r" }))
+        .rejects.toMatchObject({ name: "FenceConflictError", currentFence: 3 });
+      await expect(revokeWorkUnit(db, { unitId: "u2", expectedFence: 1, reason: "r" }))
+        .rejects.toMatchObject({ name: "FenceConflictError", currentFence: 3 });
+    });
+  });
+});
