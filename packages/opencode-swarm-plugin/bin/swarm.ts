@@ -65,13 +65,13 @@ import { tmpdir } from "os";
 
 // Query & observability tools
 import {
-  executeQuery,
   executeQueryCLI,
   executePreset,
   formatAsTable,
   formatAsCSV,
   formatAsJSON,
 } from "../src/query-tools.js";
+import type { QueryResult } from "../src/query-tools.js";
 import {
   getWorkerStatus,
   getSubtaskProgress,
@@ -3203,16 +3203,16 @@ async function query() {
   const projectPath = process.cwd();
 
   try {
-    let rows: any[];
+    let result: QueryResult;
 
     if (parsed.preset) {
       // Execute preset query
       p.log.step(`Executing preset: ${parsed.preset}`);
-      rows = await executePreset(projectPath, parsed.preset);
+      result = await executePreset(projectPath, parsed.preset);
     } else if (parsed.query) {
       // Execute custom SQL
       p.log.step("Executing custom SQL");
-      rows = await executeQuery(projectPath, parsed.query);
+      result = await executeQueryCLI(projectPath, parsed.query);
     } else {
       p.log.error("No query specified. Use --sql or --preset");
       p.outro("Aborted");
@@ -3223,14 +3223,14 @@ async function query() {
     let output: string;
     switch (parsed.format) {
       case "csv":
-        output = formatAsCSV(rows);
+        output = formatAsCSV(result);
         break;
       case "json":
-        output = formatAsJSON(rows);
+        output = formatAsJSON(result);
         break;
       case "table":
       default:
-        output = formatAsTable(rows);
+        output = formatAsTable(result);
         break;
     }
 
@@ -3238,7 +3238,7 @@ async function query() {
     console.log(output);
     console.log();
 
-    p.outro(`Found ${rows.length} result(s)`);
+    p.outro(`Found ${result.rowCount} result(s)`);
   } catch (error) {
     p.log.error("Query failed");
     p.log.message(error instanceof Error ? error.message : String(error));
