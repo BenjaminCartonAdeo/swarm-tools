@@ -4,7 +4,7 @@
  * Tests cross-agent task completion signaling using DurableDeferred.
  * Workers resolve a deferred when completing, coordinators await it.
  */
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -53,6 +53,78 @@ describe("swarm_complete DurableDeferred integration", () => {
     if (previousDbPath === undefined) delete process.env.SWARM_DB_PATH;
     else process.env.SWARM_DB_PATH = previousDbPath;
     await rm(testDirectory, { recursive: true, force: true });
+  });
+
+  it("completes quietly when deferred and hivemind are unavailable", async () => {
+    await db.exec("DROP TABLE IF EXISTS deferred");
+    const cell = await hive.createCell(projectKey, {
+      title: "No optional capabilities",
+      type: "task",
+      priority: 2,
+      status: "in_progress",
+    });
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = JSON.parse(await swarm_complete.execute({
+        project_key: projectKey,
+        agent_name: "TestWorker",
+        bead_id: cell.id,
+        summary: "Completed without optional capabilities",
+        start_time: Date.now() - 1000,
+        skip_verification: true,
+        skip_review: true,
+      }, {
+        sessionID: "test-session-no-optional",
+        messageID: "test-message-no-optional",
+        agent: "test-agent",
+        abort: new AbortController().signal,
+      }));
+
+      expect(result.success).toBe(true);
+      expect(result.deferred_resolved).toBe(false);
+      expect(result.deferred_error).toBeUndefined();
+      const warnings = warnSpy.mock.calls.map((call) => call.join(" "));
+      expect(warnings.some((warning) => warning.includes("deferred"))).toBe(false);
+      expect(warnings.some((warning) => warning.includes("hivemind"))).toBe(false);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("surfaces real deferred failures when the table exists", async () => {
+    await db.exec("DROP TABLE IF EXISTS deferred");
+    await db.exec("CREATE TABLE deferred (url TEXT)");
+    const cell = await hive.createCell(projectKey, {
+      title: "Broken deferred schema",
+      type: "task",
+      priority: 2,
+      status: "in_progress",
+    });
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = JSON.parse(await swarm_complete.execute({
+        project_key: projectKey,
+        agent_name: "TestWorker",
+        bead_id: cell.id,
+        summary: "Completed with a broken deferred table",
+        start_time: Date.now() - 1000,
+        skip_verification: true,
+        skip_review: true,
+      }, {
+        sessionID: "test-session-broken-deferred",
+        messageID: "test-message-broken-deferred",
+        agent: "test-agent",
+        abort: new AbortController().signal,
+      }));
+
+      expect(result.success).toBe(true);
+      expect(result.deferred_resolved).toBe(false);
+      expect(result.deferred_error).toContain("resolved");
+      expect(warnSpy.mock.calls.some((call) => call.join(" ").includes("deferred"))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+      await db.exec("DROP TABLE IF EXISTS deferred");
+    }
   });
 
   it("should resolve deferred when swarm_complete is called", async () => {

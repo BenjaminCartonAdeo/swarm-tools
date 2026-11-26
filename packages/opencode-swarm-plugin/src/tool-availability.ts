@@ -164,66 +164,26 @@ const toolCheckers: Record<ToolName, () => Promise<ToolStatus>> = {
     }
   },
 
-  // Hivemind: Unified memory system (ADR-011)
-  // Checks both semantic-memory and cass availability
+  // Hivemind: Unified memory system (ADR-011).
+  // Callers invoke the native `hivemind` binary, so alternative backends do not
+  // make this tool available.
   hivemind: async () => {
-    // Check native hivemind command first
-    const hivemindExists = await commandExists("hivemind");
-    if (hivemindExists) {
-      try {
-        const result = await Bun.$`hivemind stats`.quiet().nothrow();
-        return {
-          available: result.exitCode === 0,
-          checkedAt: new Date().toISOString(),
-          version: "native",
-        };
-      } catch (e) {
-        return {
-          available: false,
-          checkedAt: new Date().toISOString(),
-          error: String(e),
-        };
-      }
+    const exists = await commandExists("hivemind");
+    if (!exists) {
+      return {
+        available: false,
+        checkedAt: new Date().toISOString(),
+        error: "hivemind command not found",
+      };
     }
 
-    // Fall back to checking semantic-memory (hivemind uses same backend)
-    const semanticMemoryExists = await commandExists("semantic-memory");
-    if (semanticMemoryExists) {
-      try {
-        const result = await Bun.$`semantic-memory stats`.quiet().nothrow();
-        return {
-          available: result.exitCode === 0,
-          checkedAt: new Date().toISOString(),
-          version: "semantic-memory-backend",
-        };
-      } catch (e) {
-        return {
-          available: false,
-          checkedAt: new Date().toISOString(),
-          error: String(e),
-        };
-      }
-    }
-
-    // Try bunx semantic-memory with manual timeout
     try {
-      const proc = Bun.spawn(["bunx", "semantic-memory", "stats"], {
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-
-      const timeout = setTimeout(() => proc.kill(), BUNX_TIMEOUT_MS);
-      try {
-        const exitCode = await proc.exited;
-        return {
-          available: exitCode === 0,
-          checkedAt: new Date().toISOString(),
-          version: "bunx-semantic-memory",
-        };
-      } finally {
-        clearTimeout(timeout);
-        proc.kill(); // Safe to call even if already dead
-      }
+      const result = await Bun.$`hivemind stats`.quiet().nothrow();
+      return {
+        available: result.exitCode === 0,
+        checkedAt: new Date().toISOString(),
+        version: "native",
+      };
     } catch (e) {
       return {
         available: false,

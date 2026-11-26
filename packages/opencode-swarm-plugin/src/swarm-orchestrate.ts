@@ -71,7 +71,6 @@ import {
   checkAllTools,
   formatToolAvailability,
   isToolAvailable,
-  warnMissingTool,
 } from "./tool-availability";
 import { getHiveAdapter, hive_sync, setHiveWorkingDirectory, getHiveWorkingDirectory } from "./hive";
 import { listSkills } from "./skills";
@@ -1386,30 +1385,30 @@ This will be recorded as a negative learning signal.`;
         const swarmMail = await getSwarmMailLibSQL(args.project_key);
         const db = await swarmMail.getDatabase();
         
-        // Resolve deferred keyed by bead_id
-        // Coordinator should have created this deferred before spawning worker
+        // Resolve deferred keyed by bead_id when the optional table exists.
         const deferredUrl = `deferred:${args.bead_id}`;
-        
-        // Check if deferred exists before resolving
-        const checkResult = await db.query<{ url: string; resolved: number }>(
-          `SELECT url, resolved FROM deferred WHERE url = ? AND resolved = 0`,
-          [deferredUrl],
+        const tableResult = await db.query<{ name: string }>(
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'deferred'`,
+          [],
         );
-        
-        if (checkResult.rows.length > 0) {
-          // Resolve with completion payload
-          await db.query(
-            `UPDATE deferred SET resolved = 1, value = ? WHERE url = ? AND resolved = 0`,
-            [JSON.stringify({ completed: true, summary: args.summary }), deferredUrl],
+
+        if (tableResult.rows.length > 0) {
+          const checkResult = await db.query<{ url: string; resolved: number }>(
+            `SELECT url, resolved FROM deferred WHERE url = ? AND resolved = 0`,
+            [deferredUrl],
           );
-          
-          deferredResolved = true;
-        } else {
-          // Deferred doesn't exist - worker was likely not spawned via swarm pattern
-          // This is non-fatal - just log for debugging
-          console.info(
-            `[swarm_complete] No deferred found for ${args.bead_id} - task may not be part of active swarm`,
-          );
+
+          if (checkResult.rows.length > 0) {
+            await db.query(
+              `UPDATE deferred SET resolved = 1, value = ? WHERE url = ? AND resolved = 0`,
+              [JSON.stringify({ completed: true, summary: args.summary }), deferredUrl],
+            );
+            deferredResolved = true;
+          } else {
+            console.info(
+              `[swarm_complete] No deferred found for ${args.bead_id} - task may not be part of active swarm`,
+            );
+          }
         }
       } catch (error) {
         // Non-fatal - deferred resolution is optional for backward compatibility
@@ -1551,7 +1550,6 @@ This will be recorded as a negative learning signal.`;
         } else {
           memoryError =
             "hivemind not available - learning stored in-memory only";
-          warnMissingTool("hivemind");
         }
       } catch (error) {
         memoryError = `Failed to store memory: ${error instanceof Error ? error.message : String(error)}`;
