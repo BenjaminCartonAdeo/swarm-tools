@@ -5,8 +5,26 @@
  * and utilities, with no PGLite references.
  */
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { rm } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createTestDatabasePath, removeTestDatabasePath } from "../test-utils/test-db.js";
+
+let testDbPath: string;
+let previousDbPath: string | undefined;
+
+beforeAll(async () => {
+  previousDbPath = process.env.SWARM_DB_PATH;
+  testDbPath = await createTestDatabasePath("swarm-index-test");
+  process.env.SWARM_DB_PATH = testDbPath;
+});
+
+afterAll(async () => {
+  await removeTestDatabasePath(testDbPath);
+  await rm(dirname(testDbPath), { recursive: true, force: true });
+  if (previousDbPath === undefined) delete process.env.SWARM_DB_PATH;
+  else process.env.SWARM_DB_PATH = previousDbPath;
+});
 
 describe("streams/index.ts module", () => {
   const indexPath = join(__dirname, "index.ts");
@@ -75,42 +93,29 @@ describe("streams/index.ts module", () => {
 });
 
 describe("getDatabasePath()", () => {
-  it("returns global path when no projectPath provided", async () => {
+  it("returns the configured test path when no projectPath is provided", async () => {
     const { getDatabasePath } = await import("./index");
-    const { homedir } = await import("node:os");
-    const { join } = await import("node:path");
-    
-    const expected = join(homedir(), ".config", "swarm-tools", "swarm.db");
-    
-    // With no argument - should use global
-    expect(getDatabasePath()).toBe(expected);
+    expect(getDatabasePath()).toBe(testDbPath);
   });
   
-  it("always returns global path even when projectPath provided", async () => {
-    // NEW BEHAVIOR: getDatabasePath always returns global path
-    // Project-local DBs are auto-migrated to global on first access
+  it("returns the configured test path even when projectPath is provided", async () => {
     const { getDatabasePath } = await import("./index");
-    const { homedir, tmpdir } = await import("node:os");
+    const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     
     const projectPath = join(tmpdir(), "test-project-" + Date.now());
-    const expected = join(homedir(), ".config", "swarm-tools", "swarm.db");
-    
     const result = getDatabasePath(projectPath);
-    expect(result).toBe(expected);
+    expect(result).toBe(testDbPath);
   });
   
-  it("always returns global path for worktree paths", async () => {
-    // NEW BEHAVIOR: getDatabasePath always returns global path
+  it("returns the configured test path for worktree paths", async () => {
     const { getDatabasePath } = await import("./index");
-    const { homedir, tmpdir } = await import("node:os");
+    const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     
     const projectPath = join(tmpdir(), "test-project-worktree-" + Date.now());
-    const expected = join(homedir(), ".config", "swarm-tools", "swarm.db");
-    
     const result = getDatabasePath(projectPath);
-    expect(result).toBe(expected);
+    expect(result).toBe(testDbPath);
   });
 });
 
@@ -134,14 +139,14 @@ describe("getDatabasePath() auto-migration", () => {
     const { getDatabasePath } = await import("./index");
     const { createClient } = await import("@libsql/client");
     const { existsSync, mkdirSync, rmSync } = await import("node:fs");
-    const { tmpdir, homedir } = await import("node:os");
+    const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     
     // Create temp project with real SQLite DB
     const projectPath = join(tmpdir(), `test-auto-migrate-${Date.now()}`);
     const localDbDir = join(projectPath, ".opencode");
     const localDbPath = join(localDbDir, "streams.db");
-    const globalDbPath = join(homedir(), ".config", "swarm-tools", "swarm.db");
+    const expectedDbPath = testDbPath;
     
     try {
       mkdirSync(localDbDir, { recursive: true });
@@ -156,7 +161,7 @@ describe("getDatabasePath() auto-migration", () => {
       const result = getDatabasePath(projectPath);
       
       // Should return global path immediately
-      expect(result).toBe(globalDbPath);
+      expect(result).toBe(expectedDbPath);
       
       // Wait for migration to complete (fire-and-forget)
       await new Promise(resolve => setTimeout(resolve, 200));
@@ -183,24 +188,22 @@ describe("getDatabasePath() auto-migration", () => {
     // Call getDatabasePath - should NOT trigger migration (no local DB)
     const result = getDatabasePath(projectPath);
     
-    // Should return global path
-    const { homedir } = await import("node:os");
-    const expectedGlobal = join(homedir(), ".config", "swarm-tools", "swarm.db");
-    expect(result).toBe(expectedGlobal);
+    // Should return the configured test path
+    expect(result).toBe(testDbPath);
   });
   
   it("only migrates once (idempotent)", async () => {
     const { getDatabasePath } = await import("./index");
     const { createClient } = await import("@libsql/client");
     const { existsSync, mkdirSync, rmSync } = await import("node:fs");
-    const { tmpdir, homedir } = await import("node:os");
+    const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     
     // Create temp project with real SQLite DB
     const projectPath = join(tmpdir(), `test-idempotent-${Date.now()}`);
     const localDbDir = join(projectPath, ".opencode");
     const localDbPath = join(localDbDir, "streams.db");
-    const globalDbPath = join(homedir(), ".config", "swarm-tools", "swarm.db");
+    const expectedDbPath = testDbPath;
     
     try {
       mkdirSync(localDbDir, { recursive: true });
@@ -224,7 +227,7 @@ describe("getDatabasePath() auto-migration", () => {
       const result = getDatabasePath(projectPath);
       
       // Should still return global path
-      expect(result).toBe(globalDbPath);
+      expect(result).toBe(expectedDbPath);
       
       // Wait a bit to ensure no second migration happened
       await new Promise(resolve => setTimeout(resolve, 50));

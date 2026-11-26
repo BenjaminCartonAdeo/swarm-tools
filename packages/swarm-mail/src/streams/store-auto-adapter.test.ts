@@ -5,20 +5,33 @@
  * This was the bug: functions threw "dbOverride parameter is required" error.
  */
 import { rm } from "node:fs/promises";
-import { describe, it, expect, afterEach } from "vitest";
+import { dirname } from "node:path";
+import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import { createEvent } from "./events";
-import { getDatabasePath } from "./index";
 import { appendEvent, clearAdapterCache } from "./store";
+import { createTestDatabasePath, removeTestDatabasePath } from "../test-utils/test-db.js";
 
 describe("Store Auto-Adapter Resolution", () => {
+  let testDbPath: string;
+  let previousDbPath: string | undefined;
+
+  beforeAll(async () => {
+    previousDbPath = process.env.SWARM_DB_PATH;
+    testDbPath = await createTestDatabasePath("swarm-store-adapter-test");
+    process.env.SWARM_DB_PATH = testDbPath;
+  });
+
   afterEach(async () => {
-    // Clean up
     clearAdapterCache();
-    try {
-      await rm(getDatabasePath(), { force: true });
-    } catch {
-      // Ignore
-    }
+    await removeTestDatabasePath(testDbPath);
+  });
+
+  afterAll(async () => {
+    clearAdapterCache();
+    await removeTestDatabasePath(testDbPath);
+    await rm(dirname(testDbPath), { recursive: true, force: true });
+    if (previousDbPath === undefined) delete process.env.SWARM_DB_PATH;
+    else process.env.SWARM_DB_PATH = previousDbPath;
   });
 
   it("appendEvent works WITHOUT explicit dbOverride", async () => {

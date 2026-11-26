@@ -8,11 +8,10 @@
  * - Edge cases and error handling
  * - Persistence to libSQL via Drizzle ORM
  */
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import { rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
+import { dirname } from "node:path";
 import {
   AgentEventSchema,
   AgentRegisteredEventSchema,
@@ -1624,16 +1623,29 @@ describe("ValidationCompletedEventSchema", () => {
 import { getDatabasePath } from "./index.js";
 import { appendEvent, readEvents } from "./store-drizzle.js";
 import { clearAdapterCache } from "./store.js";
+import { createTestDatabasePath, removeTestDatabasePath } from "../test-utils/test-db.js";
 
 describe("appendEvent persistence to libSQL", () => {
+  let testDbPath: string;
+  let previousDbPath: string | undefined;
+
+  beforeAll(async () => {
+    previousDbPath = process.env.SWARM_DB_PATH;
+    testDbPath = await createTestDatabasePath("swarm-events-test");
+    process.env.SWARM_DB_PATH = testDbPath;
+  });
+
   afterEach(async () => {
-    // Clean up test database
     clearAdapterCache();
-    try {
-      await rm(getDatabasePath("/tmp/test-persistence"), { force: true });
-    } catch {
-      // Ignore cleanup errors
-    }
+    await removeTestDatabasePath(testDbPath);
+  });
+
+  afterAll(async () => {
+    clearAdapterCache();
+    await removeTestDatabasePath(testDbPath);
+    await rm(dirname(testDbPath), { recursive: true, force: true });
+    if (previousDbPath === undefined) delete process.env.SWARM_DB_PATH;
+    else process.env.SWARM_DB_PATH = previousDbPath;
   });
 
   it("appendEvent writes to libSQL and persists across calls", async () => {
@@ -1726,8 +1738,7 @@ describe("appendEvent persistence to libSQL", () => {
     expect(events[0]?.type).toBe("message_sent");
   });
 
-  it("verifies database path resolves correctly", async () => {
-    // NEW BEHAVIOR: Database is always at global path ~/.config/swarm-tools/swarm.db
+  it("verifies database path resolves to the isolated test database", async () => {
     const projectPath = "/tmp/test-persistence";
     
     const event = createEvent("agent_registered", {
@@ -1739,9 +1750,8 @@ describe("appendEvent persistence to libSQL", () => {
 
     await appendEvent(event, projectPath);
 
-    // Verify database file exists at global location
-    const expectedDbPath = join(homedir(), ".config", "swarm-tools", "swarm.db");
-    expect(existsSync(expectedDbPath)).toBe(true);
+    expect(getDatabasePath()).toBe(testDbPath);
+    expect(existsSync(testDbPath)).toBe(true);
   });
 
   it("appendEvent increments sequence number", async () => {
