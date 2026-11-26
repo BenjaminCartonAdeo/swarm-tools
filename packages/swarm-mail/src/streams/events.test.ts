@@ -1622,7 +1622,7 @@ describe("ValidationCompletedEventSchema", () => {
 
 import { getDatabasePath } from "./index.js";
 import { appendEvent, readEvents } from "./store-drizzle.js";
-import { clearAdapterCache } from "./store.js";
+import { closeAndClearAdapterCache } from "./store.js";
 import { createTestDatabasePath, removeTestDatabasePath } from "../test-utils/test-db.js";
 
 describe("appendEvent persistence to libSQL", () => {
@@ -1636,12 +1636,12 @@ describe("appendEvent persistence to libSQL", () => {
   });
 
   afterEach(async () => {
-    clearAdapterCache();
+    await closeAndClearAdapterCache();
     await removeTestDatabasePath(testDbPath);
   });
 
   afterAll(async () => {
-    clearAdapterCache();
+    await closeAndClearAdapterCache();
     await removeTestDatabasePath(testDbPath);
     await rm(dirname(testDbPath), { recursive: true, force: true });
     if (previousDbPath === undefined) delete process.env.SWARM_DB_PATH;
@@ -1697,7 +1697,7 @@ describe("appendEvent persistence to libSQL", () => {
     await appendEvent(event, projectPath);
 
     // Clear adapter cache to force new connection
-    clearAdapterCache();
+    await closeAndClearAdapterCache();
 
     // Read from a fresh connection - should still see the event
     const readResult = await readEvents(

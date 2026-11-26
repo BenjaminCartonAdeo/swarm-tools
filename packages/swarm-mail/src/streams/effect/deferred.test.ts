@@ -12,8 +12,12 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
+import { dirname } from "node:path";
 import { Effect } from "effect";
+import { createLibSQLAdapter } from "../../libsql";
 import { createInMemorySwarmMailLibSQL } from "../../libsql.convenience";
+import { createTestDatabasePath, removeTestDatabasePath } from "../../test-utils/test-db";
 import type { DatabaseAdapter } from "../../types/database";
 import {
   TimeoutError,
@@ -22,6 +26,7 @@ import {
   resolveDeferred,
   rejectDeferred,
   cleanupDeferreds,
+  DurableDeferred,
   DurableDeferredLive,
 } from "./deferred";
 
@@ -360,5 +365,41 @@ describe("DurableDeferred", () => {
         program.pipe(Effect.provide(DurableDeferredLive)),
       );
     });
+  });
+});
+
+describe("DurableDeferred cross-connection resolution", () => {
+  it("observes a resolution written by a separate connection", async () => {
+    const path = await createTestDatabasePath("swarm-deferred-cross");
+    const creatorDb = await createLibSQLAdapter({ url: `file:${path}` });
+    const waiterDb = await createLibSQLAdapter({ url: `file:${path}` });
+    try {
+      const handle = await Effect.runPromise(
+        createDeferred<{ ok: boolean }>({
+          ttlSeconds: 5,
+          db: creatorDb,
+          key: "cross-connection",
+        }).pipe(Effect.provide(DurableDeferredLive)),
+      );
+
+      const waiting = Effect.runPromise(
+        Effect.gen(function* () {
+          const service = yield* DurableDeferred;
+          return yield* service.await<{ ok: boolean }>(handle.url, 5, waiterDb);
+        }).pipe(Effect.provide(DurableDeferredLive)),
+      );
+
+      await creatorDb.query(
+        `UPDATE deferred SET resolved = 1, value = ? WHERE url = ?`,
+        [JSON.stringify({ ok: true }), handle.url],
+      );
+
+      await expect(waiting).resolves.toEqual({ ok: true });
+    } finally {
+      await creatorDb.close();
+      await waiterDb.close();
+      await removeTestDatabasePath(path);
+      await rm(dirname(path), { recursive: true, force: true });
+    }
   });
 });

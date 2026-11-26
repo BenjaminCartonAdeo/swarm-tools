@@ -29,6 +29,16 @@ export function clearAdapterCache(): void {
   adapterCache.clear();
 }
 
+/** Close cached adapters, then clear the cache. @internal */
+export async function closeAndClearAdapterCache(): Promise<void> {
+  const adapters = [...adapterCache.values()];
+  try {
+    await Promise.all(adapters.map((adapter) => adapter.close?.() ?? Promise.resolve()));
+  } finally {
+    adapterCache.clear();
+  }
+}
+
 /**
  * Get or create a DatabaseAdapter
  * 

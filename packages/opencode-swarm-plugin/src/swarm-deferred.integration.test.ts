@@ -5,9 +5,9 @@
  * Workers resolve a deferred when completing, coordinators await it.
  */
 import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { Effect, pipe } from "effect";
 import type { DatabaseAdapter } from "../../swarm-mail/src/types/database";
 import type { SwarmMailAdapter } from "../../swarm-mail/src/adapter";
@@ -17,6 +17,7 @@ import { createHiveAdapter } from "../../swarm-mail/src/hive/adapter";
 import { DurableDeferred, DurableDeferredLive } from "../../swarm-mail/src/streams/effect/deferred";
 import { swarm_complete } from "./swarm-orchestrate";
 import { getHiveAdapter } from "./hive";
+import { resetToolCache } from "./tool-availability";
 
 describe("swarm_complete DurableDeferred integration", () => {
   let swarmMail: SwarmMailAdapter;
@@ -63,6 +64,22 @@ describe("swarm_complete DurableDeferred integration", () => {
       priority: 2,
       status: "in_progress",
     });
+
+    const binDir = await mkdtemp(join(tmpdir(), "swarm-no-hivemind-"));
+    const marker = join(binDir, "hivemind-called");
+    await writeFile(
+      join(binDir, "hivemind"),
+      `#!/bin/sh\necho "$@" >> "${marker}"\nexit 1\n`,
+      { mode: 0o755 },
+    );
+    await writeFile(join(binDir, "semantic-memory"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    for (const command of ["which", "git"]) {
+      const resolved = Bun.which(command);
+      if (resolved) await symlink(resolved, join(binDir, command));
+    }
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${binDir}${delimiter}${originalPath ?? ""}`;
+    resetToolCache();
     const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
     try {
       const result = JSON.parse(await swarm_complete.execute({
@@ -83,11 +100,15 @@ describe("swarm_complete DurableDeferred integration", () => {
       expect(result.success).toBe(true);
       expect(result.deferred_resolved).toBe(false);
       expect(result.deferred_error).toBeUndefined();
+      expect(await Bun.file(marker).exists()).toBe(false);
       const warnings = warnSpy.mock.calls.map((call) => call.join(" "));
       expect(warnings.some((warning) => warning.includes("deferred"))).toBe(false);
       expect(warnings.some((warning) => warning.includes("hivemind"))).toBe(false);
     } finally {
       warnSpy.mockRestore();
+      process.env.PATH = originalPath;
+      resetToolCache();
+      await rm(binDir, { recursive: true, force: true });
     }
   });
 

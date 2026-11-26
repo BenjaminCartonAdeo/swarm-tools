@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { access, mkdir, rm, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { access, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import {
   assertSafeTestDatabasePath,
   createTestDatabasePath,
@@ -15,6 +15,17 @@ describe("test database path safety", () => {
 
   it("accepts an isolated temporary database path", () => {
     expect(() => assertSafeTestDatabasePath("/tmp/swarm-test-isolated/swarm.db")).not.toThrow();
+  });
+
+  it("rejects a symlink to the real global database", async () => {
+    const path = await createTestDatabasePath("swarm-test-symlink");
+    const link = join(dirname(path), "global-link.db");
+    await symlink(GLOBAL_DATABASE_PATH, link);
+    try {
+      expect(() => assertSafeTestDatabasePath(link)).toThrow(/global database/i);
+    } finally {
+      await rm(dirname(path), { recursive: true, force: true });
+    }
   });
 
   it("creates a database path outside the global location", async () => {

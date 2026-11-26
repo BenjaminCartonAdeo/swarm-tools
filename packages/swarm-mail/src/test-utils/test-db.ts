@@ -1,11 +1,25 @@
+import { existsSync, realpathSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 export const GLOBAL_DATABASE_PATH = join(homedir(), ".config", "swarm-tools", "swarm.db");
 
+function canonicalPath(path: string): string {
+  const absolute = resolve(path);
+  let ancestor = absolute;
+  const suffix: string[] = [];
+  while (!existsSync(ancestor)) {
+    const parent = dirname(ancestor);
+    if (parent === ancestor) break;
+    suffix.unshift(basename(ancestor));
+    ancestor = parent;
+  }
+  return resolve(realpathSync(ancestor), ...suffix);
+}
+
 export function assertSafeTestDatabasePath(path: string): void {
-  if (resolve(path) === resolve(GLOBAL_DATABASE_PATH)) {
+  if (canonicalPath(path) === canonicalPath(GLOBAL_DATABASE_PATH)) {
     throw new Error(`Refusing to use the global database in tests: ${GLOBAL_DATABASE_PATH}`);
   }
 }
