@@ -109,9 +109,9 @@ export async function validateSchema(
       continue;
     }
 
-    // Get actual columns
+    // Get actual columns. table_xinfo includes generated columns such as events.sequence.
     const actualColumns = await client.execute({
-      sql: `PRAGMA table_info(${tableName})`,
+      sql: `PRAGMA table_xinfo(${tableName})`,
       args: [],
     });
 

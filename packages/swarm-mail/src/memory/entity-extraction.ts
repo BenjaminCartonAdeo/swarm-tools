@@ -149,6 +149,10 @@ export async function extractEntitiesAndRelationships(
   content: string,
   config: { model?: string; apiKey?: string; languageModel?: LanguageModel }
 ): Promise<ExtractionResult> {
+  if (!config.languageModel && !config.apiKey) {
+    return { entities: [], relationships: [] };
+  }
+
   try {
     // Support both string model names (AI Gateway) and LanguageModel instances (Ollama)
     const modelConfig = config.languageModel

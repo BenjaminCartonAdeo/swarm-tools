@@ -4,52 +4,60 @@
  * Tests cross-agent task completion signaling using DurableDeferred.
  * Workers resolve a deferred when completing, coordinators await it.
  */
-import { beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Effect, pipe } from "effect";
 import type { DatabaseAdapter } from "../../swarm-mail/src/types/database";
 import type { SwarmMailAdapter } from "../../swarm-mail/src/adapter";
 import type { HiveAdapter } from "../../swarm-mail/src/hive/adapter";
-import { createInMemorySwarmMailLibSQL } from "../../swarm-mail/src/libsql.convenience";
+import { closeAllSwarmMailLibSQL, getSwarmMailLibSQL } from "../../swarm-mail/src/libsql.convenience";
 import { createHiveAdapter } from "../../swarm-mail/src/hive/adapter";
-import { beadsMigrationLibSQL, cellsViewMigrationLibSQL, beadsResultColumnsMigrationLibSQL } from "../../swarm-mail/src/hive/migrations";
 import { DurableDeferred, DurableDeferredLive } from "../../swarm-mail/src/streams/effect/deferred";
 import { swarm_complete } from "./swarm-orchestrate";
+import { getHiveAdapter } from "./hive";
 
 describe("swarm_complete DurableDeferred integration", () => {
   let swarmMail: SwarmMailAdapter;
   let hive: HiveAdapter;
   let db: DatabaseAdapter;
   let projectKey: string;
+  let beadId: string;
+  let testDirectory: string;
+  let previousDbPath: string | undefined;
 
   beforeAll(async () => {
-    // Use in-memory libSQL database
-    swarmMail = await createInMemorySwarmMailLibSQL("test-deferred-integration");
-    db = await swarmMail.getDatabase();
+    previousDbPath = process.env.SWARM_DB_PATH;
+    testDirectory = await mkdtemp(join(tmpdir(), "swarm-deferred-test-"));
+    process.env.SWARM_DB_PATH = join(testDirectory, "swarm.db");
     projectKey = "/tmp/test-deferred-integration";
 
-    // Run hive migrations to create beads tables
-    await db.exec(beadsMigrationLibSQL.up);
-    await db.exec(cellsViewMigrationLibSQL.up);
-    await db.exec(beadsResultColumnsMigrationLibSQL.up);
-
-    // Register test agent using swarm-mail adapter
-    await swarmMail.registerAgent(projectKey, "TestWorker");
-
-    // Create Hive adapter for cell management
+    swarmMail = await getSwarmMailLibSQL(projectKey);
+    db = await swarmMail.getDatabase();
     hive = createHiveAdapter(db, projectKey);
+    await hive.runMigrations();
 
-    // Create test cell using Hive adapter
-    await hive.createCell(projectKey, {
+    await swarmMail.registerAgent(projectKey, "TestWorker");
+    const cell = await hive.createCell(projectKey, {
       title: "Test Task",
       type: "task",
       priority: 2,
       status: "in_progress",
-      id: "test-bead-123",
     });
+    beadId = cell.id;
+  });
+
+  afterAll(async () => {
+    await closeAllSwarmMailLibSQL();
+    if (previousDbPath === undefined) delete process.env.SWARM_DB_PATH;
+    else process.env.SWARM_DB_PATH = previousDbPath;
+    await rm(testDirectory, { recursive: true, force: true });
   });
 
   it("should resolve deferred when swarm_complete is called", async () => {
-    const beadId = "test-bead-123";
+    expect(await hive.getCell(projectKey, beadId)).not.toBeNull();
+    expect(await (await getHiveAdapter(projectKey)).getCell(projectKey, beadId)).not.toBeNull();
 
     // First create deferred (coordinator side)
     const createProgram = Effect.gen(function* () {
@@ -59,6 +67,7 @@ describe("swarm_complete DurableDeferred integration", () => {
       const handle = yield* service.create({
         ttlSeconds: 60,
         db,
+        key: beadId,
       });
 
       expect(handle.url).toMatch(/^deferred:/);
@@ -85,31 +94,20 @@ describe("swarm_complete DurableDeferred integration", () => {
         bead_id: beadId,
         summary: "Task completed successfully",
         start_time: Date.now() - 1500,
-        skip_verification: true, // Skip verification for test
+        skip_verification: true,
+        skip_review: true,
       },
       mockContext
     );
 
     const parsed = JSON.parse(completeResult);
     expect(parsed.success).toBe(true);
+    expect(parsed.closed).toBe(true);
 
-    // TODO: Resolve the deferred in swarm_complete implementation
-    // For now, manually resolve to verify await works
-    const resolveProgram = Effect.gen(function* () {
-      const service = yield* DurableDeferred;
-      yield* service.resolve(deferredUrl, { completed: true }, db);
-    });
-
-    await Effect.runPromise(
-      pipe(resolveProgram, Effect.provide(DurableDeferredLive))
-    );
-
-    // Coordinator awaits completion
+    // Coordinator awaits the real completion signal written by swarm_complete.
     const awaitProgram = Effect.gen(function* () {
       const service = yield* DurableDeferred;
-      const result = yield* service.await(deferredUrl, 60, db);
-      
-      expect(result).toEqual({ completed: true });
+      const result = yield* service.await(deferredUrl, 5, db);
       return result;
     });
 
@@ -117,7 +115,7 @@ describe("swarm_complete DurableDeferred integration", () => {
       pipe(awaitProgram, Effect.provide(DurableDeferredLive))
     );
 
-    expect(result).toEqual({ completed: true });
+    expect(result).toEqual({ completed: true, summary: "Task completed successfully" });
   });
 
   it("should timeout if deferred is never resolved", async () => {

@@ -18,7 +18,7 @@
  * - Cleans up expired entries automatically
  */
 
-import { Context, Deferred, Duration, Effect, Layer } from "effect";
+import { Context, Duration, Effect, Layer } from "effect";
 import { nanoid } from "nanoid";
 import type { DatabaseAdapter } from "../../types/database";
 
@@ -71,6 +71,8 @@ export interface DeferredConfig {
   readonly ttlSeconds: number;
   /** Database adapter for storage */
   readonly db: DatabaseAdapter;
+  /** Optional stable key; produces `deferred:<key>` instead of a random URL. */
+  readonly key?: string;
 }
 
 // ============================================================================
@@ -134,12 +136,6 @@ export class DurableDeferred extends Context.Tag("DurableDeferred")<
 // ============================================================================
 
 /**
- * In-memory registry of active deferreds
- * Maps URL -> Effect.Deferred for instant resolution without polling
- */
-const activeDefersMap = new Map<string, Deferred.Deferred<unknown, Error>>();
-
-/**
  * Ensure deferred table exists in database (SQLite syntax)
  */
 async function ensureDeferredTable(db: DatabaseAdapter): Promise<void> {
@@ -185,19 +181,15 @@ function createImpl<T>(
   config: DeferredConfig,
 ): Effect.Effect<DeferredHandle<T>> {
   return Effect.gen(function* () {
-    const { db, ttlSeconds } = config;
-    
+    const { db, ttlSeconds, key } = config;
+
     // Ensure table exists
     yield* Effect.promise(() => ensureDeferredTable(db));
 
-    // Generate unique URL
-    const url = `deferred:${nanoid()}`;
+    // Generate a unique URL or use the caller's stable key.
+    const url = key === undefined ? `deferred:${nanoid()}` : `deferred:${key}`;
     const expiresAt = Date.now() + ttlSeconds * 1000;
     const createdAt = Date.now();
-
-    // Create Effect.Deferred for instant resolution
-    const deferred = yield* Deferred.make<T, Error>();
-    activeDefersMap.set(url, deferred as Deferred.Deferred<unknown, Error>);
 
     // Insert into database (use parameterized query)
     yield* Effect.promise(() =>
@@ -250,15 +242,6 @@ function resolveImpl<T>(
         [serializedValue, url],
       ),
     );
-
-    // Resolve in-memory deferred if it exists
-    const deferred = activeDefersMap.get(url);
-    if (deferred) {
-      yield* Deferred.succeed(deferred, value as unknown) as Effect.Effect<
-        boolean,
-        never
-      >;
-    }
   });
 }
 
@@ -293,17 +276,11 @@ function rejectImpl(
         [error.message, url],
       ),
     );
-
-    // Reject in-memory deferred if it exists
-    const deferred = activeDefersMap.get(url);
-    if (deferred) {
-      yield* Deferred.fail(deferred, error) as Effect.Effect<boolean, never>;
-    }
   });
 }
 
 /**
- * Await implementation (uses in-memory deferred if available, otherwise polls)
+ * Await implementation (polls the database so cross-process resolution works)
  */
 function awaitImpl<T>(
   url: string,
@@ -313,30 +290,6 @@ function awaitImpl<T>(
   return Effect.gen(function* () {
     yield* Effect.promise(() => ensureDeferredTable(db));
 
-    // Check if we have an in-memory deferred
-    const deferred = activeDefersMap.get(url);
-    if (deferred) {
-      // Use in-memory deferred with timeout
-      const result = yield* Deferred.await(deferred as Deferred.Deferred<T, Error>).pipe(
-        Effect.timeoutFail({
-          duration: Duration.seconds(ttlSeconds),
-          onTimeout: () => new TimeoutError(url, ttlSeconds),
-        }),
-        Effect.catchAll((error) =>
-          Effect.fail(
-            error instanceof NotFoundError || error instanceof TimeoutError
-              ? error
-              : new NotFoundError(url),
-          ),
-        ),
-      );
-
-      // Cleanup
-      activeDefersMap.delete(url);
-      return result as T;
-    }
-
-    // Fall back to polling database
     const startTime = Date.now();
     const timeoutMs = ttlSeconds * 1000;
 

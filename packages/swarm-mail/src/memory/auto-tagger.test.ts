@@ -7,7 +7,7 @@
  * These tests are skipped in CI or when the API is unavailable/rate-limited.
  */
 
-import { describe, test, expect, beforeAll } from "bun:test";
+import { describe, test, expect, beforeAll, mock } from "bun:test";
 import { generateTags } from "./auto-tagger.js";
 
 const HAS_API_KEY = Boolean(process.env.AI_GATEWAY_API_KEY);
@@ -104,26 +104,21 @@ describe("generateTags", () => {
     ).toBe(true);
   });
 
-  test("handles LLM errors gracefully - returns empty result without throwing", async () => {
-    const content = "Test content";
-    const badConfig = {
-      model: "invalid-model",
-      apiKey: "invalid-key",
-    };
-    
-    // Should not throw - graceful degradation
-    const result = await generateTags(content, undefined, badConfig);
-    
-    expect(result).toHaveProperty("tags");
-    expect(result).toHaveProperty("keywords");
-    expect(result).toHaveProperty("category");
-    expect(Array.isArray(result.tags)).toBe(true);
-    expect(Array.isArray(result.keywords)).toBe(true);
-    expect(typeof result.category).toBe("string");
-    // Empty result on error
-    expect(result.tags.length).toBe(0);
-    expect(result.keywords.length).toBe(0);
-    expect(result.category).toBe("");
+  test("skips the LLM call without logging when no API key is configured", async () => {
+    const originalError = console.error;
+    const errorSpy = mock(() => {});
+    console.error = errorSpy;
+    try {
+      const result = await generateTags("Test content", undefined, {
+        model: "anthropic/claude-haiku-4-5",
+        apiKey: "",
+      });
+
+      expect(result).toEqual({ tags: [], keywords: [], category: "" });
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      console.error = originalError;
+    }
   });
 
   test.skipIf(SKIP_LLM_TESTS)("different content produces different tags", async () => {

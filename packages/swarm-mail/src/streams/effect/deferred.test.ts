@@ -59,6 +59,24 @@ describe("DurableDeferred", () => {
       );
     });
 
+    it("uses a caller-provided key as the deferred URL", async () => {
+      const program = Effect.gen(function* (_) {
+        const handle = yield* _(
+          createDeferred<string>({
+            ttlSeconds: 60,
+            db,
+            key: "bead-123",
+          }),
+        );
+
+        expect(handle.url).toBe("deferred:bead-123");
+      });
+
+      await Effect.runPromise(
+        program.pipe(Effect.provide(DurableDeferredLive)),
+      );
+    });
+
     it("creates multiple deferreds with different URLs", async () => {
       const program = Effect.gen(function* (_) {
         const handle1 = yield* _(
