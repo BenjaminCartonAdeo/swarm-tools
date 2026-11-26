@@ -398,6 +398,51 @@ describe("work unit effect runner", () => {
     expect(effect.state).toBe("succeeded");
   });
 
+  test("preCompletionReadFailureRecordsUnknownAndClearsClaim", async () => {
+    const db = await seedUnit([{ effectId: "eff-c", kind: "backend_complete", mandatory: true, request: COMPLETE_ARGS }]);
+    const ports = fakePorts();
+    ports.readHiveCell = async () => { throw new Error("hive unavailable"); };
+
+    const effect = await runWorkUnitEffect(db, { effectId: "eff-c", host: HOST, ports });
+
+    expect(effect.state).toBe("unknown");
+    expect(effect.claim_token).toBeNull();
+    expect(JSON.parse(effect.error_json!)).toMatchObject({ message: "hive unavailable" });
+  });
+
+  test("definitePreCompletionReadFailureRecordsFailedMandatory", async () => {
+    const db = await seedUnit([{ effectId: "eff-c", kind: "backend_complete", mandatory: true, request: COMPLETE_ARGS }]);
+    const ports = fakePorts();
+    ports.readHiveCell = async () => { throw new DefiniteEffectError("cell read rejected"); };
+
+    const effect = await runWorkUnitEffect(db, { effectId: "eff-c", host: HOST, ports });
+
+    expect(effect.state).toBe("failed_mandatory");
+    expect(effect.claim_token).toBeNull();
+    expect(JSON.parse(effect.error_json!)).toMatchObject({ name: "DefiniteEffectError", message: "cell read rejected" });
+  });
+
+  test("postCompletionReadFailureRetriesWithoutDuplicateSideEffect", async () => {
+    const db = await seedUnit([{ effectId: "eff-c", kind: "backend_complete", mandatory: true, request: COMPLETE_ARGS }]);
+    let readCount = 0;
+    const ports = fakePorts();
+    ports.readHiveCell = async () => {
+      readCount += 1;
+      if (readCount === 1) return { status: "open" };
+      if (readCount === 2) throw new Error("hive unavailable after completion");
+      return { status: "closed", completionOperationId: "eff-c" };
+    };
+
+    const first = await runWorkUnitEffect(db, { effectId: "eff-c", host: HOST, ports });
+    expect(first.state).toBe("unknown");
+    expect(first.claim_token).toBeNull();
+    expect(JSON.parse(first.error_json!)).toMatchObject({ message: "hive unavailable after completion" });
+
+    const retried = await runWorkUnitEffect(db, { effectId: "eff-c", host: HOST, ports });
+    expect(retried.state).toBe("succeeded");
+    expect(ports.calls).toEqual([{ name: "swarm_complete", args: { ...COMPLETE_ARGS, operation_id: "eff-c" } }]);
+  });
+
   test("null cell retries complete and ambiguous tool error stays unknown", async () => {
     const db = await seedUnit([{ effectId: "eff-c", kind: "backend_complete", mandatory: true, request: COMPLETE_ARGS }]);
     const ports = fakePorts({ cells: [null], tool: async () => { throw new Error("socket hang up"); } });

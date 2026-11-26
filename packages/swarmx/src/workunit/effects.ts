@@ -482,7 +482,12 @@ export async function runWorkUnitEffect(
   });
   if (claim === null) return (await getEffect(db, effect.effect_id)) ?? effect;
 
-  const outcome = await executeEffect(unit, mission, claim.effect, input.ports);
+  let outcome: Outcome;
+  try {
+    outcome = await executeEffect(unit, mission, claim.effect, input.ports);
+  } catch (error) {
+    outcome = ambiguousOrDefinite(error);
+  }
   return recordEffectResult(db, { effectId: effect.effect_id, claimToken: claim.claimToken, ...outcome });
 }
 
