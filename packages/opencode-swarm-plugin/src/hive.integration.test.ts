@@ -2090,6 +2090,20 @@ describe("beads integration", () => {
       expect(cells[0]).toHaveProperty("completion_operation_id", null);
     });
 
+    it("preserves completion identity for full ID lookup", async () => {
+      const completionOperationId = `complete-${testCellId}`;
+      await adapter.closeCell(TEST_PROJECT_KEY, testCellId, "done", {
+        completion_operation_id: completionOperationId,
+      });
+      const { hive_cells } = await import("./hive");
+
+      const result = await hive_cells.execute({ id: testCellId }, mockContext);
+      const cells = parseResponse<Cell[]>(result);
+
+      expect(cells).toHaveLength(1);
+      expect(cells[0].completion_operation_id).toBe(completionOperationId);
+    });
+
     it("throws error for non-existent ID", async () => {
       const { hive_cells } = await import("./hive");
       
