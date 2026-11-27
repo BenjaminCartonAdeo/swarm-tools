@@ -1008,6 +1008,50 @@ describe("mission gate → settle sequence", () => {
     ).rejects.toThrow(/worker dispatch capability is revoked, unbound, or not owned by this session/);
   });
 
+  test("swarmmail_init accepts a caller name that differs only in case or separators", async () => {
+    const projectPath = await realpath(process.cwd());
+    const rig = await createLifecycleRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-init-normalized", epicID: "epic-1" },
+    });
+    await dispatchWorker(rig, "cell-init-normalized", "call-dispatch-init-normalized");
+
+    await rig.tools.get("swarmmail_init")?.execute(
+      { project_path: projectPath, agent_name: "SWARM_Worker", task_description: "normalized" },
+      workerToolContext("swarm/swarm-worker", "call-init-normalized"),
+    );
+
+    expect(rig.runCalls).toEqual([
+      {
+        name: "swarmmail_init",
+        args: {
+          project_path: projectPath,
+          agent_name: "swarm-worker",
+          task_description: "normalized",
+        },
+      },
+    ]);
+  });
+
+  test("swarmmail_init still rejects another agent's name", async () => {
+    const projectPath = await realpath(process.cwd());
+    const rig = await createLifecycleRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-init-spoof", epicID: "epic-1" },
+    });
+    await dispatchWorker(rig, "cell-init-spoof", "call-dispatch-init-spoof");
+
+    await expect(
+      rig.tools.get("swarmmail_init")?.execute(
+        { project_path: projectPath, agent_name: "swarm-coordinator", task_description: "spoof" },
+        workerToolContext("swarm/swarm-worker", "call-init-spoof-normalized"),
+      ),
+    ).rejects.toThrow(/agent_name must match the V2 caller/);
+    expect(rig.runCalls).toHaveLength(0);
+  });
+
   test("first worker mutation binds the dispatch capability before swarmmail_init", async () => {
     const rig = await createLifecycleRig({
       agents: GATE_AGENTS,

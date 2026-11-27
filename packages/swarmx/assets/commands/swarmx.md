@@ -115,9 +115,11 @@ appliqué par `model-tier-router`, pas par swarmx.
 
 ## Phase 3 — Prompt & dispatch
 
-1. Pour la cellule de recherche, après création de l'épic et persistance de son affectation,
-   appelle `swarm_spawn_researcher({research_id, epic_id, tech_stack, project_path})`.
-   C'est un générateur de prompt, **pas** un dispatch. Place son résultat dans
+1. Pour la cellule de recherche ou d'audit, après création de l'épic et persistance de son
+   affectation, appelle `swarm_spawn_researcher({research_id, epic_id, tech_stack, project_path})`.
+   Pour une cellule d'audit de code, ajoute `cell_kind: "audit"` : le prompt devient un audit
+   lecture seule (preuves `file:line`, aucune écriture) et `tech_stack` liste les fichiers à
+   auditer. C'est un générateur de prompt, **pas** un dispatch. Place son résultat dans
    `subtask_description` ou `shared_context`.
 2. Par tentative de dispatch : `swarm_subtask_prompt({agent_name, bead_id, epic_id,
     subtask_title, subtask_description, files, shared_context})` — **une seule fois**. `files` doit contenir

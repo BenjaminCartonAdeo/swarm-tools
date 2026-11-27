@@ -4062,6 +4062,17 @@ async function requireCoordinatorOrMissionOwner(
   }
 }
 
+function matchesAgentIdentity(requested: unknown, expected: string): boolean {
+  if (typeof requested !== "string") return false;
+  const normalize = (value: string) =>
+    value
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+  return normalize(requested) === normalize(expected);
+}
+
 async function bindSwarmMailIdentity(
   runtime: SwarmxRuntime,
   context: ToolExecuteContextLike,
@@ -4079,8 +4090,16 @@ async function bindSwarmMailIdentity(
     throw new LocalToolError("swarmmail_init", "agent_unknown", "the V2 caller is not present in the agent roster");
   }
   const requestedName = input.agent_name;
-  if (requestedName !== undefined && requestedName !== caller.id && requestedName !== caller.name) {
-    throw new LocalToolError("swarmmail_init", "conflict", "agent_name must match the V2 caller");
+  if (
+    requestedName !== undefined &&
+    !matchesAgentIdentity(requestedName, caller.id) &&
+    !matchesAgentIdentity(requestedName, caller.name)
+  ) {
+    throw new LocalToolError(
+      "swarmmail_init",
+      "conflict",
+      `agent_name must match the V2 caller (${caller.name})`,
+    );
   }
   if ((await resolveCallerMode(runtime, context, "swarmmail_init")) !== "primary") {
     await requireAssignedWorkerScope(runtime, context, "swarmmail_init");

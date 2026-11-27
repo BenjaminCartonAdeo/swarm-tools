@@ -88,16 +88,18 @@ identified, stop and ask rather than inventing one or passing an empty list.
    editing.
 2. Report progress with `swarm_progress`; store reusable findings with `hivemind_store`.
 3. Wait for the asynchronous `<subagent>` completion report. Call
-   `swarm_review({project_key, epic_id, task_id, files_touched})` with a non-empty list of
-   that cell's reported paths; compare its scoped diff to acceptance criteria, then send
-   `swarm_review_feedback` (the plugin requires and consumes a one-use review receipt). If
-   the diff is missing/truncated, split the path list or block and escalate—never fall back
-   to shell or direct file reads.
+   `swarm_review({project_key, epic_id, task_id, files_touched})` with that cell's reported
+   paths; an empty list is valid for a no-file cell (research, audit) and expects no diff.
+   Compare the scoped diff to acceptance criteria, then send `swarm_review_feedback` (the
+   plugin requires and consumes a one-use review receipt). For a cell that touched files, a
+   missing/truncated diff means split the path list or block and escalate—never fall back to
+   shell or direct file reads.
 4. For `needs_changes`, use `swarm_spawn_retry` for retry context and generate one new final
    prompt for that retry attempt. Do not retry past the mission limit; mark the cell blocked
    and escalate.
-5. Workers submit completion with `swarm_complete`, providing a non-empty `files_touched`
-   list (`start_time` is optional and auto-filled with the submission time). After
+5. Workers submit completion with `swarm_complete`; `files_touched` lists the changed files
+   and may be empty for a no-file cell (research, audit). `start_time` is optional and
+   auto-filled with the submission time. After
    coordinator approval, swarmx runs the Verification
    Gate and finalizes that submission. Swarmx rejects `skip_review` and `skip_verification`
    for all callers. The coordinator audits distribution, calls `hive_sync`, stores reusable
