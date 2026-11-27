@@ -661,15 +661,7 @@ Updated ID generation
 - Mention backward compatibility explicitly
 - Make it scannable (headers, bullets, bold for key points)
 
-**MANDATORY: Pull a quote from pdf-brain.** This is NOT optional:
-```bash
-pdf-brain_search(query="<thematic keyword from your change>", limit=5)
-```
-Add the quote as an epigraph. Makes changelogs memorable and connects our work to the broader craft. Examples:
-- Adding observability? Search "observability monitoring visibility"
-- Refactoring? Search "refactoring Fowler small steps"
-- Event sourcing? Search "event sourcing CQRS"
-- Testing? Search "Beck TDD red green"
+**Curated epigraphs:** Every changeset must include a short thematic epigraph with a verifiable author or source. No external search tool is required; use a quote whose attribution can be verified from a reliable source. Lorem ipsum and fabricated citations are forbidden.
 
 **ASCII Art Guidelines:**
 - ASCII art is NOT always box-drawing block diagrams

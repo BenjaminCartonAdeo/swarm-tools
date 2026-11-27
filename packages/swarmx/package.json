@@ -16,7 +16,8 @@
   ],
   "scripts": {
     "prepare": "bun run build",
-    "build": "bun build src/index.ts --outdir dist --target node --external @opencode/plugin --external @opencode-ai/plugin && bun build bin/swarmx.ts --outdir dist/bin --target node --external @opencode/plugin --external @opencode-ai/plugin",
+    "build": "bun build src/index.ts --outdir dist --target node --external @opencode/plugin --external @opencode-ai/plugin --external swarm-mail && bun build bin/swarmx.ts --outdir dist/bin --target node --external @opencode/plugin --external @opencode-ai/plugin --external swarm-mail",
+    "deploy:local": "bun run build && bun run bin/swarmx.ts upgrade --target /home/benjamin/Dev/.opencode",
     "test": "bun test tests/",
     "typecheck": "tsc --noEmit"
   },
@@ -24,9 +25,13 @@
     "@opencode/plugin": "^2.2.7"
   },
   "devDependencies": {
+    "@opencode/client": "^2.3.0",
     "@opencode/plugin": "^2.2.7",
     "@types/bun": "^1.3.0",
     "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "swarm-mail": "workspace:*"
   },
   "private": true
 }

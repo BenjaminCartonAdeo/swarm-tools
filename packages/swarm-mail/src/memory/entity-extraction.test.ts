@@ -14,7 +14,7 @@
  * 8. Graceful handling of LLM errors
  */
 
-import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach, mock } from "bun:test";
 import { createClient } from "@libsql/client";
 import type { Client } from "@libsql/client";
 import { createLibSQLMemorySchema, dropLibSQLMemorySchema } from "./libsql-schema.js";
@@ -273,19 +273,24 @@ describe("Entity Extraction", () => {
     expect(Number(result.rows[0].count)).toBe(0);
   });
 
-  test("graceful handling of LLM errors", async () => {
+  test("graceful handling without LLM credentials", async () => {
     const content = "Some content";
-    const config = {
-      model: "anthropic/invalid-model",
-      apiKey: "invalid-key",
-    };
+    const originalError = console.error;
+    const errorSpy = mock(() => {});
+    console.error = errorSpy;
+    try {
+      const result = await extractEntitiesAndRelationships(content, {
+        model: "anthropic/invalid-model",
+        apiKey: "",
+      });
 
-    // Should not throw, should return empty structure
-    const result = await extractEntitiesAndRelationships(content, config);
-
-    expect(result).toEqual({
-      entities: [],
-      relationships: [],
-    });
+      expect(result).toEqual({
+        entities: [],
+        relationships: [],
+      });
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      console.error = originalError;
+    }
   });
 });

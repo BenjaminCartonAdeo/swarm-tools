@@ -98,6 +98,8 @@ export const CellCreateArgsSchema = z.object({
    * For subtasks, use dot notation: 'migrate-egghead-phase-0.e2e-test'
    */
   id: z.string().optional(),
+  /** Optional idempotency key forwarded unchanged to the Hive adapter */
+  operation_id: z.string().optional(),
 });
 export type CellCreateArgs = z.infer<typeof CellCreateArgsSchema>;
 

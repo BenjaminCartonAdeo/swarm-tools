@@ -112,7 +112,7 @@ export async function getStrategyInsights(
 		SELECT 
 			json_extract(data, '$.strategy') as strategy,
 			COUNT(*) as total_attempts,
-			SUM(CASE WHEN json_extract(data, '$.success') = 'true' THEN 1 ELSE 0 END) as successes
+			SUM(CASE WHEN json_extract(data, '$.success') = 1 THEN 1 ELSE 0 END) as successes
 		FROM events
 		WHERE type = 'subtask_outcome'
 		AND json_extract(data, '$.strategy') IS NOT NULL
@@ -206,7 +206,7 @@ export async function getFileInsights(
 				MAX(timestamp) as last_failure
 			FROM events
 			WHERE type = 'subtask_outcome'
-			AND json_extract(data, '$.success') = 'false'
+			AND json_extract(data, '$.success') = 0
 			AND json_extract(data, '$.files_touched') LIKE ?
 		`;
 
@@ -613,7 +613,7 @@ export async function getPatternInsights(
 			COUNT(*) as frequency
 		FROM events
 		WHERE type = 'subtask_outcome'
-		AND json_extract(data, '$.success') = 'false'
+		AND json_extract(data, '$.success') = 0
 		AND json_extract(data, '$.error_type') IS NOT NULL
 		GROUP BY json_extract(data, '$.error_type')
 		HAVING COUNT(*) >= 2

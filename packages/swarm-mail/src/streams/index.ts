@@ -78,42 +78,36 @@ export async function withTiming<T>(
 // ============================================================================
 
 /**
- * Get the database path for swarm-mail
+ * Get the configured database path for swarm-mail.
  *
- * ALWAYS returns the global database: ~/.config/swarm-tools/swarm.db
- * 
+ * Defaults to the global database: ~/.config/swarm-tools/swarm.db.
+ * SWARM_DB_PATH overrides the destination for isolated/test runs.
+ *
  * If a projectPath is provided and has a local swarm.db, it will be
- * auto-migrated to the global database on first access.
+ * auto-migrated to the resolved database on first access.
  *
  * @param projectPath - Optional project path (triggers auto-migration if local DB exists)
- * @returns Path to global database file
+ * @returns Resolved database file path
  */
 export function getDatabasePath(projectPath?: string): string {
-	// Allow override for testing - use a separate DB to avoid polluting production data
-	if (process.env.SWARM_DB_PATH) {
-		return process.env.SWARM_DB_PATH;
-	}
+	const overridePath = process.env.SWARM_DB_PATH;
 	const globalDir = join(homedir(), ".config", "swarm-tools");
-	if (!existsSync(globalDir)) {
+	const databasePath = overridePath ?? join(globalDir, "swarm.db");
+	if (overridePath === undefined && !existsSync(globalDir)) {
 		mkdirSync(globalDir, { recursive: true });
 	}
-	const globalDbPath = join(globalDir, "swarm.db");
-	
-	// Auto-migrate project-local DBs to global DB
+
+	// Auto-migrate project-local DBs to the resolved database path.
 	if (projectPath) {
 		const oldPaths = getOldProjectDbPaths(projectPath);
-		
-		// Check for old libSQL database (.opencode/streams.db)
 		if (existsSync(oldPaths.libsql)) {
-			// Trigger migration - runs async but we don't wait
-			// Idempotent: safe to call multiple times, skips if .migrated exists
-			migrateLocalDbToGlobal(oldPaths.libsql, globalDbPath).catch((err) => {
+			migrateLocalDbToGlobal(oldPaths.libsql, databasePath).catch((err) => {
 				console.error(`[swarm-mail] Migration failed: ${err.message}`);
 			});
 		}
 	}
-	
-	return globalDbPath;
+
+	return databasePath;
 }
 
 /**
@@ -169,8 +163,8 @@ export {
 	getMessage,
 	getThreadMessages,
 } from "./projections-drizzle";
-// Export adapter cache management
-export { clearAdapterCache } from "./store";
+// Export adapter access and cache management
+export { clearAdapterCache, getSwarmMailDatabaseAdapter } from "./store";
 
 // Export Drizzle wrapper functions (they match old signatures)
 export {

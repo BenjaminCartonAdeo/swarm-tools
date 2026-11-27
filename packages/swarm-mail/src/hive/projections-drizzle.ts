@@ -13,7 +13,7 @@
  * @module hive/projections-drizzle
  */
 
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull, or } from "drizzle-orm";
 import type { SwarmDb } from "../db/client.js";
 import {
   beadComments,
@@ -117,6 +117,30 @@ async function handleBeadCreatedDrizzle(
   db: SwarmDb,
   event: CellEvent,
 ): Promise<void> {
+  await buildBeadCreatedInsert(db, event);
+}
+
+/**
+ * Statements materialising a cell_created event (beads row + dirty marker).
+ *
+ * Returned as unexecuted Drizzle builders so the event store can run them in
+ * the same atomic `db.batch()` as the event insert.
+ */
+export function buildCellCreatedProjectionStatements(db: SwarmDb, event: CellEvent) {
+  return [
+    buildBeadCreatedInsert(db, event),
+    buildMarkDirtyStatement(db, event.cell_id),
+  ] as const;
+}
+
+function buildMarkDirtyStatement(db: SwarmDb, cellId: string) {
+  return db
+    .insert(dirtyBeads)
+    .values({ cell_id: cellId, marked_at: Date.now() })
+    .onConflictDoUpdate({ target: dirtyBeads.cell_id, set: { marked_at: Date.now() } });
+}
+
+function buildBeadCreatedInsert(db: SwarmDb, event: CellEvent) {
   // GUARD: Validate bead ID is not null/empty
   // This prevents the root cause of NULL ID records from migration failures
   if (!event.cell_id || event.cell_id.trim() === "") {
@@ -127,7 +151,7 @@ async function handleBeadCreatedDrizzle(
     );
   }
 
-  await db.insert(beads).values({
+  return db.insert(beads).values({
     id: event.cell_id,
     project_key: event.project_key,
     type: event.issue_type as string,
@@ -145,6 +169,7 @@ async function handleBeadCreatedDrizzle(
     deleted_by: null,
     delete_reason: null,
     created_by: (event.created_by as string | null | undefined) ?? null,
+    operation_id: (event.operation_id as string | null | undefined) ?? null,
   });
 }
 
@@ -226,10 +251,23 @@ async function handleBeadClosedDrizzle(
     setFields.result_at = event.timestamp;
   }
 
+  const completionOperationId = (event as { completion_operation_id?: unknown }).completion_operation_id;
+  const hasIdentity = typeof completionOperationId === "string" && completionOperationId.length > 0;
+  if (hasIdentity) {
+    setFields.completion_operation_id = completionOperationId;
+  }
+
   await db
     .update(beads)
     .set(setFields)
-    .where(eq(beads.id, event.cell_id));
+    .where(
+      hasIdentity
+        ? and(
+            eq(beads.id, event.cell_id),
+            or(isNull(beads.completion_operation_id), eq(beads.completion_operation_id, completionOperationId)),
+          )
+        : eq(beads.id, event.cell_id),
+    );
 
   // Invalidate blocked cache for dependents (beads that were blocked by this one)
   const { invalidateBlockedCacheDrizzle } = await import(
@@ -248,6 +286,7 @@ async function handleBeadReopenedDrizzle(
       status: "open",
       closed_at: null,
       closed_reason: null,
+      completion_operation_id: null,
       updated_at: event.timestamp,
     })
     .where(eq(beads.id, event.cell_id));

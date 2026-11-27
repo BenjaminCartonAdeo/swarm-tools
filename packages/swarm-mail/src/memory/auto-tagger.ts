@@ -77,6 +77,10 @@ export async function generateTags(
   existingTags: string[] | undefined,
   config: AutoTagConfig
 ): Promise<AutoTagResult> {
+  if (!config.apiKey) {
+    return { tags: [], keywords: [], category: "" };
+  }
+
   try {
     const userTagsHint = existingTags && existingTags.length > 0
       ? `\n\nUSER-PROVIDED TAGS (incorporate these):\n${existingTags.join(", ")}`

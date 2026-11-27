@@ -87,6 +87,8 @@ export async function findCellsByPartialIdDrizzle(
     created_by: row.created_by,
     result: row.result ?? null,
     result_at: row.result_at ?? null,
+    operation_id: row.operation_id ?? null,
+    completion_operation_id: row.completion_operation_id ?? null,
   }));
 }
 

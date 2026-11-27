@@ -71,7 +71,6 @@ import {
   checkAllTools,
   formatToolAvailability,
   isToolAvailable,
-  warnMissingTool,
 } from "./tool-availability";
 import { getHiveAdapter, hive_sync, setHiveWorkingDirectory, getHiveWorkingDirectory } from "./hive";
 import { listSkills } from "./skills";
@@ -82,6 +81,7 @@ import {
 import {
   isReviewApproved,
   getReviewStatus,
+  getDurableReviewApproval,
 } from "./swarm-review";
 import { getGitCommitInfo } from "./utils/git-commit-info";
 import { captureCoordinatorEvent, type EvalRecord } from "./eval-capture.js";
@@ -1027,6 +1027,12 @@ export const swarm_complete = tool({
       .string()
       .optional()
       .describe("Git branch (auto-detected if not provided)"),
+    operation_id: tool.schema
+      .string()
+      .optional()
+      .describe(
+        "Completion identity. Persisted on the closed cell; replaying the same identity is idempotent, a different identity on an already-closed cell is a conflict.",
+      ),
   },
   async execute(args, _ctx) {
     // Validate required parameters with helpful error messages
@@ -1061,7 +1067,18 @@ export const swarm_complete = tool({
 
     // Check review gate (unless skipped) - BEFORE try block so errors are clear
     if (!args.skip_review) {
-      const reviewStatusResult = getReviewStatus(args.bead_id);
+      let reviewStatusResult = getReviewStatus(args.bead_id);
+      // A local review decision (approval, rejection or counted needs_changes
+      // attempt) is authoritative; durable keyed feedback is consulted only
+      // when this process has no decision for the task.
+      const hasLocalDecision =
+        reviewStatusResult.reviewed || reviewStatusResult.attempt_count > 0;
+      if (
+        !hasLocalDecision &&
+        (await getDurableReviewApproval(args.project_key, args.bead_id))
+      ) {
+        reviewStatusResult = { ...reviewStatusResult, reviewed: true, approved: true };
+      }
 
       if (!reviewStatusResult.approved) {
         // Check if review was even attempted
@@ -1134,6 +1151,26 @@ export const swarm_complete = tool({
 
       // 2. Check if bead is already closed
       if (cell.status === "closed") {
+        if (args.operation_id) {
+          const existingIdentity = (cell as { completion_operation_id?: string | null }).completion_operation_id ?? null;
+          if (existingIdentity === args.operation_id) {
+            // Idempotent replay of the same completion identity.
+            return JSON.stringify({
+              success: true,
+              idempotent_replay: true,
+              bead_id: args.bead_id,
+              completion_operation_id: existingIdentity,
+            });
+          }
+          return JSON.stringify({
+            success: false,
+            conflict: true,
+            error_type: "operation_id_conflict",
+            error: `Bead already closed with a different completion identity: ${args.bead_id}`,
+            expected_operation_id: args.operation_id,
+            actual_operation_id: existingIdentity,
+          });
+        }
         return JSON.stringify({
           success: false,
           error: `Bead already closed: ${args.bead_id}`,
@@ -1313,6 +1350,7 @@ This will be recorded as a negative learning signal.`;
       try {
         await adapter.closeCell(args.project_key, args.bead_id, args.summary, {
           result: resultText,
+          ...(args.operation_id ? { completion_operation_id: args.operation_id } : {}),
         });
       } catch (closeError) {
         const errorMessage = closeError instanceof Error ? closeError.message : String(closeError);
@@ -1347,30 +1385,30 @@ This will be recorded as a negative learning signal.`;
         const swarmMail = await getSwarmMailLibSQL(args.project_key);
         const db = await swarmMail.getDatabase();
         
-        // Resolve deferred keyed by bead_id
-        // Coordinator should have created this deferred before spawning worker
+        // Resolve deferred keyed by bead_id when the optional table exists.
         const deferredUrl = `deferred:${args.bead_id}`;
-        
-        // Check if deferred exists before resolving
-        const checkResult = await db.query<{ url: string; resolved: number }>(
-          `SELECT url, resolved FROM deferred WHERE url = ? AND resolved = 0`,
-          [deferredUrl],
+        const tableResult = await db.query<{ name: string }>(
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'deferred'`,
+          [],
         );
-        
-        if (checkResult.rows.length > 0) {
-          // Resolve with completion payload
-          await db.query(
-            `UPDATE deferred SET resolved = 1, value = ? WHERE url = ? AND resolved = 0`,
-            [JSON.stringify({ completed: true, summary: args.summary }), deferredUrl],
+
+        if (tableResult.rows.length > 0) {
+          const checkResult = await db.query<{ url: string; resolved: number }>(
+            `SELECT url, resolved FROM deferred WHERE url = ? AND resolved = 0`,
+            [deferredUrl],
           );
-          
-          deferredResolved = true;
-        } else {
-          // Deferred doesn't exist - worker was likely not spawned via swarm pattern
-          // This is non-fatal - just log for debugging
-          console.info(
-            `[swarm_complete] No deferred found for ${args.bead_id} - task may not be part of active swarm`,
-          );
+
+          if (checkResult.rows.length > 0) {
+            await db.query(
+              `UPDATE deferred SET resolved = 1, value = ? WHERE url = ? AND resolved = 0`,
+              [JSON.stringify({ completed: true, summary: args.summary }), deferredUrl],
+            );
+            deferredResolved = true;
+          } else {
+            console.info(
+              `[swarm_complete] No deferred found for ${args.bead_id} - task may not be part of active swarm`,
+            );
+          }
         }
       } catch (error) {
         // Non-fatal - deferred resolution is optional for backward compatibility
@@ -1512,7 +1550,6 @@ This will be recorded as a negative learning signal.`;
         } else {
           memoryError =
             "hivemind not available - learning stored in-memory only";
-          warnMissingTool("hivemind");
         }
       } catch (error) {
         memoryError = `Failed to store memory: ${error instanceof Error ? error.message : String(error)}`;

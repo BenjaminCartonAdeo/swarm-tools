@@ -149,6 +149,7 @@ export async function createTestLibSQLDb(): Promise<{
       project_key TEXT NOT NULL,
       timestamp INTEGER NOT NULL,
       data TEXT NOT NULL DEFAULT '{}',
+      operation_id TEXT,
       created_at TEXT
     )
   `);
@@ -212,7 +213,8 @@ export async function createTestLibSQLDb(): Promise<{
       thread_id TEXT,
       importance TEXT NOT NULL DEFAULT 'normal',
       ack_required INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      operation_id TEXT
     )
   `);
 
@@ -371,6 +373,8 @@ export async function createTestLibSQLDb(): Promise<{
       created_by TEXT,
       result TEXT,
       result_at INTEGER,
+      operation_id TEXT UNIQUE,
+      completion_operation_id TEXT UNIQUE,
       CHECK ((status = 'closed') = (closed_at IS NOT NULL)),
       FOREIGN KEY (parent_id) REFERENCES beads(id) ON DELETE SET NULL
     )

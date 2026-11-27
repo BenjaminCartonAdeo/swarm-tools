@@ -625,3 +625,34 @@ describe("DecisionTraceStore", () => {
     });
   });
 });
+
+describe("createDecisionTrace operation_id", () => {
+  test("replayedOperationIdReturnsPersistedTraceWithoutSecondRow", async () => {
+    const db = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      await createLibSQLStreamsSchema(db);
+      const input: DecisionTraceInput = {
+        decision_type: "review_decision",
+        agent_name: "coordinator",
+        project_key: "/p",
+        decision: { status: "approved" },
+        operation_id: "op-trace",
+      };
+      const first = await createDecisionTrace(db, input);
+      const second = await createDecisionTrace(db, { ...input, rationale: "changed" });
+      expect(second.id).toBe(first.id);
+      expect(second.rationale).toBeNull();
+      expect(second.operation_id).toBe("op-trace");
+      const rows = await db.query<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM decision_traces WHERE operation_id = 'op-trace'",
+      );
+      expect(rows.rows[0]?.n).toBe(1);
+
+      const unkeyedA = await createDecisionTrace(db, { ...input, operation_id: undefined });
+      const unkeyedB = await createDecisionTrace(db, { ...input, operation_id: undefined });
+      expect(unkeyedA.id).not.toBe(unkeyedB.id);
+    } finally {
+      await db.close?.();
+    }
+  });
+});

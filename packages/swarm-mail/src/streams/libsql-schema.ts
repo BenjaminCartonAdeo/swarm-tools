@@ -71,9 +71,11 @@ export async function createLibSQLStreamsSchema(db: DatabaseAdapter): Promise<vo
       project_key TEXT NOT NULL,
       timestamp INTEGER NOT NULL,
       sequence INTEGER GENERATED ALWAYS AS (id) STORED,
-      data TEXT NOT NULL
+      data TEXT NOT NULL,
+      operation_id TEXT
     )
   `);
+  await ensureOperationIdColumn(db, "events");
 
   // Events indexes
   await db.exec(`
@@ -84,6 +86,13 @@ export async function createLibSQLStreamsSchema(db: DatabaseAdapter): Promise<vo
   await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_events_type 
     ON events(type)
+  `);
+
+  // Guarded hive close looks up its own cell_closed event by internal event_token.
+  await db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_events_cell_closed_event_token
+    ON events(json_extract(data, '$.event_token'))
+    WHERE type = 'cell_closed'
   `);
 
   await db.exec(`
@@ -140,9 +149,11 @@ export async function createLibSQLStreamsSchema(db: DatabaseAdapter): Promise<vo
       thread_id TEXT,
       importance TEXT DEFAULT 'normal',
       ack_required INTEGER DEFAULT 0,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      operation_id TEXT
     )
   `);
+  await ensureOperationIdColumn(db, "messages");
 
   await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_messages_project 
@@ -364,9 +375,11 @@ export async function createLibSQLStreamsSchema(db: DatabaseAdapter): Promise<vo
       precedent_cited TEXT,
       outcome_event_id INTEGER,
       quality_score REAL,
-      timestamp INTEGER NOT NULL
+      timestamp INTEGER NOT NULL,
+      operation_id TEXT
     )
   `);
+  await ensureOperationIdColumn(db, "decision_traces");
 
   await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_decision_traces_epic 
@@ -418,6 +431,64 @@ export async function createLibSQLStreamsSchema(db: DatabaseAdapter): Promise<vo
     CREATE INDEX IF NOT EXISTS idx_entity_links_type 
     ON entity_links(link_type)
   `);
+
+  // ========================================================================
+  // Review Feedback Operations (durable idempotent review feedback claims)
+  // ========================================================================
+  // IMPORTANT: This table structure MUST match db/schema/streams.ts (reviewFeedbackOperationsTable)
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS review_feedback_operations (
+      operation_id TEXT PRIMARY KEY,
+      project_key TEXT NOT NULL,
+      unit_id TEXT,
+      task_id TEXT NOT NULL,
+      worker_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      attempt INTEGER NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('claimed', 'in_progress', 'done')),
+      claim_token TEXT,
+      host_instance_id TEXT,
+      hostname TEXT,
+      pid INTEGER,
+      result TEXT,
+      completion_seq INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `);
+  await ensureColumn(db, "review_feedback_operations", "completion_seq", "INTEGER");
+
+  await db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_review_feedback_operations_task
+    ON review_feedback_operations(project_key, task_id)
+  `);
+}
+
+/**
+ * Add a nullable `operation_id` column to an existing table when missing,
+ * then (idempotently) the partial unique index guarding non-null keys.
+ * `CREATE TABLE IF NOT EXISTS` never alters pre-existing tables, so older
+ * databases are upgraded here.
+ */
+async function ensureColumn(
+  db: DatabaseAdapter,
+  table: string,
+  column: string,
+  type: string,
+): Promise<void> {
+  const info = await db.query<{ name: string }>(`PRAGMA table_info('${table}')`);
+  if (!info.rows.some((row) => row.name === column)) {
+    await db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
+}
+
+async function ensureOperationIdColumn(db: DatabaseAdapter, table: string): Promise<void> {
+  await ensureColumn(db, table, "operation_id", "TEXT");
+  await db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_${table}_operation_id
+    ON ${table}(operation_id) WHERE operation_id IS NOT NULL
+  `);
 }
 
 /**
@@ -430,6 +501,7 @@ export async function createLibSQLStreamsSchema(db: DatabaseAdapter): Promise<vo
  */
 export async function dropLibSQLStreamsSchema(db: DatabaseAdapter): Promise<void> {
   // Drop in reverse dependency order
+  await db.exec("DROP TABLE IF EXISTS review_feedback_operations");
   await db.exec("DROP TABLE IF EXISTS entity_links");
   await db.exec("DROP TABLE IF EXISTS decision_traces");
   await db.exec("DROP TABLE IF EXISTS swarm_contexts");

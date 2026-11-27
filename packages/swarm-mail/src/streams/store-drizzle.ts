@@ -14,6 +14,7 @@
 
 import { and, eq, gte, gt, inArray, lte, sql } from "drizzle-orm";
 import type { SwarmDb } from "../db/client.js";
+import { isOperationIdUniqueViolation } from "../operation-id-conflict.js";
 import type {
   AgentEvent,
   AgentRegisteredEvent,
@@ -46,18 +47,56 @@ export async function appendEventDrizzle(
   event: AgentEvent,
 ): Promise<AgentEvent & { id: number; sequence: number }> {
   const { type, project_key, timestamp, ...rest } = event;
+  const operationId = event.operation_id;
+
+  const loadExisting = async () => {
+    if (!operationId) return null;
+    const found = await db
+      .select()
+      .from(eventsTable)
+      .where(eq(eventsTable.operation_id, operationId))
+      .limit(1);
+    const existing = found[0];
+    if (!existing) return null;
+    return {
+      ...(JSON.parse(existing.data) as Record<string, unknown>),
+      type: existing.type,
+      project_key: existing.project_key,
+      timestamp: Number(existing.timestamp),
+      operation_id: operationId,
+      id: existing.id,
+      sequence: existing.sequence ?? existing.id,
+    } as unknown as AgentEvent & { id: number; sequence: number };
+  };
+
+  // Idempotent replay: return the persisted record, never re-run projections
+  const replayed = await loadExisting();
+  if (replayed) {
+    await repairKeyedProjectionDrizzle(db, replayed);
+    return replayed;
+  }
 
   // Insert event
-  const result = await db
-    .insert(eventsTable)
-    .values({
-      type,
-      project_key,
-      timestamp,
-      data: JSON.stringify(rest),
-      // sequence omitted - auto-assigned by database (SERIAL in PGlite, trigger in LibSQL)
-    })
-    .returning({ id: eventsTable.id, sequence: eventsTable.sequence });
+  let result: Array<{ id: number; sequence: number | null }>;
+  try {
+    result = await db
+      .insert(eventsTable)
+      .values({
+        type,
+        project_key,
+        timestamp,
+        data: JSON.stringify(rest),
+        operation_id: operationId ?? null,
+        // sequence omitted - auto-assigned by database (SERIAL in PGlite, trigger in LibSQL)
+      })
+      .returning({ id: eventsTable.id, sequence: eventsTable.sequence });
+  } catch (error) {
+    if (operationId && isOperationIdUniqueViolation(error, "events")) {
+      const raced = await loadExisting();
+      if (raced) return raced;
+    }
+    throw error;
+  }
 
   const row = result[0];
   if (!row || row.sequence === null || row.sequence === undefined) {
@@ -306,6 +345,46 @@ async function handleAgentRegisteredDrizzle(
     });
 }
 
+/**
+ * Replay repair: the event insert and its projection are separate writes, so
+ * a crash between them leaves a keyed message_sent event without its message
+ * row/recipients. On replay, re-run the (idempotent) projection.
+ */
+export async function repairKeyedProjectionDrizzle(
+  db: SwarmDb,
+  event: AgentEvent & { id: number; sequence: number },
+): Promise<void> {
+  if (event.type !== "message_sent" || !event.operation_id) return;
+  const operationId = event.operation_id;
+  const readMessageId = async () => {
+    const found = await db
+      .select({ id: messagesTable.id })
+      .from(messagesTable)
+      .where(eq(messagesTable.operation_id, operationId))
+      .limit(1);
+    return found[0]?.id;
+  };
+  if ((await readMessageId()) === undefined) {
+    try {
+      await handleMessageSentDrizzle(db, event as MessageSentEvent & { id: number; sequence: number });
+    } catch (error) {
+      // Lost the race to a concurrent projection: fall through and make the
+      // winner's row recipient-complete.
+      if (!isOperationIdUniqueViolation(error, "messages")) throw error;
+    }
+  }
+  const messageId = await readMessageId();
+  if (messageId === undefined) {
+    throw new Error(`[SwarmMail] keyed message projection missing for ${operationId}`);
+  }
+  if (event.to_agents.length > 0) {
+    await db
+      .insert(messageRecipientsTable)
+      .values(event.to_agents.map((agentName) => ({ message_id: messageId, agent_name: agentName })))
+      .onConflictDoNothing();
+  }
+}
+
 async function handleMessageSentDrizzle(
   db: SwarmDb,
   event: MessageSentEvent & { id: number; sequence: number },
@@ -322,6 +401,7 @@ async function handleMessageSentDrizzle(
       importance: event.importance,
       ack_required: event.ack_required,
       created_at: event.timestamp,
+      operation_id: event.operation_id ?? null,
     })
     .returning({ id: messagesTable.id });
 

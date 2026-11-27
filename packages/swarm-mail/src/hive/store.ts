@@ -18,13 +18,31 @@
  * @module beads/store
  */
 
+import { randomUUID } from "node:crypto";
 import { and, eq, gte, gt, inArray, lte, sql } from "drizzle-orm";
 import type { SwarmDb } from "../db/client.js";
 import { eventsTable } from "../db/schema/streams.js";
 import { withTiming } from "../streams/index.js";
 import type { DatabaseAdapter } from "../types/database.js";
-import { updateProjectionsDrizzle } from "./projections-drizzle.js";
+import { buildCellCreatedProjectionStatements, updateProjectionsDrizzle } from "./projections-drizzle.js";
 import type { CellEvent } from "./events.js";
+import { OperationIdConflictError, isOperationIdUniqueViolation } from "../operation-id-conflict.js";
+
+/**
+ * Typed conflict: a cell_created lost the unique race on beads.operation_id.
+ * The whole batch (event + projection) was rolled back.
+ */
+export { OperationIdConflictError };
+
+async function resolveSequence(db: SwarmDb, id: number, sequence: number | null): Promise<number> {
+  if (sequence != null) return sequence;
+  // LibSQL workaround: RETURNING gives pre-trigger value
+  const seqResult = await db
+    .select({ sequence: eventsTable.sequence })
+    .from(eventsTable)
+    .where(eq(eventsTable.id, id));
+  return seqResult[0]?.sequence ?? id;
+}
 
 // No type guards needed - CellEvent type is already defined
 
@@ -90,8 +108,7 @@ export async function appendCellEventDrizzle(
 ): Promise<CellEvent & { id: number; sequence: number }> {
   const { type, project_key, timestamp, ...rest } = event;
 
-  // Insert event
-  const result = await db
+  const insertEvent = db
     .insert(eventsTable)
     .values({
       type,
@@ -101,6 +118,39 @@ export async function appendCellEventDrizzle(
       // sequence omitted - auto-assigned by database (SERIAL in PGlite, trigger in LibSQL)
     })
     .returning({ id: eventsTable.id, sequence: eventsTable.sequence });
+
+  if (type === "cell_created") {
+    // Atomic path: event insert + beads row + dirty marker run in ONE
+    // db.batch() (single BEGIN/COMMIT on the same connection). If the beads
+    // insert fails (e.g. idx_beads_operation_id) the event insert rolls back,
+    // so no orphan cell_created event can exist.
+    const [beadInsert, dirtyInsert] = buildCellCreatedProjectionStatements(db, event as any);
+    let batchResult: Array<{ id: number; sequence: number | null }>;
+    try {
+      [batchResult] = await db.batch([insertEvent, beadInsert, dirtyInsert]);
+    } catch (error) {
+      if (isOperationIdUniqueViolation(error, "beads")) {
+        throw new OperationIdConflictError(
+          (event as { operation_id?: string }).operation_id ?? "",
+          error,
+        );
+      }
+      throw error;
+    }
+    const created = batchResult[0];
+    if (!created) {
+      throw new Error("[BeadsStore] Failed to insert event - no row returned");
+    }
+    const sequence = await resolveSequence(db, created.id, created.sequence);
+    return { ...event, id: created.id, sequence };
+  }
+
+  if (type === "cell_closed") {
+    return appendGuardedCellClosed(db, event, rest);
+  }
+
+  // Insert event
+  const result = await insertEvent;
 
   const row = result[0];
   if (!row) {
@@ -124,6 +174,132 @@ export async function appendCellEventDrizzle(
 
   return { ...event, id, sequence };
 }
+
+/**
+ * Thrown by the guarded close when its event insert lost the guard (cell not
+ * open, or identity already set, or cell missing). The whole batch was a no-op.
+ * The adapter re-reads the cell to classify the outcome.
+ */
+export class CellCloseRejectedError extends Error {
+  readonly cellId: string;
+  constructor(cellId: string) {
+    super(`[BeadsStore] close rejected by guard: ${cellId}`);
+    this.name = "CellCloseRejectedError";
+    this.cellId = cellId;
+  }
+}
+
+/** Thrown when an operation targets a cell that does not exist. */
+export class CellNotFoundError extends Error {
+  readonly cellId: string;
+  constructor(cellId: string) {
+    super(`[HiveAdapter] Bead not found: ${cellId}`);
+    this.name = "CellNotFoundError";
+    this.cellId = cellId;
+  }
+}
+
+/**
+ * Atomic, conflict-safe close. One db.batch (single BEGIN/COMMIT):
+ *   1. guarded event insert (cell open and, for identity closes, identity unset),
+ *      carrying a unique internal `event_token`;
+ *   2. beads update;
+ *   3-4. blocked-cache rebuild for the closed cell and its direct dependents
+ *      (same semantics as invalidateBlockedCacheDrizzle);
+ *   5. dirty marker.
+ * Statements 2-5 are gated on the existence of this exact event_token, so a
+ * losing insert makes the whole batch a no-op. Replay/rebuild still uses the
+ * shared projection path (handleBeadClosedDrizzle), which ignores event_token.
+ */
+async function appendGuardedCellClosed(
+  db: SwarmDb,
+  event: CellEvent,
+  rest: Record<string, unknown>,
+): Promise<CellEvent & { id: number; sequence: number }> {
+  const { type, project_key, timestamp } = event;
+  const cellId = event.cell_id;
+  const rawIdentity = (event as { completion_operation_id?: unknown }).completion_operation_id;
+  const identity = typeof rawIdentity === "string" && rawIdentity.length > 0 ? rawIdentity : null;
+  const eventToken = randomUUID(); // internal-only: caller-supplied tokens are ignored
+  const { event_token: _ignoredToken, ...restWithoutToken } = rest;
+  const data = JSON.stringify({ ...restWithoutToken, event_token: eventToken });
+  const reason = (event as { reason?: string | null }).reason ?? null;
+  const rawResult = (event as { result?: unknown }).result;
+  // Truthy-result semantics, as in handleBeadClosedDrizzle (`if (result)`).
+  const result = typeof rawResult === "string" && rawResult.length > 0 ? rawResult : null;
+  const identityGuard = identity === null ? sql`` : sql` AND completion_operation_id IS NULL`;
+  const thisEvent = sql`EXISTS (
+    SELECT 1 FROM events WHERE type = 'cell_closed' AND json_extract(data, '$.event_token') = ${eventToken}
+  )`;
+  const targets = sql`targets(id) AS (
+    SELECT ${cellId}
+    UNION
+    SELECT cell_id FROM bead_dependencies WHERE depends_on_id = ${cellId}
+  )`;
+
+  const statements = [
+    db.run(sql`
+      INSERT INTO events (type, project_key, timestamp, data)
+      SELECT ${type}, ${project_key}, ${timestamp}, ${data}
+      WHERE EXISTS (SELECT 1 FROM beads WHERE id = ${cellId} AND status <> 'closed'${identityGuard})
+    `),
+    db.run(sql`
+      UPDATE beads SET status = 'closed', closed_at = ${timestamp}, closed_reason = ${reason},
+        updated_at = ${timestamp}, completion_operation_id = COALESCE(${identity}, completion_operation_id),
+        result = CASE WHEN ${result} IS NULL THEN result ELSE ${result} END,
+        result_at = CASE WHEN ${result} IS NULL THEN result_at ELSE ${timestamp} END
+      WHERE id = ${cellId} AND ${thisEvent}
+    `),
+    db.run(sql`
+      WITH RECURSIVE ${targets}
+      DELETE FROM blocked_beads_cache WHERE cell_id IN (SELECT id FROM targets) AND ${thisEvent}
+    `),
+    db.run(sql`
+      WITH RECURSIVE ${targets},
+      blockers(target, blocker_id, depth) AS (
+        SELECT t.id, bd.depends_on_id, 1
+        FROM targets t JOIN bead_dependencies bd ON bd.cell_id = t.id
+        WHERE bd.relationship = 'blocks'
+        UNION
+        SELECT b.target, bd.depends_on_id, b.depth + 1
+        FROM bead_dependencies bd JOIN blockers b ON bd.cell_id = b.blocker_id
+        WHERE bd.relationship = 'blocks' AND b.depth < ${MAX_CLOSE_DEPENDENCY_DEPTH}
+      ),
+      open_blockers AS (
+        SELECT DISTINCT b.target, b.blocker_id
+        FROM blockers b JOIN beads bead ON b.blocker_id = bead.id
+        WHERE bead.project_key = ${project_key} AND bead.status != 'closed' AND bead.deleted_at IS NULL
+      )
+      INSERT INTO blocked_beads_cache (cell_id, blocker_ids, updated_at)
+      SELECT target, json_group_array(blocker_id), ${timestamp}
+      FROM open_blockers
+      WHERE ${thisEvent}
+      GROUP BY target
+    `),
+    db.run(sql`
+      INSERT INTO dirty_beads (cell_id, marked_at) SELECT ${cellId}, ${Date.now()} WHERE ${thisEvent}
+      ON CONFLICT (cell_id) DO UPDATE SET marked_at = excluded.marked_at
+    `),
+  ];
+
+  let batchResult: Array<{ rowsAffected: number; lastInsertRowid?: bigint | number }>;
+  try {
+    batchResult = (await db.batch(statements as any)) as unknown as typeof batchResult;
+  } catch (error) {
+    if (identity !== null && isOperationIdUniqueViolation(error, "beads", "completion_operation_id")) {
+      throw new OperationIdConflictError(identity, error, "beads.completion");
+    }
+    throw error;
+  }
+  const inserted = batchResult[0];
+  if (!inserted || inserted.rowsAffected === 0) throw new CellCloseRejectedError(cellId);
+  const id = Number(inserted.lastInsertRowid);
+  const sequence = await resolveSequence(db, id, null);
+  return { ...event, event_token: eventToken, id, sequence } as CellEvent & { id: number; sequence: number };
+}
+
+/** Same bound as dependencies-drizzle MAX_DEPENDENCY_DEPTH. */
+const MAX_CLOSE_DEPENDENCY_DEPTH = 100;
 
 /**
  * Read cell events with optional filters using Drizzle

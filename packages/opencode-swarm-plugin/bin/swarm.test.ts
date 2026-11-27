@@ -7,6 +7,8 @@
  * - Swarm history helpers (formatSwarmHistory, parseHistoryArgs, filterHistoryByStatus)
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { spawnSync } from "child_process";
+import { randomUUID } from "crypto";
 import { mkdirSync, rmSync, writeFileSync, existsSync, readFileSync, readdirSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -1455,6 +1457,30 @@ describe("swarm history", () => {
 // ============================================================================
 
 describe("swarm query", () => {
+  test("executes custom SQL through the CLI and formats its rows as JSON", () => {
+    const databasePath = join("/tmp/opencode", `swarm-query-${randomUUID()}.db`);
+
+    try {
+      mkdirSync("/tmp/opencode", { recursive: true });
+      const result = spawnSync(
+        process.execPath,
+        [join(import.meta.dir, "swarm.ts"), "query", "--sql", "SELECT 1 AS ok", "--format", "json"],
+        {
+          cwd: process.cwd(),
+          env: { ...process.env, SWARM_DB_PATH: databasePath },
+          encoding: "utf8",
+        },
+      );
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('"ok": 1');
+    } finally {
+      rmSync(databasePath, { force: true });
+      rmSync(`${databasePath}-wal`, { force: true });
+      rmSync(`${databasePath}-shm`, { force: true });
+    }
+  });
+
   test("executes SQL query with table format", () => {
     // Mock function - to be implemented in swarm.ts
     function executeQueryCommand(args: string[]): { format: string; query?: string; preset?: string } {
@@ -2302,3 +2328,17 @@ describe("swarm db repair", () => {
   });
 });
 
+
+describe("executeTool args forwarding operationId", () => {
+  test("supplied operation_id survives CLI JSON parsing unchanged", async () => {
+    const { parseToolArgsJson } = await import("./tool-args");
+    const args = { title: "t", operation_id: "op-ÉX 42/α" };
+    expect(parseToolArgsJson(JSON.stringify(args))).toEqual(args);
+  });
+
+  test("omitted operation_id stays absent after CLI JSON parsing", async () => {
+    const { parseToolArgsJson } = await import("./tool-args");
+    expect("operation_id" in parseToolArgsJson(JSON.stringify({ title: "t" }))).toBe(false);
+    expect(parseToolArgsJson(undefined)).toEqual({});
+  });
+});

@@ -35,7 +35,7 @@ plugin, pas une estimation. L'ancien flag de budget monétaire est retiré.
 - Un seul appel à `swarm_subtask_prompt` par tentative de dispatch. Un retry est une
   nouvelle tentative et reçoit un nouveau prompt final ; les outils de recherche ne font
   que produire son contexte source.
-- Le worker soumet sa completion avec `swarm_complete` et `files_touched` non vide
+- Le worker soumet sa completion avec `swarm_complete`; `files_touched` peut être vide pour une recherche sans fichier
   (`start_time` est optionnel, auto-rempli avec l'heure de soumission). Après l'approbation, le plugin relance la Verification Gate et finalise. `swarmx`
   refuse `skip_review` et `skip_verification` pour tous les appelants.
 - Jamais de repli silencieux sur `swarm/swarm-worker` quand le résolveur renvoie
@@ -47,16 +47,18 @@ plugin, pas une estimation. L'ancien flag de budget monétaire est retiré.
 1. **Triplet obligatoire** : tickets couverts (ou « aucun »), modules/fichiers ciblés,
    tests ciblés. Incomplet → UNE question de clarification (sauf `--fast`/`--auto`).
    `--jira <KEY>` : charger `swarm-jira-import` et suivre ses 4 étapes d'abord.
-2. **Mode** : `audit` si la mission ne produit pas de diff (exploration, diagnostic,
+2. **Préflight** : `swarm_preflight()`. Working tree sale → nettoyer ou auditer
+   explicitement avec `allow_dirty: true` et un `dirty_reason`.
+3. **Mode** : `audit` si la mission ne produit pas de diff (exploration, diagnostic,
    revue) ; `dev` si elle écrit du code. Choix fait avant la décomposition.
-3. `swarm_set_budget({mode, max_spawns, max_iterations})` — **une seule fois**, avant le
+4. `swarm_set_budget({mode, max_spawns, max_iterations})` — **une seule fois**, avant le
    premier dispatch. Annoncer la valeur posée en tête de mission. Un plafond découvert
    après coup n'a rien borné.
-4. **Dimensionnement** : avant de valider le CellTree, comparer
+5. **Dimensionnement** : avant de valider le CellTree, comparer
    `cellules + reviews + reprises max` au plafond de spawns. Marge insuffisante → réduire
    le nombre de cellules ou demander un accord explicite ; jamais engager une mission dont
    une cellule restera bloquée par construction.
-5. **Un épic par session**. Pas d'enchaînement de second livrable : checkpoint puis
+6. **Un épic par session**. Pas d'enchaînement de second livrable : checkpoint puis
    session neuve.
 
 ## Phase 1 — Knowledge
@@ -148,12 +150,10 @@ régénérer et recopier, jamais dispatcher un placeholder.
    signaler un état idle puis rapporter de nouveau après une reprise.
 2. **Inbox** : `swarmmail_inbox()` puis `swarmmail_read_message(message_id)`.
 3. **Review/gate diff** : appelle `swarm_review(project_key, epic_id, task_id,
-   files_touched)` avec une liste non vide des seuls chemins annoncés. Le plugin lie ce diff
-   complet à la mission dans un reçu à usage unique. Vérifie que le retour
-   contient leur diff réel avant d'approuver. Sortie vide ou absente → bloque et demande une
-   preuve/revue ciblée; ne lis jamais les fichiers et ne contourne pas le gate par le shell.
-   Payload tronqué → relance `swarm_review` sur des sous-listes non vides. Pour un fichier
-   nouveau non suivi, si l'outil ne fournit pas son contenu, bloque et escalade.
+   files_touched)` avec les chemins déclarés; liste vide autorisée pour une cellule sans
+   fichier. Le plugin enrichit automatiquement la review avec le diff des nouveaux fichiers
+   non suivis. Vérifie que le retour contient leur contenu avant d'approuver. Fichier absent
+   ou diff invalide → bloque; ne lis jamais les fichiers et ne contourne pas le gate par le shell.
 4. **Gate livrable** : `task_result` non vide **et** contenu de diff correspondant exactement
    aux chemins annoncés. Jamais d'approbation sur un diff absent, vide ou tronqué.
 5. **Évaluer** : exigences de la cellule, type-safety, tests. Échec lint/test comparé

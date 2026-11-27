@@ -27,7 +27,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   clearAdapterCache,
-  createInMemorySwarmMailLibSQL,
+  closeAllSwarmMailLibSQL,
+  createHiveAdapter,
+  getSwarmMailLibSQL,
   type SwarmMailAdapter,
 } from "swarm-mail";
 
@@ -65,6 +67,7 @@ import {
 } from "./swarm-orchestrate";
 
 import {
+  resetHivemindCache,
   semantic_memory_store,
   semantic_memory_find,
 } from "./hivemind-tools";
@@ -91,6 +94,7 @@ function trackPath(path: string): string {
 }
 
 let TEST_DB_PATH: string;
+let previousDbPath: string | undefined;
 let swarmMail: SwarmMailAdapter;
 
 /**
@@ -137,31 +141,35 @@ async function executeToolRaw(
 
 beforeEach(async () => {
   testPaths = [];
+  previousDbPath = process.env.SWARM_DB_PATH;
   TEST_DB_PATH = trackPath(testDbPath());
-  
-  // Create directory for test database (tools will create DB here)
   await mkdir(TEST_DB_PATH, { recursive: true });
-  
-  // Clear adapter caches to ensure clean state
+  process.env.SWARM_DB_PATH = join(TEST_DB_PATH, "swarm.db");
+
   clearAdapterCache();
   clearHiveAdapterCache();
-  
-  // Don't create SwarmMail here - let tools create it
-  // This ensures tests use the SAME DB adapter as tools
+  resetHivemindCache();
+
+  // Initialize the same file-backed DB the tools will resolve, with the full
+  // streams schema and Hive migration chain, then close it before tool calls.
+  const initializer = await getSwarmMailLibSQL(TEST_DB_PATH);
+  const initialDb = await initializer.getDatabase();
+  const hive = createHiveAdapter(initialDb, TEST_DB_PATH);
+  await hive.runMigrations();
+  await closeAllSwarmMailLibSQL();
   swarmMail = null!;
 });
 
 afterEach(async () => {
-  // Close SwarmMail adapter if created
-  if (swarmMail) {
-    await swarmMail.close();
-  }
-  
-  // Clear all cached adapters
+  if (swarmMail) await swarmMail.close();
+  await closeAllSwarmMailLibSQL();
   clearAdapterCache();
   clearHiveAdapterCache();
-  
-  // Clean up all test database directories
+  resetHivemindCache();
+
+  if (previousDbPath === undefined) delete process.env.SWARM_DB_PATH;
+  else process.env.SWARM_DB_PATH = previousDbPath;
+
   for (const path of testPaths) {
     try {
       await rm(path, { recursive: true, force: true });
@@ -652,6 +660,43 @@ describe("hive tools adapter wiring", () => {
       const cell = await hiveAdapter.getCell(TEST_DB_PATH, result.id);
       expect(cell).toBeDefined();
       expect(cell!.title).toBe("Test cell minimal");
+    } finally {
+      setHiveWorkingDirectory(originalDir);
+    }
+  });
+
+  it("hive_create forwards operationId to the adapter and preserves absence", async () => {
+    const ctx = createTestContext();
+    const originalDir = getHiveWorkingDirectory();
+    setHiveWorkingDirectory(TEST_DB_PATH);
+
+    try {
+      const operationId = `op-task6-${Date.now()}`;
+      const first = await executeTool<Bead>(
+        hive_create,
+        { title: "Op id cell", operation_id: operationId },
+        ctx,
+      );
+      createdCellIds.push(first.id);
+      const second = await executeTool<Bead>(
+        hive_create,
+        { title: "Op id cell retry", operation_id: operationId },
+        ctx,
+      );
+      expect(second.id).toBe(first.id);
+
+      const { getHiveAdapter } = await import("./hive");
+      const hiveAdapter = await getHiveAdapter(TEST_DB_PATH);
+      const found = await hiveAdapter.queryCells(TEST_DB_PATH, {
+        operation_id: operationId,
+        limit: 1,
+      });
+      expect(found.map((c) => c.id)).toEqual([first.id]);
+
+      const a = await executeTool<Bead>(hive_create, { title: "No op id" }, ctx);
+      const b = await executeTool<Bead>(hive_create, { title: "No op id" }, ctx);
+      createdCellIds.push(a.id, b.id);
+      expect(a.id).not.toBe(b.id);
     } finally {
       setHiveWorkingDirectory(originalDir);
     }

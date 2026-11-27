@@ -12,10 +12,22 @@
  */
 import { Plugin } from "@opencode/plugin";
 
-import { pendingCompletionKey, registerTools } from "./catalog";
+import { registerTools } from "./catalog";
 import { createSwarmCliRunner } from "./cli";
+
+export {
+  consumePendingDowngrade,
+  createWorkUnitEffectPorts,
+  isProcessAlive,
+  resolveHostIdentity,
+  setupWorkUnitRuntime,
+} from "./workunit/ports";
+export type { SetupWorkUnitRuntimeOptions, WorkUnitRuntime } from "./workunit/ports";
+export { createWorkUnitMissionStore, DerivedFieldWriteError } from "./workunit/mission-store-adapter";
+export { createMissionCommands, type MissionActor, type MissionCommands } from "./workunit/commands";
 import { COMPACTION_HOOK_NAME, buildCompactionContribution } from "./compaction";
 import { resolveWorkerProtocol } from "./roster";
+import { DEFAULT_WORKER_PROTOCOL } from "./worker-protocol-default";
 import { createSessionEventWriter } from "./session-events";
 import { TOKEN_PRESSURE_HOOK_NAME, createTokenWatchdog } from "./token-watchdog";
 import {
@@ -27,13 +39,21 @@ import {
 } from "./dispatch";
 import {
   createMissionStateStore,
+  createTombstoneGuardedStorage,
   listAssignments,
   listAttempts,
   readMission,
   selectPendingOrphans,
   type MissionStorageLike,
+  createLegacyLifecycleStore,
 } from "./state";
 import type { DispatchAgentInfo, DispatchAgentList, SwarmxRuntime, ToolContextLike } from "./types";
+import { getSwarmMailDatabaseAdapter, type DatabaseAdapter } from "swarm-mail";
+import { consumePendingDowngrade, setupWorkUnitRuntime, type WorkUnitRuntime } from "./workunit/ports";
+import { getMission } from "./workunit/mission";
+import { acquireWorkUnitLock, BUILD_LOCK_STALE_MS, buildLockName, releaseWorkUnitLock } from "./workunit/locks";
+import { listUnits } from "./workunit/mission";
+import { projectMission, selectMissionOrphanCandidates } from "./workunit/projection";
 
 function isSwarmCliToolCommand(command: string): boolean {
   const decoded = command.replace(/\\x([0-9a-f]{2})/gi, (_escape, hex: string) =>
@@ -129,12 +149,24 @@ function isSwarmCliToolCommand(command: string): boolean {
   });
 }
 
-async function workerMutationIsUnbound(
+function isBuildOrTestCommand(command: string): boolean {
+  const normalized = command.toLowerCase();
+  return [
+    /\b(?:\.\/)?mvnw?\b.*\b(?:test|compile|package|verify|install)\b/,
+    /\b(?:\.\/)?gradlew?\b.*\b(?:test|build|check)\b/,
+    /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|typecheck|check)\b/,
+    /\b(?:go|cargo)\s+(?:test|build|check)\b/,
+  ].some((pattern) => pattern.test(normalized));
+}
+
+type WorkerMutationDenial = "mission_inactive" | "pending_completion" | "token_missing" | "revoked" | "not_owner" | "read_only_followup";
+
+async function workerMutationDenial(
   runtime: SwarmxRuntime,
   sessionID: string,
   agentID: string | undefined,
-): Promise<boolean> {
-  if (runtime.listAgents === undefined) return true;
+): Promise<WorkerMutationDenial | undefined> {
+  if (runtime.listAgents === undefined) return "token_missing";
   let caller: { readonly mode: string } | undefined;
   try {
     const listed = await runtime.listAgents();
@@ -143,17 +175,19 @@ async function workerMutationIsUnbound(
       : (listed as { readonly data: readonly DispatchAgentInfo[] }).data;
     caller = agents.find((agent: DispatchAgentInfo) => agent.id === agentID);
   } catch {
-    return true;
+    return "token_missing";
   }
-  if (caller === undefined) return true;
-  if (caller.mode === "primary") return false;
+  if (caller === undefined) return "token_missing";
+  if (caller.mode === "primary") return undefined;
+  // Worker capabilities are WorkUnit-only: a CLI-only runtime never binds legacy KV attempts.
+  const native = runtime.workUnit;
   if (
-    runtime.store === undefined ||
+    native === undefined ||
     runtime.projectID === undefined ||
     runtime.resolveWorkerParentSession === undefined ||
     runtime.resolveWorkerCell === undefined
   ) {
-    return true;
+    return "token_missing";
   }
   let parentSessionID: string | null | undefined;
   let marker;
@@ -163,49 +197,69 @@ async function workerMutationIsUnbound(
       runtime.resolveWorkerCell(sessionID),
     ]);
   } catch {
-    return true;
+    return "token_missing";
   }
-  if (parentSessionID === null) return caller.mode !== "primary" && caller.mode !== "all";
-  if (parentSessionID === undefined) return true;
+  if (parentSessionID === null) return caller.mode !== "all" ? "token_missing" : undefined;
+  if (parentSessionID === undefined) return "token_missing";
   let mission;
   try {
-    mission = await readMission(runtime.store, runtime.projectID, parentSessionID);
+    mission = await native.store.load(runtime.projectID, parentSessionID);
   } catch {
-    return true;
+    return "token_missing";
   }
-  if (mission === undefined) return false;
-  if (!mission.active) return marker !== undefined;
-  if (marker?.dispatchToken === undefined || agentID === undefined) return true;
-  let attempts;
+  if (mission === undefined) return undefined;
+  if (!mission.active) return marker !== undefined ? "mission_inactive" : undefined;
+  if (marker?.dispatchToken === undefined || agentID === undefined) return "token_missing";
+  let bindingStatus: "bound" | "already_bound" | "not_owner" | "revoked" | "inactive" | "token_missing";
+  let followup: boolean;
   try {
-    attempts = await listAttempts(runtime.store, runtime.projectID, parentSessionID, mission);
+    {
+      const missionRow = await getMission(native.db, runtime.projectID, parentSessionID);
+      if (missionRow === null || missionRow.mission_id !== mission.missionID) {
+        bindingStatus = "inactive";
+        followup = false;
+      } else {
+        const unit = (await listUnits(native.db, missionRow.id)).find((candidate) =>
+          candidate.dispatch_token === marker?.dispatchToken &&
+          candidate.cell_id === marker.cellID &&
+          candidate.worker_agent === agentID,
+        );
+        if (unit === undefined) {
+          bindingStatus = "token_missing";
+          followup = false;
+        } else if (unit.state === "BOUND") {
+          bindingStatus = unit.worker_session === sessionID ? "already_bound" : "not_owner";
+          followup = unit.budget_charge === 0;
+        } else if (unit.state === "RESERVED") {
+          const bound = await native.commands.bindWorker(
+            { kind: "coordinator", sessionId: parentSessionID },
+            { unitId: unit.id, unitFence: unit.fence, workerSessionId: sessionID, workerAgent: agentID },
+          );
+          bindingStatus = "bound";
+          followup = bound.budget_charge === 0;
+        } else if (
+          (unit.state === "SUBMITTED" || unit.state === "IN_REVIEW") &&
+          unit.worker_session === sessionID
+        ) {
+          // Native pending completion: authoritative without any legacy store.
+          return "pending_completion";
+        } else {
+          bindingStatus = unit.state === "REVOKED" ? "revoked" : "token_missing";
+          followup = false;
+        }
+      }
+    }
   } catch {
-    return true;
+    return "token_missing";
   }
-  const attempt = attempts.find(
-    (candidate) =>
-      candidate.dispatchToken === marker.dispatchToken &&
-      candidate.cellID === marker.cellID &&
-      candidate.epicID === marker.epicID &&
-      candidate.agent === agentID,
-  );
-  if (
-    attempt === undefined ||
-    attempt.revokedAt !== undefined ||
-    attempt.workerSessionID !== sessionID ||
-    (attempt.status !== "pending" && attempt.status !== "succeeded")
-  ) {
-    return true;
-  }
-  const pending = await runtime.store.storage.get(pendingCompletionKey(runtime.projectID, marker.cellID));
-  const pendingRecord =
-    typeof pending === "object" && pending !== null ? (pending as Record<string, unknown>) : undefined;
-  return (
-    pendingRecord?.projectID === runtime.projectID &&
-    pendingRecord.parentSessionID === parentSessionID &&
-    pendingRecord.missionID === (mission.missionID ?? `legacy:${mission.createdAt}`) &&
-    pendingRecord.taskID === marker.cellID
-  );
+  if (bindingStatus === "not_owner") return "not_owner";
+  if (bindingStatus === "revoked") return "revoked";
+  if (bindingStatus === "inactive") return "mission_inactive";
+  if (bindingStatus !== "bound" && bindingStatus !== "already_bound") return "token_missing";
+  if (followup) return "read_only_followup";
+  // Native SUBMITTED/IN_REVIEW denial above is authoritative; there is no
+  // raw-KV pending-completion overlay.
+  return undefined;
 }
 
 /** Optional seams, used by tests to prove the compaction hook calls no CLI. */
@@ -216,6 +270,18 @@ export interface SwarmxPluginOverrides {
    * authoritative for the compaction path, which reads them directly.
    */
   readonly runtime?: Partial<SwarmxRuntime>;
+  /**
+   * WorkUnit DB resolver. Defaults to the canonical `getSwarmMailDatabaseAdapter()`
+   * (in-memory under tests via the `SWARM_DB_PATH=:memory:` preload).
+   */
+  readonly workUnitDatabase?: () => Promise<DatabaseAdapter>;
+  /** Test seam: observes WorkUnit setup steps in order. */
+  readonly workUnitTrace?: (step: string) => void;
+}
+
+/** True when the caller explicitly chose the lifecycle backend (legacy tests pass `workUnit: undefined`). */
+function hasExplicitWorkUnit(runtime: Partial<SwarmxRuntime> | undefined): boolean {
+  return runtime !== undefined && Object.prototype.hasOwnProperty.call(runtime, "workUnit");
 }
 
 /**
@@ -230,14 +296,37 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
 
     async setup(ctx: Plugin.Context) {
       const projectID = ctx.location.project.id;
-      const store = createMissionStateStore(ctx.storage as unknown as MissionStorageLike, {
-        projectID,
-        listAgents: () => ctx.agent.list() as unknown as Promise<DispatchAgentList>,
-      });
+      const store = createMissionStateStore(
+        createTombstoneGuardedStorage(ctx.storage as unknown as MissionStorageLike),
+        {
+          projectID,
+          listAgents: () => ctx.agent.list() as unknown as Promise<DispatchAgentList>,
+        },
+      );
+      // Default lifecycle: schema -> project-wide idempotent migration/tombstone ->
+      // stale-effect recovery -> adapter/commands, all before hooks/tools exist.
+      // An explicit `overrides.runtime.workUnit` (even `undefined`) skips it.
+      let workUnit: WorkUnitRuntime | undefined;
+      if (!hasExplicitWorkUnit(overrides.runtime)) {
+        const legacyLifecycle = createLegacyLifecycleStore(store);
+        const db = await (overrides.workUnitDatabase ?? (() => getSwarmMailDatabaseAdapter()))();
+        workUnit = await setupWorkUnitRuntime(db, {
+          projectID,
+          migrate: { project: projectID, legacyStore: legacyLifecycle },
+          legacyReader: legacyLifecycle,
+          ...(overrides.workUnitTrace === undefined ? {} : { trace: overrides.workUnitTrace }),
+        });
+        overrides.workUnitTrace?.("runtime");
+        // Pending operator downgrade for this project only, before hooks/tools.
+        // Raw storage: the tombstone guard would refuse lifecycle removals.
+        await consumePendingDowngrade(db, ctx.storage as unknown as MissionStorageLike, projectID);
+      }
       const skills = await ctx.skill.list().catch(() => undefined);
       const catalogProtocol = skills?.data.find((skill) => skill.id === "swarm-worker-protocol")?.content;
+      // Fall back to the bundled protocol so workers always receive the survival
+      // checklist even when the host does not expose the skill via ctx.skill.list().
       const workerProtocol = resolveWorkerProtocol(
-        typeof catalogProtocol === "string" ? catalogProtocol : undefined,
+        typeof catalogProtocol === "string" ? catalogProtocol : DEFAULT_WORKER_PROTOCOL,
       );
 
       // Session id fallback: local tool handlers prefer their per-call context,
@@ -264,7 +353,8 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
             return undefined;
           }
         },
-        store,
+        store: workUnit?.store ?? store,
+        ...(workUnit === undefined ? {} : { workUnit }),
         projectID,
         projectPath: ctx.location.project.canonical,
         sessionID: () => activeSessionID,
@@ -282,18 +372,44 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
           event.message = "Use the swarmx plugin tools; direct swarm CLI calls bypass mission gates.";
           return;
         }
-        if (
-          ["edit", "write", "patch", "shell"].includes(event.action) &&
-          (await workerMutationIsUnbound(runtime, event.sessionID, event.agent))
-        ) {
-          event.effect = "deny";
-          event.message = "worker dispatch capability is revoked, unbound, or not owned by this session.";
+        if (["edit", "write", "patch", "shell"].includes(event.action)) {
+          const reason = await workerMutationDenial(runtime, event.sessionID, event.agent);
+          if (reason !== undefined) {
+            event.effect = "deny";
+            event.message = `worker dispatch capability is revoked, unbound, or not owned by this session (${reason}).`;
+            return;
+          }
         }
       });
 
       // Structural bridge: `Plugin.Context` is nominal (Effect schemas), while
       // the catalogue only needs the synchronous `tool.transform` surface.
       await registerTools(ctx as unknown as ToolContextLike, runtime);
+
+      // Build/test serialisation: SQL fenced WorkUnit lock only. CLI-only runtimes
+      // without WorkUnit do not serialise builds and never write KV lock keys.
+      const buildLockFences = new Map<string, number>();
+      const acquireShellBuildLock = async (sessionID: string, callID: string, command: string): Promise<boolean> => {
+        const native = runtime.workUnit;
+        if (native === undefined) return true;
+        const result = await acquireWorkUnitLock(native.db, {
+          name: buildLockName(projectID),
+          token: callID,
+          ownerSession: sessionID,
+          now: Date.now(),
+          staleAfterMs: BUILD_LOCK_STALE_MS,
+        });
+        if (result.acquired) buildLockFences.set(callID, result.fence);
+        return result.acquired;
+      };
+      const releaseShellBuildLock = async (callID: string): Promise<boolean> => {
+        const native = runtime.workUnit;
+        if (native === undefined) return false;
+        const fence = buildLockFences.get(callID);
+        if (fence === undefined) return false;
+        buildLockFences.delete(callID);
+        return releaseWorkUnitLock(native.db, { name: buildLockName(projectID), token: callID, fence });
+      };
 
       const before = (event: {
         tool: string;
@@ -313,16 +429,33 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
 
       await ctx.tool.hook("execute.before", async (event) => {
         activeSessionID = event.sessionID;
-        await gateBefore(store, before(event));
+        if (event.tool === "shell") {
+          const input = event.input;
+          if (typeof input === "object" && input !== null && "command" in input) {
+            const command = input.command;
+            if (typeof command === "string" && isBuildOrTestCommand(command)) {
+              const acquired = await acquireShellBuildLock(event.sessionID, event.id, command).catch(() => false);
+              if (!acquired) {
+                throw new Error(
+                  "another build/test is already running in this project; wait for it to finish before compiling again.",
+                );
+              }
+            }
+          }
+        }
+        await gateBefore(store, before(event), runtime.workUnit);
       });
 
       await ctx.tool.hook("execute.after", async (event) => {
+        if (event.tool === "shell") {
+          await releaseShellBuildLock(event.id).catch(() => undefined);
+        }
         const base = before(event);
         const settled: DispatchAfterEvent =
           event.status === "completed"
             ? { ...base, status: "completed", result: event.result }
             : { ...base, status: "error", error: event.error };
-        await settleAfter(store, settled);
+        await settleAfter(store, settled, runtime.workUnit);
       });
 
       // Context-pressure watchdog: before every model request, read the
@@ -353,6 +486,25 @@ export function createSwarmxPlugin(overrides: SwarmxPluginOverrides = {}) {
       // never a log: the state may contain user data).
       await ctx.session.hook(COMPACTION_HOOK_NAME, async (event) => {
         try {
+          const native = runtime.workUnit;
+          if (native !== undefined) {
+            // Projected MissionState + loadCells; the orphan count is display-only.
+            const row = await getMission(native.db, projectID, event.sessionID);
+            if (row === null) return;
+            const units = await listUnits(native.db, row.id);
+            const state = projectMission({ mission: row, units, assignments: [] });
+            const cells = state.active ? await native.store.loadCells(projectID, event.sessionID) : [];
+            const contribution = buildCompactionContribution(state, {
+              cells,
+              pendingOrphans: selectMissionOrphanCandidates({
+                units,
+                now: runtime.now?.() ?? Date.now(),
+                orphanGraceMs: runtime.orphanGraceMs ?? 0,
+              }).length,
+            });
+            if (contribution !== undefined) event.system.push({ type: "text", text: contribution.text });
+            return;
+          }
           const mission = await readMission(store, projectID, event.sessionID);
           const [attempts, assignments] = await Promise.all([
             listAttempts(store, projectID, event.sessionID, mission),

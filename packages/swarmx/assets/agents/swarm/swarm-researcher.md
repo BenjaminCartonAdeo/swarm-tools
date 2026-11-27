@@ -22,7 +22,6 @@ permission:
   hive_close: deny
   hive_start: deny
   swarm_spawn*: deny
-  swarm_complete*: deny
   swarm_worktree*: deny
   swarmmail_reserve: deny
   swarmmail_release*: deny

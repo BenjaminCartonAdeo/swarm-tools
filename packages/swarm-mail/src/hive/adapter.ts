@@ -37,6 +37,7 @@ import {
   readCellEvents,
   replayCellEvents,
 } from "./store.js";
+import { CellCloseRejectedError, CellNotFoundError, OperationIdConflictError } from "./store.js";
 
 import {
   getCell,
@@ -75,6 +76,20 @@ export function createHiveAdapter(
     // ============================================================================
 
     async createCell(projectKeyParam, options, projectPath?) {
+      const findByOperationId = async () => {
+        if (!options.operation_id) return null;
+        const [found] = await queryCells(db, projectKeyParam, {
+          operation_id: options.operation_id,
+          include_deleted: true,
+          limit: 1,
+        });
+        return found ?? null;
+      };
+
+      // Idempotency: a known operation_id returns the existing cell
+      const existing = await findByOperationId();
+      if (existing) return existing;
+
       // Create bead_created event
       const event: CellEvent = {
         type: "cell_created",
@@ -87,10 +102,19 @@ export function createHiveAdapter(
         priority: options.priority ?? 2,
         parent_id: options.parent_id || null,
         created_by: options.created_by || null,
+        ...(options.operation_id ? { operation_id: options.operation_id } : {}),
         metadata: options.metadata || null,
       } as any;
 
-      await appendCellEvent(event, projectPath, db);
+      try {
+        await appendCellEvent(event, projectPath, db);
+      } catch (error) {
+        // Only a lost race on idx_beads_operation_id is an idempotent duplicate
+        if (!(error instanceof OperationIdConflictError)) throw error;
+        const winner = await findByOperationId();
+        if (winner) return winner;
+        throw error;
+      }
 
       // If assignee provided, emit bead_assigned event
       if (options.assignee) {
@@ -195,7 +219,22 @@ export function createHiveAdapter(
     async closeCell(projectKeyParam, cellId, reason, options?, projectPath?) {
       const existingBead = await getCell(db, projectKeyParam, cellId);
       if (!existingBead) {
-        throw new Error(`[HiveAdapter] Bead not found: ${cellId}`);
+        throw new CellNotFoundError(cellId);
+      }
+
+      const completionOperationId = options?.completion_operation_id;
+      if (!completionOperationId && existingBead.status === "closed") {
+        // Manual close of an already-closed cell: legacy silent no-op, no event.
+        return existingBead;
+      }
+      if (completionOperationId && existingBead.status === "closed") {
+        // Idempotent completion: same identity → return the already-closed cell.
+        if (existingBead.completion_operation_id === completionOperationId) return existingBead;
+        throw new OperationIdConflictError(
+          completionOperationId,
+          new Error(`cell ${cellId} already closed with completion identity ${existingBead.completion_operation_id ?? "<none>"}`),
+          "beads.completion",
+        );
       }
 
       const event: CellEvent = {
@@ -208,9 +247,26 @@ export function createHiveAdapter(
         files_touched: options?.files_touched || null,
         duration_ms: options?.duration_ms || null,
         result: options?.result || null,
+        ...(completionOperationId ? { completion_operation_id: completionOperationId } : {}),
       } as any;
 
-      await appendCellEvent(event, projectPath, db);
+      await appendCellEvent(event, projectPath, db).catch(async (error: unknown) => {
+        if (!(error instanceof CellCloseRejectedError)) throw error;
+        // The guarded batch was a no-op. Classify from current state:
+        // missing → CellNotFoundError; closed with the same identity (incl. both
+        // null for manual closes) → idempotent success; otherwise conflict.
+        const current = await getCell(db, projectKeyParam, cellId);
+        if (!current) throw new CellNotFoundError(cellId);
+        // Manual close (no identity) of a closed cell stays a silent no-op (legacy behaviour).
+        if (!completionOperationId && current.status === "closed") return;
+        const expected = completionOperationId ?? null;
+        if (current.status === "closed" && (current.completion_operation_id ?? null) === expected) return;
+        throw new OperationIdConflictError(
+          completionOperationId ?? "",
+          new Error(`cell ${cellId} closed with completion identity ${current.completion_operation_id ?? "<none>"}`),
+          "beads.completion",
+        );
+      });
 
       const updated = await getCell(db, projectKeyParam, cellId);
       if (!updated) {

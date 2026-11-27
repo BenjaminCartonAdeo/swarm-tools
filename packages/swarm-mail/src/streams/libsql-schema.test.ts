@@ -50,6 +50,26 @@ describe("libSQL streams schema", () => {
       expect(tableNames).toContain("decision_traces");
     });
 
+    test("creates idempotent cell_closed event_token expression index used by the close gate", async () => {
+      const local = await createLibSQLAdapter({ url: ":memory:" });
+      try {
+        await createLibSQLStreamsSchema(local);
+        await createLibSQLStreamsSchema(local);
+        const index = await local.query<{ sql: string }>(
+          "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_cell_closed_event_token'",
+        );
+        expect(index.rows).toHaveLength(1);
+        expect(index.rows[0].sql).toContain("json_extract(data, '$.event_token')");
+        expect(index.rows[0].sql).toContain("WHERE type = 'cell_closed'");
+        const plan = await local.query<{ detail: string }>(
+          "EXPLAIN QUERY PLAN SELECT 1 FROM events WHERE type = 'cell_closed' AND json_extract(data, '$.event_token') = 'tok'",
+        );
+        expect(plan.rows.map((row) => row.detail).join(" ")).toContain("idx_events_cell_closed_event_token");
+      } finally {
+        await local.close?.();
+      }
+    });
+
     test("creates indexes", async () => {
       await createLibSQLStreamsSchema(db);
 
@@ -461,5 +481,176 @@ describe("libSQL streams schema", () => {
       const isValid = await validateLibSQLStreamsSchema(db);
       expect(isValid).toBe(false);
     });
+  });
+});
+
+describe("operation_id upgrade of existing streams schema", () => {
+  const LEGACY_DDL = [
+    `CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL,
+      project_key TEXT NOT NULL,
+      timestamp INTEGER NOT NULL,
+      sequence INTEGER GENERATED ALWAYS AS (id) STORED,
+      data TEXT NOT NULL
+    )`,
+    `CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_key TEXT NOT NULL,
+      from_agent TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      body TEXT NOT NULL,
+      thread_id TEXT,
+      importance TEXT DEFAULT 'normal',
+      ack_required INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL
+    )`,
+    `CREATE TABLE decision_traces (
+      id TEXT PRIMARY KEY,
+      decision_type TEXT NOT NULL,
+      epic_id TEXT,
+      bead_id TEXT,
+      agent_name TEXT NOT NULL,
+      project_key TEXT NOT NULL,
+      decision TEXT NOT NULL,
+      rationale TEXT,
+      inputs_gathered TEXT,
+      policy_evaluated TEXT,
+      alternatives TEXT,
+      precedent_cited TEXT,
+      outcome_event_id INTEGER,
+      quality_score REAL,
+      timestamp INTEGER NOT NULL
+    )`,
+  ];
+
+  async function legacyDb(): Promise<DatabaseAdapter> {
+    const legacy = await createLibSQLAdapter({ url: ":memory:" });
+    for (const ddl of LEGACY_DDL) await legacy.exec(ddl);
+    await legacy.query(
+      "INSERT INTO events (type, project_key, timestamp, data) VALUES ('legacy', '/p', 1, '{}')",
+    );
+    await legacy.query(
+      "INSERT INTO messages (project_key, from_agent, subject, body, created_at) VALUES ('/p', 'a', 's', 'b', 1)",
+    );
+    await legacy.query(
+      "INSERT INTO decision_traces (id, decision_type, agent_name, project_key, decision, timestamp) VALUES ('dt-legacy', 't', 'a', '/p', '{}', 1)",
+    );
+    return legacy;
+  }
+
+  async function columns(target: DatabaseAdapter, table: string): Promise<string[]> {
+    const result = await target.query<{ name: string }>(`PRAGMA table_xinfo('${table}')`);
+    return result.rows.map((r) => r.name);
+  }
+
+  test("existingStreamsSchemaGetsOperationIdColumnsIdempotently", async () => {
+    const legacy = await legacyDb();
+    try {
+      await createLibSQLStreamsSchema(legacy);
+      await createLibSQLStreamsSchema(legacy);
+      for (const table of ["events", "messages", "decision_traces"]) {
+        const names = await columns(legacy, table);
+        expect(names.filter((n) => n === "operation_id")).toEqual(["operation_id"]);
+      }
+      const indexes = await legacy.query<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type='index' AND name IN
+         ('idx_events_operation_id','idx_messages_operation_id','idx_decision_traces_operation_id')
+         ORDER BY name`,
+      );
+      expect(indexes.rows.map((r) => r.name)).toEqual([
+        "idx_decision_traces_operation_id",
+        "idx_events_operation_id",
+        "idx_messages_operation_id",
+      ]);
+      expect(await validateLibSQLStreamsSchema(legacy)).toBe(true);
+    } finally {
+      await legacy.close?.();
+    }
+  });
+
+  test("legacyRowsSurviveOperationIdUpgrade", async () => {
+    const legacy = await legacyDb();
+    try {
+      await createLibSQLStreamsSchema(legacy);
+      const ev = await legacy.query<{ type: string; operation_id: string | null }>(
+        "SELECT type, operation_id FROM events",
+      );
+      expect(ev.rows).toEqual([{ type: "legacy", operation_id: null }]);
+      const msg = await legacy.query<{ subject: string; operation_id: string | null }>(
+        "SELECT subject, operation_id FROM messages",
+      );
+      expect(msg.rows).toEqual([{ subject: "s", operation_id: null }]);
+      const dt = await legacy.query<{ id: string; operation_id: string | null }>(
+        "SELECT id, operation_id FROM decision_traces",
+      );
+      expect(dt.rows).toEqual([{ id: "dt-legacy", operation_id: null }]);
+    } finally {
+      await legacy.close?.();
+    }
+  });
+
+  test("operationIdIndexesRejectNonNullDuplicatesButAllowNulls", async () => {
+    const fresh = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      await createLibSQLStreamsSchema(fresh);
+      const insertEvent = (op: string | null) =>
+        fresh.query(
+          "INSERT INTO events (type, project_key, timestamp, data, operation_id) VALUES ('t', '/p', 1, '{}', ?)",
+          [op],
+        );
+      await insertEvent(null);
+      await insertEvent(null);
+      await insertEvent("op-1");
+      await expect(insertEvent("op-1")).rejects.toThrow(/UNIQUE/);
+
+      const insertMessage = (op: string | null) =>
+        fresh.query(
+          "INSERT INTO messages (project_key, from_agent, subject, body, created_at, operation_id) VALUES ('/p', 'a', 's', 'b', 1, ?)",
+          [op],
+        );
+      await insertMessage(null);
+      await insertMessage(null);
+      await insertMessage("op-1");
+      await expect(insertMessage("op-1")).rejects.toThrow(/UNIQUE/);
+
+      const insertTrace = (id: string, op: string | null) =>
+        fresh.query(
+          "INSERT INTO decision_traces (id, decision_type, agent_name, project_key, decision, timestamp, operation_id) VALUES (?, 't', 'a', '/p', '{}', 1, ?)",
+          [id, op],
+        );
+      await insertTrace("dt-1", null);
+      await insertTrace("dt-2", null);
+      await insertTrace("dt-3", "op-1");
+      await expect(insertTrace("dt-4", "op-1")).rejects.toThrow(/UNIQUE/);
+    } finally {
+      await fresh.close?.();
+    }
+  });
+
+  test("existingReviewFeedbackTableGetsCompletionSeqIdempotently", async () => {
+    const legacy = await createLibSQLAdapter({ url: ":memory:" });
+    try {
+      await legacy.exec(`CREATE TABLE review_feedback_operations (
+        operation_id TEXT PRIMARY KEY, project_key TEXT NOT NULL, unit_id TEXT,
+        task_id TEXT NOT NULL, worker_id TEXT NOT NULL, status TEXT NOT NULL,
+        request_hash TEXT NOT NULL, attempt INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('claimed', 'in_progress', 'done')),
+        claim_token TEXT, host_instance_id TEXT, hostname TEXT, pid INTEGER,
+        result TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+      await legacy.query(
+        "INSERT INTO review_feedback_operations (operation_id, project_key, task_id, worker_id, status, request_hash, attempt, state, created_at, updated_at) VALUES ('op-old', '/p', 't', 'w', 'approved', 'h', 1, 'done', 1, 1)",
+      );
+      await createLibSQLStreamsSchema(legacy);
+      await createLibSQLStreamsSchema(legacy);
+      const names = await columns(legacy, "review_feedback_operations");
+      expect(names.filter((n) => n === "completion_seq")).toEqual(["completion_seq"]);
+      const rows = await legacy.query<{ operation_id: string; completion_seq: number | null }>(
+        "SELECT operation_id, completion_seq FROM review_feedback_operations",
+      );
+      expect(rows.rows).toEqual([{ operation_id: "op-old", completion_seq: null }]);
+    } finally {
+      await legacy.close?.();
+    }
   });
 });

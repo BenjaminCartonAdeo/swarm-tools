@@ -612,6 +612,8 @@ function formatCellForOutput(adapterCell: AdapterCell): Record<string, unknown> 
       ? new Date(Number(adapterCell.closed_at)).toISOString()
       : undefined,
     parent_id: adapterCell.parent_id || undefined,
+    completion_operation_id:
+      (adapterCell as { completion_operation_id?: string | null }).completion_operation_id ?? null,
     dependencies: [], // TODO: fetch from adapter if needed
     metadata: {},
   };
@@ -643,6 +645,10 @@ export const hive_create = tool({
       .string()
       .optional()
       .describe("Parent cell ID for epic children"),
+    operation_id: tool.schema
+      .string()
+      .optional()
+      .describe("Optional idempotency key forwarded unchanged"),
   },
   async execute(args, ctx) {
     const validated = CellCreateArgsSchema.parse(args);
@@ -656,6 +662,9 @@ export const hive_create = tool({
         priority: validated.priority ?? 2,
         description: validated.description,
         parent_id: validated.parent_id,
+        ...(validated.operation_id !== undefined
+          ? { operation_id: validated.operation_id }
+          : {}),
       });
 
       // Mark dirty for export

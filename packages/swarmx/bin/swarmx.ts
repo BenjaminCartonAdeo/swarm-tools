@@ -25,7 +25,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -552,6 +552,16 @@ Commands:
   doctor      Verify installed assets and manifest
   uninstall   Remove managed assets only
 
+Lifecycle operator commands (CLI-only; exit 0 success, 1 refusal, 2 usage):
+  recover [--project <p>] [--effect <id> | --feedback <op>] [--json]
+              Recover stale effect/feedback claims; without --project it scans all projects
+  unit revoke <unit-id> --expected-fence <n> --reason <reason> [--json]
+              Fenced revoke of a RESERVED/BOUND/SUBMITTED WorkUnit
+  mission force-close <mission-pk> --expected-fence <n> --owner-session <session-id> --reason <reason> [--json]
+              Close a CLOSING mission whose live units have failed mandatory effects
+  downgrade --project <p> --yes [--json]
+              Request legacy downgrade; refuses while any mission is OPEN or CLOSING
+
 Options:
   --global, -g            Use global OpenCode directory
   --target, --dir, -t     Target .opencode directory
@@ -562,7 +572,224 @@ Options:
 `);
 }
 
+// ---------------------------------------------------------------------------
+// Lifecycle operator commands (CLI-only; never registered as agent tools)
+//
+//   recover   [--project <p>] [--effect <id> | --feedback <op>] [--json]
+//   unit revoke <unit-id> --expected-fence <n> --reason <reason> [--json]
+//   mission force-close <mission-pk> --expected-fence <n> --owner-session <session-id> --reason <reason> [--json]
+//   downgrade --project <p> --yes [--json]
+//
+// Exit codes: 0 success, 1 refusal/error, 2 usage.
+// ---------------------------------------------------------------------------
+
+const LIFECYCLE_COMMANDS = new Set(["recover", "unit", "mission", "downgrade"]);
+
+class UsageError extends Error {}
+
+type LifecycleErrorCode =
+  | "usage_error"
+  | "live_mission"
+  | "fence_conflict"
+  | "forced_close_not_allowed"
+  | "claim_conflict"
+  | "not_found"
+  | "illegal_transition"
+  | "internal_error";
+
+interface LifecycleFlags {
+  positional: string[];
+  values: Map<string, string>;
+  bools: Set<string>;
+  json: boolean;
+}
+
+function parseLifecycleFlags(argv: string[], valueFlags: string[], boolFlags: string[]): LifecycleFlags {
+  const flags: LifecycleFlags = { positional: [], values: new Map(), bools: new Set(), json: false };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]!;
+    if (arg === "--json") {
+      flags.json = true;
+    } else if (valueFlags.includes(arg)) {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith("--")) throw new UsageError(`${arg} requires a value`);
+      if (flags.values.has(arg)) throw new UsageError(`${arg} given twice`);
+      flags.values.set(arg, value);
+      i += 1;
+    } else if (boolFlags.includes(arg)) {
+      flags.bools.add(arg);
+    } else if (arg.startsWith("-")) {
+      throw new UsageError(`Unknown option ${arg}`);
+    } else {
+      flags.positional.push(arg);
+    }
+  }
+  return flags;
+}
+
+function lifecycleErrorCode(error: unknown): { code: LifecycleErrorCode; exit: number } {
+  if (error instanceof UsageError) return { code: "usage_error", exit: 2 };
+  const name = error instanceof Error ? error.name : "";
+  switch (name) {
+    case "InvalidRevokeReasonError":
+      return { code: "usage_error", exit: 2 };
+    case "LiveMissionError":
+      return { code: "live_mission", exit: 1 };
+    case "FenceConflictError":
+    case "MissionFenceConflictError":
+      return { code: "fence_conflict", exit: 1 };
+    case "ForcedCloseNotAllowedError":
+      return { code: "forced_close_not_allowed", exit: 1 };
+    case "EffectClaimConflictError":
+      return { code: "claim_conflict", exit: 1 };
+    case "EffectNotFoundError":
+    case "WorkUnitNotFoundError":
+    case "ReviewFeedbackNotFoundError":
+      return { code: "not_found", exit: 1 };
+    case "IllegalTransitionError":
+      return { code: "illegal_transition", exit: 1 };
+    default:
+      return { code: "internal_error", exit: 1 };
+  }
+}
+
+class ReviewFeedbackNotFoundError extends Error {
+  constructor(operationId: string) {
+    super(`No unfinished claimed feedback operation ${operationId}`);
+    this.name = "ReviewFeedbackNotFoundError";
+  }
+}
+
+async function openLifecycleDb() {
+  const swarmMail = await import("swarm-mail");
+  const { ensureWorkUnitSchema } = await import("../src/workunit/schema.js");
+  const db = await swarmMail.getSwarmMailDatabaseAdapter();
+  // Schema only: setupWorkUnitRuntime would auto-recover, which the operator controls here.
+  await ensureWorkUnitSchema(db);
+  return { db, swarmMail };
+}
+
+async function runRecover(flags: LifecycleFlags): Promise<Record<string, unknown>> {
+  if (flags.positional.length > 1) throw new UsageError("recover takes no positional arguments");
+  const project = flags.values.get("--project");
+  const effectId = flags.values.get("--effect");
+  const feedbackId = flags.values.get("--feedback");
+  if (effectId !== undefined && feedbackId !== undefined) {
+    throw new UsageError("--effect and --feedback are mutually exclusive");
+  }
+  const { db, swarmMail } = await openLifecycleDb();
+  const effects = await import("../src/workunit/effects.js");
+  const { isProcessAlive } = await import("../src/workunit/ports.js");
+  const { getOrCreateHostInstanceId } = await import("../src/workunit/store.js");
+  const host = hostname();
+  const hostInstanceId = await getOrCreateHostInstanceId(db, host);
+
+  const stale = await effects.recoverStaleEffects(db, {
+    hostInstanceId, hostname: host, isProcessAlive, ...(project === undefined ? {} : { project }),
+  });
+  const feedback = await swarmMail.recoverStaleReviewFeedback(
+    { hostname: host, isProcessAlive, ...(project === undefined ? {} : { projectKey: project }) },
+    db,
+  );
+  const out: Record<string, unknown> = {
+    recoveredEffects: stale.recoveredEffects,
+    recoveredFeedback: feedback.recoveredOperations,
+    foreignHostEffects: stale.foreignHostCandidates,
+    foreignHostFeedback: feedback.foreignCandidates,
+  };
+  if (effectId !== undefined) {
+    const token = await effects.readEffectClaimToken(db, effectId, project);
+    if (token === undefined) throw new effects.EffectNotFoundError(effectId);
+    if (token === null) throw new effects.EffectClaimConflictError(effectId);
+    await effects.recoverEffectClaim(db, {
+      effectId, expectedClaimToken: token, ...(project === undefined ? {} : { project }),
+    });
+    out.explicitEffect = effectId;
+  }
+  if (feedbackId !== undefined) {
+    const released = await swarmMail.recoverReviewFeedbackOperation(feedbackId, db, project);
+    if (!released) throw new ReviewFeedbackNotFoundError(feedbackId);
+    out.explicitFeedback = feedbackId;
+  }
+  return out;
+}
+
+async function runUnitRevoke(flags: LifecycleFlags): Promise<Record<string, unknown>> {
+  const [, sub, unitId, ...rest] = flags.positional;
+  if (sub !== "revoke") throw new UsageError("Usage: swarmx unit revoke <unit-id> --expected-fence <n> --reason <reason>");
+  if (unitId === undefined || rest.length > 0) throw new UsageError("unit revoke requires exactly one <unit-id>");
+  const fenceRaw = flags.values.get("--expected-fence");
+  if (fenceRaw === undefined || !/^\d+$/.test(fenceRaw)) throw new UsageError("--expected-fence <n> is required");
+  const reason = flags.values.get("--reason");
+  if (reason === undefined || reason.trim().length === 0) throw new UsageError("--reason <reason> is required and nonblank");
+  const { db } = await openLifecycleDb();
+  const { revokeWorkUnit } = await import("../src/workunit/store.js");
+  const unit = await revokeWorkUnit(db, { unitId, expectedFence: Number(fenceRaw), reason });
+  return { unitId: unit.id, state: "REVOKED", fence: Number(unit.fence), reason: unit.reason };
+}
+
+async function runMissionForceClose(flags: LifecycleFlags): Promise<Record<string, unknown>> {
+  const usage = "Usage: swarmx mission force-close <mission-pk> --expected-fence <n> --owner-session <session-id> --reason <reason>";
+  const [, sub, missionPk, ...rest] = flags.positional;
+  if (sub !== "force-close") throw new UsageError(usage);
+  if (missionPk === undefined || rest.length > 0) throw new UsageError("mission force-close requires exactly one <mission-pk>");
+  const fenceRaw = flags.values.get("--expected-fence");
+  if (fenceRaw === undefined || !/^\d+$/.test(fenceRaw)) throw new UsageError("--expected-fence <n> is required");
+  const owner = flags.values.get("--owner-session");
+  if (owner === undefined || owner.trim().length === 0) throw new UsageError("--owner-session <session-id> is required");
+  const reason = flags.values.get("--reason")?.trim();
+  if (reason === undefined || reason.length === 0) throw new UsageError("--reason <reason> is required and nonblank");
+  const { db } = await openLifecycleDb();
+  const { forceMissionClose } = await import("../src/workunit/effects.js");
+  const mission = await forceMissionClose(db, { missionPk, expectedFence: Number(fenceRaw), ownerSessionId: owner });
+  return { missionId: mission.id, state: mission.state, fence: Number(mission.fence), reason };
+}
+
+async function runDowngrade(flags: LifecycleFlags): Promise<Record<string, unknown>> {
+  if (flags.positional.length > 1) throw new UsageError("downgrade takes no positional arguments");
+  const project = flags.values.get("--project");
+  if (project === undefined || project.length === 0) throw new UsageError("--project <project> is required");
+  if (!flags.bools.has("--yes")) throw new UsageError("downgrade requires --yes");
+  const { db } = await openLifecycleDb();
+  const { requestDowngrade } = await import("../src/workunit/store.js");
+  return requestDowngrade(db, project);
+}
+
+export async function runLifecycleCommand(argv: string[]): Promise<number> {
+  let json = argv.includes("--json");
+  try {
+    const command = argv[0];
+    let result: Record<string, unknown>;
+    if (command === "recover") {
+      const flags = parseLifecycleFlags(argv, ["--project", "--effect", "--feedback"], []);
+      json = flags.json;
+      result = await runRecover(flags);
+    } else if (command === "unit") {
+      const flags = parseLifecycleFlags(argv, ["--expected-fence", "--reason"], []);
+      json = flags.json;
+      result = await runUnitRevoke(flags);
+    } else if (command === "mission") {
+      const flags = parseLifecycleFlags(argv, ["--expected-fence", "--owner-session", "--reason"], []);
+      json = flags.json;
+      result = await runMissionForceClose(flags);
+    } else {
+      const flags = parseLifecycleFlags(argv, ["--project"], ["--yes"]);
+      json = flags.json;
+      result = await runDowngrade(flags);
+    }
+    console.log(json ? JSON.stringify(result) : JSON.stringify(result, null, 2));
+    return 0;
+  } catch (error) {
+    const { code, exit } = lifecycleErrorCode(error);
+    const message = error instanceof Error ? error.message : String(error);
+    if (json) console.log(JSON.stringify({ error: { code, message } }));
+    else console.error(`${code}: ${message}`);
+    return exit;
+  }
+}
+
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+  if (argv[0] !== undefined && LIFECYCLE_COMMANDS.has(argv[0])) return runLifecycleCommand(argv);
   const parsed = parseArgs(argv);
 
   if (parsed.showVersion) {

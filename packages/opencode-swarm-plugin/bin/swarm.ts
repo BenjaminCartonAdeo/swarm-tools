@@ -65,13 +65,13 @@ import { tmpdir } from "os";
 
 // Query & observability tools
 import {
-  executeQuery,
   executeQueryCLI,
   executePreset,
   formatAsTable,
   formatAsCSV,
   formatAsJSON,
 } from "../src/query-tools.js";
+import type { QueryResult } from "../src/query-tools.js";
 import {
   getWorkerStatus,
   getSubtaskProgress,
@@ -110,6 +110,7 @@ import { detectRegressions } from "../src/regression-detection.js";
 
 // All tools (for tool command)
 import { allTools } from "../src/index.js";
+import { parseToolArgsJson } from "./tool-args.js";
 
 // Skills (for skill-reload command)
 import { invalidateSkillsCache, discoverSkills } from "../src/skills.js";
@@ -2531,7 +2532,7 @@ async function setup(forceReinstall = false, nonInteractive = false) {
   // Model defaults: opus for coordinator, sonnet for worker, haiku for lite
   const DEFAULT_COORDINATOR = "anthropic/claude-opus-4-5";
   const DEFAULT_WORKER = "anthropic/claude-sonnet-4-5";
-  const DEFAULT_LITE = "anthropic/claude-haiku-4-5";
+  const DEFAULT_LITE = "opencode-go/deepseek-v4.1-flash";
 
   // Model selection (skip if non-interactive)
   let coordinatorModel: string;
@@ -2651,9 +2652,14 @@ async function setup(forceReinstall = false, nonInteractive = false) {
       message: "Select lite model (for docs, tests, simple edits):",
       options: [
         {
+          value: "opencode-go/deepseek-v4.1-flash",
+          label: "DeepSeek V4.1 Flash (opencode-go)",
+          hint: "Fast and cost-effective (recommended)",
+        },
+        {
           value: "anthropic/claude-haiku-4-5",
           label: "Claude Haiku 4.5",
-          hint: "Fast and cost-effective (recommended)",
+          hint: "Fast and cost-effective",
         },
         {
           value: "anthropic/claude-sonnet-4-5",
@@ -3197,16 +3203,16 @@ async function query() {
   const projectPath = process.cwd();
 
   try {
-    let rows: any[];
+    let result: QueryResult;
 
     if (parsed.preset) {
       // Execute preset query
       p.log.step(`Executing preset: ${parsed.preset}`);
-      rows = await executePreset(projectPath, parsed.preset);
+      result = await executePreset(projectPath, parsed.preset);
     } else if (parsed.query) {
       // Execute custom SQL
       p.log.step("Executing custom SQL");
-      rows = await executeQuery(projectPath, parsed.query);
+      result = await executeQueryCLI(projectPath, parsed.query);
     } else {
       p.log.error("No query specified. Use --sql or --preset");
       p.outro("Aborted");
@@ -3217,14 +3223,14 @@ async function query() {
     let output: string;
     switch (parsed.format) {
       case "csv":
-        output = formatAsCSV(rows);
+        output = formatAsCSV(result);
         break;
       case "json":
-        output = formatAsJSON(rows);
+        output = formatAsJSON(result);
         break;
       case "table":
       default:
-        output = formatAsTable(rows);
+        output = formatAsTable(result);
         break;
     }
 
@@ -3232,7 +3238,7 @@ async function query() {
     console.log(output);
     console.log();
 
-    p.outro(`Found ${rows.length} result(s)`);
+    p.outro(`Found ${result.rowCount} result(s)`);
   } catch (error) {
     p.log.error("Query failed");
     p.log.message(error instanceof Error ? error.message : String(error));
@@ -3736,7 +3742,7 @@ async function executeTool(toolName: string, argsJson?: string) {
   let args: Record<string, unknown> = {};
   if (argsJson) {
     try {
-      args = JSON.parse(argsJson);
+      args = parseToolArgsJson(argsJson);
     } catch (e) {
       console.log(
         JSON.stringify({
@@ -5243,7 +5249,7 @@ async function stats() {
 			(strategyResult.rows as Array<{ strategy: string | null; success: string }>).map(
 				(row) => ({
 					strategy: row.strategy,
-					success: row.success === "true",
+					success: row.success === true || row.success === "true" || row.success === 1,
 				}),
 			),
 		);
@@ -5283,9 +5289,11 @@ async function stats() {
 					for (const line of lines) {
 						try {
 							const event = JSON.parse(line);
-							if (event.type === "VIOLATION") violations++;
-							if (event.type === "DECISION" && event.action === "spawn") spawns++;
-							if (event.type === "DECISION" && event.action === "review") reviews++;
+							const eventType = event.event_type || event.type;
+							const decisionType = event.decision_type || event.action;
+							if (eventType === "VIOLATION") violations++;
+							if (eventType === "DECISION" && decisionType === "worker_spawned") spawns++;
+							if (eventType === "DECISION" && decisionType === "review_completed") reviews++;
 						} catch {
 							// Skip invalid lines
 						}

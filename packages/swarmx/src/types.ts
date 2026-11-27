@@ -8,7 +8,8 @@
  */
 
 import type { SessionEventSink } from "./session-events";
-import type { MissionStateStore } from "./state";
+import type { MissionStore } from "./state";
+import type { WorkUnitRuntime } from "./workunit/ports";
 
 /** JSON-serialisable value, aligned with plugin storage's `Schema.Json`. */
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -187,7 +188,16 @@ export interface SwarmxRuntime {
   /** Parent session recorded by OpenCode for the actual worker session. */
   resolveWorkerParentSession?: (sessionID: string) => Promise<string | null | undefined>;
   /** Mission store backing budget/finish/audit/assignments. */
-  store?: MissionStateStore;
+  store?: MissionStore;
+  /** Epoch-ms clock override for lifecycle decisions. */
+  now?: () => number;
+  /** Grace window (ms) before a pending attempt is treated as orphaned. */
+  orphanGraceMs?: number;
+  /**
+   * Additive WorkUnit runtime (Task 13c). Undefined in the default plugin setup;
+   * tests inject it through the runtime override seam. The legacy `store` stays authoritative.
+   */
+  workUnit?: WorkUnitRuntime;
   /** Project id bound to the mission documents (production: `location.project.id`). */
   projectID?: string;
   /** Canonical project root used to constrain scoped review tools. */
@@ -397,6 +407,8 @@ export interface DispatchAttempt {
   dispatchToken?: string;
   /** V2 child session bound on its first scoped worker tool call. */
   workerSessionID?: string;
+  /** True for read-only follow-up dispatches that do not consume a cell iteration. */
+  followup?: boolean;
   /** Set after review feedback or finalization revokes this worker attempt. */
   revokedAt?: IsoTimestamp;
 }

@@ -32,7 +32,8 @@
  */
 
 import { 
-  createDecisionTrace, 
+  createDecisionTrace,
+  createDecisionTraceWithReplay,
   createEntityLink,
   type DecisionTraceInput,
   type EntityLinkInput,
@@ -272,6 +273,8 @@ export interface ReviewDecisionInput {
   attemptNumber?: number;
   remainingAttempts?: number;
   rationale?: string;
+  /** Optional idempotency key; a replay returns the persisted trace */
+  operationId?: string;
 }
 
 /**
@@ -289,7 +292,7 @@ export async function traceReviewDecision(
   try {
     const db = await getTraceDb(input.projectKey);
 
-    const trace = await createDecisionTrace(db, {
+    const { trace, duplicate } = await createDecisionTraceWithReplay(db, {
       decision_type: "review_decision",
       epic_id: input.epicId,
       bead_id: input.beadId,
@@ -306,10 +309,11 @@ export async function traceReviewDecision(
       inputs_gathered: input.issues
         ? [{ source: "code_review", issues: input.issues }]
         : undefined,
+      ...(input.operationId ? { operation_id: input.operationId } : {}),
     });
 
-    // Create entity link to the worker agent being reviewed
-    await createEntityLink(db, {
+    // Create entity link to the worker agent being reviewed (once per trace)
+    if (!duplicate) await createEntityLink(db, {
       source_decision_id: trace.id,
       target_entity_type: "agent",
       target_entity_id: input.workerId,

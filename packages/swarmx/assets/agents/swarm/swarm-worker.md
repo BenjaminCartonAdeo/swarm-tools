@@ -112,7 +112,7 @@ Rules of engagement:
   are refused for you — do not retry them. Worktree cleanup, shared skill mutations, and
   `hivemind_remove` are also refused. `hive_update` may only mark your cell
   `in_progress` or `blocked`; do not change its description, priority, or completion state.
-- Complete through `swarm_complete` with `start_time` and a non-empty `files_touched` list.
+- Complete through `swarm_complete` with `start_time` optional and `files_touched` possibly empty for research/analysis tasks. Never use `swarm_progress(status="completed")` as a completion substitute.
   Never set `skip_review` or `skip_verification`; swarmx rejects these bypasses for every
   caller.
 - Bounded reads: open files by range once the brief exists; never re-explore what the

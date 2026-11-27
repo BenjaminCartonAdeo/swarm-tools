@@ -161,6 +161,41 @@ describe("captureSubtaskOutcome integration", () => {
     }
   });
 
+  test("forwards operation_id as an idempotent completion identity", async () => {
+    const { hive_create_epic } = await import("./hive");
+    const epicResult = await hive_create_epic.execute({
+      epic_title: "Identity epic",
+      subtasks: [{ title: "Identity subtask", priority: 2, files: ["src/x.ts"] }],
+    }, mockContext);
+    const beadId = JSON.parse(epicResult).subtasks[0].id;
+    const runId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const complete = async (operationId: string) => JSON.parse(await swarm_complete.execute({
+      project_key: testProjectPath,
+      agent_name: "TestAgent",
+      bead_id: beadId,
+      summary: "Done",
+      files_touched: ["src/x.ts"],
+      skip_verification: true,
+      skip_review: true,
+      start_time: Date.now() - 1000,
+      operation_id: `${operationId}-${runId}`,
+    }, mockContext));
+
+    const first = await complete("effect-complete-A");
+    expect(first).toMatchObject({ success: true });
+    expect(await complete("effect-complete-A")).toMatchObject({ success: true, idempotent_replay: true });
+    const { getHiveAdapter } = await import("./hive");
+    const adapter = await getHiveAdapter(testProjectPath);
+    expect(await adapter.getCell(testProjectPath, beadId)).toMatchObject({
+      status: "closed",
+      completion_operation_id: `effect-complete-A-${runId}`,
+    });
+    const conflict = await complete("effect-complete-B");
+    expect(conflict.success).toBe(false);
+    expect(conflict).toMatchObject({ conflict: true, error_type: "operation_id_conflict" });
+    expect((await adapter.getCell(testProjectPath, beadId))?.completion_operation_id).toBe(`effect-complete-A-${runId}`);
+  });
+
   test("calls captureSubtaskOutcome after successful completion with all params", async () => {
     // Import hive tools
     const { hive_create_epic } = await import("./hive");

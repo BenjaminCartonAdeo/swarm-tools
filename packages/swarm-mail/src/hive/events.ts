@@ -67,6 +67,8 @@ export interface CellCreatedEvent extends BaseCellEvent {
   priority: number;
   parent_id?: string;
   created_by?: string;
+  /** Idempotency key: one operation_id never creates two cells */
+  operation_id?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -96,6 +98,10 @@ export interface CellClosedEvent extends BaseCellEvent {
   duration_ms?: number;
   /** Implementation summary - what was actually done (like a PR description) */
   result?: string;
+  /** Idempotent completion identity persisted on the cell (migration v12) */
+  completion_operation_id?: string;
+  /** Unique internal token of this close event (guards the atomic close batch); not a cell identity */
+  event_token?: string;
 }
 
 export interface CellReopenedEvent extends BaseCellEvent {

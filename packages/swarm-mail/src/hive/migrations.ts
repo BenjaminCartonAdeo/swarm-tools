@@ -576,6 +576,252 @@ export const beadsResultColumnsMigrationLibSQL: Migration = {
   `,
 };
 
+const V11_CELLS_COLUMNS = `id, project_key, type, status, title,
+        description, priority, parent_id, assignee,
+        created_at, updated_at, closed_at, closed_reason,
+        deleted_at, deleted_by, delete_reason, created_by,
+        result, result_at, operation_id`;
+
+/**
+ * Migration v11: idempotent creation via nullable operation_id (LibSQL).
+ *
+ * Additive: nullable column + partial unique index. The cells view is rebuilt
+ * with an explicit, stable column order (operation_id appended last) so old
+ * readers selecting named columns keep working.
+ *
+ * Rollback: drop index, drop view (drops its INSTEAD OF triggers), drop the
+ * column (SQLite >= 3.35 / libSQL), then restore the v10 view and the v10
+ * triggers verbatim (trigger SQL text is identical to v10's).
+ */
+export const beadsOperationIdMigrationLibSQL: Migration = {
+  version: 11,
+  description: "Add nullable unique operation_id to beads (LibSQL)",
+  up: `
+    DROP VIEW IF EXISTS cells;
+    ALTER TABLE beads ADD COLUMN operation_id TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_beads_operation_id
+      ON beads(operation_id) WHERE operation_id IS NOT NULL;
+
+    CREATE VIEW cells AS SELECT
+        ${V11_CELLS_COLUMNS}
+      FROM beads;
+
+    CREATE TRIGGER cells_insert
+      INSTEAD OF INSERT ON cells
+      FOR EACH ROW
+    BEGIN
+      INSERT INTO beads (${V11_CELLS_COLUMNS})
+      VALUES (
+        NEW.id, NEW.project_key, NEW.type, NEW.status, NEW.title,
+        NEW.description, NEW.priority, NEW.parent_id, NEW.assignee,
+        NEW.created_at, NEW.updated_at, NEW.closed_at, NEW.closed_reason,
+        NEW.deleted_at, NEW.deleted_by, NEW.delete_reason, NEW.created_by,
+        NEW.result, NEW.result_at, NEW.operation_id
+      );
+    END;
+
+    CREATE TRIGGER cells_update
+      INSTEAD OF UPDATE ON cells
+      FOR EACH ROW
+    BEGIN
+      UPDATE beads SET
+        project_key = NEW.project_key,
+        type = NEW.type,
+        status = NEW.status,
+        title = NEW.title,
+        description = NEW.description,
+        priority = NEW.priority,
+        parent_id = NEW.parent_id,
+        assignee = NEW.assignee,
+        created_at = NEW.created_at,
+        updated_at = NEW.updated_at,
+        closed_at = NEW.closed_at,
+        closed_reason = NEW.closed_reason,
+        deleted_at = NEW.deleted_at,
+        deleted_by = NEW.deleted_by,
+        delete_reason = NEW.delete_reason,
+        created_by = NEW.created_by,
+        result = NEW.result,
+        result_at = NEW.result_at,
+        operation_id = NEW.operation_id
+      WHERE id = NEW.id;
+    END;
+
+    CREATE TRIGGER cells_delete
+      INSTEAD OF DELETE ON cells
+      FOR EACH ROW
+    BEGIN
+      DELETE FROM beads WHERE id = OLD.id;
+    END;
+  `,
+  down: `
+    DROP INDEX IF EXISTS idx_beads_operation_id;
+    DROP VIEW IF EXISTS cells;
+    ALTER TABLE beads DROP COLUMN operation_id;
+    CREATE VIEW cells AS SELECT * FROM beads;
+
+    CREATE TRIGGER cells_insert
+      INSTEAD OF INSERT ON cells
+      FOR EACH ROW
+    BEGIN
+      INSERT INTO beads (id, project_key, type, status, title,
+        description, priority, parent_id, assignee,
+        created_at, updated_at, closed_at, closed_reason,
+        deleted_at, deleted_by, delete_reason, created_by,
+        result, result_at)
+      VALUES (
+        NEW.id, NEW.project_key, NEW.type, NEW.status, NEW.title,
+        NEW.description, NEW.priority, NEW.parent_id, NEW.assignee,
+        NEW.created_at, NEW.updated_at, NEW.closed_at, NEW.closed_reason,
+        NEW.deleted_at, NEW.deleted_by, NEW.delete_reason, NEW.created_by,
+        NEW.result, NEW.result_at
+      );
+    END;
+
+    CREATE TRIGGER cells_update
+      INSTEAD OF UPDATE ON cells
+      FOR EACH ROW
+    BEGIN
+      UPDATE beads SET
+        project_key = NEW.project_key,
+        type = NEW.type,
+        status = NEW.status,
+        title = NEW.title,
+        description = NEW.description,
+        priority = NEW.priority,
+        parent_id = NEW.parent_id,
+        assignee = NEW.assignee,
+        created_at = NEW.created_at,
+        updated_at = NEW.updated_at,
+        closed_at = NEW.closed_at,
+        closed_reason = NEW.closed_reason,
+        deleted_at = NEW.deleted_at,
+        deleted_by = NEW.deleted_by,
+        delete_reason = NEW.delete_reason,
+        created_by = NEW.created_by,
+        result = NEW.result,
+        result_at = NEW.result_at
+      WHERE id = NEW.id;
+    END;
+
+    CREATE TRIGGER cells_delete
+      INSTEAD OF DELETE ON cells
+      FOR EACH ROW
+    BEGIN
+      DELETE FROM beads WHERE id = OLD.id;
+    END;
+  `,
+};
+
+/**
+ * Migration v11 (PGLite): nullable unique operation_id.
+ * Rollback re-applies the v8 view/trigger definitions after dropping the column.
+ */
+export const beadsOperationIdMigration: Migration = {
+  version: 11,
+  description: "Add nullable unique operation_id to beads",
+  up: `
+    ALTER TABLE beads ADD COLUMN IF NOT EXISTS operation_id TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_beads_operation_id
+      ON beads(operation_id) WHERE operation_id IS NOT NULL;
+    CREATE OR REPLACE VIEW cells AS SELECT
+        ${V11_CELLS_COLUMNS}
+      FROM beads;
+  `,
+  down: `
+    DROP INDEX IF EXISTS idx_beads_operation_id;
+    DROP VIEW IF EXISTS cells CASCADE;
+    ALTER TABLE beads DROP COLUMN IF EXISTS operation_id;
+    ${cellsViewMigration.up}
+  `,
+};
+
+const V12_CELLS_COLUMNS = `${V11_CELLS_COLUMNS}, completion_operation_id`;
+
+/** Build the LibSQL cells view + INSTEAD OF triggers for an explicit, stable column order. */
+function libsqlCellsViewSql(columns: string): string {
+  const names = columns.split(",").map((name) => name.trim()).filter((name) => name.length > 0);
+  const values = names.map((name) => `NEW.${name}`).join(", ");
+  const updates = names.filter((name) => name !== "id").map((name) => `${name} = NEW.${name}`).join(",\n        ");
+  return `
+    CREATE VIEW cells AS SELECT ${names.join(", ")} FROM beads;
+
+    CREATE TRIGGER cells_insert
+      INSTEAD OF INSERT ON cells
+      FOR EACH ROW
+    BEGIN
+      INSERT INTO beads (${names.join(", ")}) VALUES (${values});
+    END;
+
+    CREATE TRIGGER cells_update
+      INSTEAD OF UPDATE ON cells
+      FOR EACH ROW
+    BEGIN
+      UPDATE beads SET
+        ${updates}
+      WHERE id = NEW.id;
+    END;
+
+    CREATE TRIGGER cells_delete
+      INSTEAD OF DELETE ON cells
+      FOR EACH ROW
+    BEGIN
+      DELETE FROM beads WHERE id = OLD.id;
+    END;
+  `;
+}
+
+/**
+ * Migration v12: completion identity (LibSQL).
+ *
+ * Adds nullable `completion_operation_id` recorded when a cell is closed by an
+ * idempotent completion. A partial unique index guarantees one identity never
+ * closes two cells. The cells view/triggers are rebuilt with an explicit column
+ * order (v11 columns first), so readers selecting named columns keep working.
+ *
+ * Rollback: drop index, drop view (and its triggers), drop the column, then
+ * rebuild the v11 view/triggers with the v11 column order.
+ */
+export const beadsCompletionOperationIdMigrationLibSQL: Migration = {
+  version: 12,
+  description: "Add nullable unique completion_operation_id to beads (LibSQL)",
+  up: `
+    DROP VIEW IF EXISTS cells;
+    ALTER TABLE beads ADD COLUMN completion_operation_id TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_beads_completion_operation_id
+      ON beads(completion_operation_id) WHERE completion_operation_id IS NOT NULL;
+    ${libsqlCellsViewSql(V12_CELLS_COLUMNS)}
+  `,
+  down: `
+    DROP INDEX IF EXISTS idx_beads_completion_operation_id;
+    DROP VIEW IF EXISTS cells;
+    ALTER TABLE beads DROP COLUMN completion_operation_id;
+    ${libsqlCellsViewSql(V11_CELLS_COLUMNS)}
+  `,
+};
+
+/** Migration v12 (PGLite): nullable unique completion_operation_id. */
+export const beadsCompletionOperationIdMigration: Migration = {
+  version: 12,
+  description: "Add nullable unique completion_operation_id to beads",
+  up: `
+    ALTER TABLE beads ADD COLUMN IF NOT EXISTS completion_operation_id TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_beads_completion_operation_id
+      ON beads(completion_operation_id) WHERE completion_operation_id IS NOT NULL;
+    CREATE OR REPLACE VIEW cells AS SELECT
+        ${V12_CELLS_COLUMNS}
+      FROM beads;
+  `,
+  down: `
+    DROP INDEX IF EXISTS idx_beads_completion_operation_id;
+    DROP VIEW IF EXISTS cells CASCADE;
+    ALTER TABLE beads DROP COLUMN IF EXISTS completion_operation_id;
+    CREATE VIEW cells AS SELECT
+        ${V11_CELLS_COLUMNS}
+      FROM beads;
+  `,
+};
+
 /**
  * Export individual migrations
  */
@@ -584,7 +830,13 @@ export const beadsMigrations: Migration[] = [beadsMigration];
 /**
  * All hive migrations in order (PGLite version)
  */
-export const hiveMigrations: Migration[] = [beadsMigration, cellsViewMigration, beadsResultColumnsMigration];
+export const hiveMigrations: Migration[] = [
+  beadsMigration,
+  cellsViewMigration,
+  beadsResultColumnsMigration,
+  beadsOperationIdMigration,
+  beadsCompletionOperationIdMigration,
+];
 
 /**
  * Migration v9: Add sessions table for handoff notes
@@ -631,4 +883,6 @@ export const hiveMigrationsLibSQL: Migration[] = [
 	cellsViewMigrationLibSQL,
 	sessionsMigrationLibSQL,
 	beadsResultColumnsMigrationLibSQL,
+	beadsOperationIdMigrationLibSQL,
+	beadsCompletionOperationIdMigrationLibSQL,
 ];

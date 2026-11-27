@@ -114,9 +114,9 @@ describe("Migration Runner - Schema Validation", () => {
         type TEXT NOT NULL,
         project_key TEXT NOT NULL,
         timestamp INTEGER NOT NULL,
-        sequence INTEGER,
+        sequence INTEGER GENERATED ALWAYS AS (id) STORED,
         data TEXT NOT NULL,
-        created_at TEXT DEFAULT (datetime('now'))
+        operation_id TEXT
       )
     `);
 

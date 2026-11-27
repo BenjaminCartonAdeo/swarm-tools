@@ -323,6 +323,21 @@ describe("swarm_review_feedback", () => {
     expect(swarm_review_feedback.description).toContain("max 3");
   });
 
+  it("accepts operationId unchanged and preserves absence", async () => {
+    const { z } = await import("zod");
+    const schema = z.object(swarm_review_feedback.args);
+    const base = {
+      project_key: "/tmp/test-project",
+      task_id: "bd-feedback-test",
+      worker_id: "w",
+      status: "approved" as const,
+    };
+    expect(schema.parse({ ...base, operation_id: "op-ÉX 42/α" }).operation_id).toBe(
+      "op-ÉX 42/α",
+    );
+    expect("operation_id" in schema.parse(base)).toBe(false);
+  });
+
   it("sends approved feedback successfully", async () => {
     const result = await swarm_review_feedback.execute(
       {

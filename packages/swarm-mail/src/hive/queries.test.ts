@@ -743,6 +743,25 @@ describe("beads/queries", () => {
       expect(results[0].id).toBe(cell.id);
     });
 
+    test("preserves operation identities for partial ID lookup", async () => {
+      const cell = await beads.createCell(projectKey, {
+        title: "Identity task",
+        type: "task",
+        priority: 2,
+        operation_id: "create-op",
+      });
+      await beads.closeCell(projectKey, cell.id, "done", { completion_operation_id: "complete-op" });
+
+      const { findCellsByPartialId } = await import("./queries.js");
+      const results = await findCellsByPartialId(beads, projectKey, cell.id);
+
+      expect(results).toHaveLength(1);
+      expect(results[0]).toMatchObject({
+        operation_id: "create-op",
+        completion_operation_id: "complete-op",
+      });
+    });
+
     test("ignores deleted cells", async () => {
       const cell = await beads.createCell(projectKey, {
         title: "To be deleted",

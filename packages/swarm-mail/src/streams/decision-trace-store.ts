@@ -37,6 +37,7 @@
 
 import { nanoid } from "nanoid";
 import type { DatabaseAdapter } from "../types/database.js";
+import { isOperationIdUniqueViolation } from "../operation-id-conflict.js";
 
 /**
  * Input for creating a decision trace.
@@ -65,6 +66,8 @@ export interface DecisionTraceInput {
   alternatives?: Array<Record<string, unknown>>;
   /** Prior decisions or memories cited as precedent */
   precedent_cited?: Record<string, unknown>;
+  /** Optional idempotency key; a replay returns the persisted trace */
+  operation_id?: string;
 }
 
 /**
@@ -87,6 +90,7 @@ export interface DecisionTrace {
   quality_score: number | null;
   timestamp: number;
   created_at: string | null;
+  operation_id?: string | null;
 }
 
 /**
@@ -167,15 +171,43 @@ export async function createDecisionTrace(
   db: DatabaseAdapter,
   input: DecisionTraceInput,
 ): Promise<DecisionTrace> {
+  return (await createDecisionTraceWithReplay(db, input)).trace;
+}
+
+async function findDecisionTraceByOperationId(
+  db: DatabaseAdapter,
+  operationId: string,
+): Promise<DecisionTrace | null> {
+  const found = await db.query<DecisionTrace>(
+    "SELECT * FROM decision_traces WHERE operation_id = ?",
+    [operationId],
+  );
+  const row = found.rows[0];
+  return row ? { ...row, created_at: row.created_at ?? null } : null;
+}
+
+/**
+ * Create a decision trace, reporting whether an operation-keyed replay
+ * returned the already persisted trace (no second row is written).
+ */
+export async function createDecisionTraceWithReplay(
+  db: DatabaseAdapter,
+  input: DecisionTraceInput,
+): Promise<{ trace: DecisionTrace; duplicate: boolean }> {
+  if (input.operation_id) {
+    const existing = await findDecisionTraceByOperationId(db, input.operation_id);
+    if (existing) return { trace: existing, duplicate: true };
+  }
   const id = `dt-${nanoid(10)}`;
   const timestamp = Date.now();
 
+  try {
   await db.query(
     `INSERT INTO decision_traces (
       id, decision_type, epic_id, bead_id, agent_name, project_key,
       decision, rationale, inputs_gathered, policy_evaluated,
-      alternatives, precedent_cited, timestamp
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      alternatives, precedent_cited, timestamp, operation_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       id,
       input.decision_type,
@@ -190,11 +222,20 @@ export async function createDecisionTrace(
       input.alternatives ? JSON.stringify(input.alternatives) : null,
       input.precedent_cited ? JSON.stringify(input.precedent_cited) : null,
       timestamp,
+      input.operation_id ?? null,
     ],
   );
+  } catch (error) {
+    if (input.operation_id && isOperationIdUniqueViolation(error, "decision_traces")) {
+      const raced = await findDecisionTraceByOperationId(db, input.operation_id);
+      if (raced) return { trace: raced, duplicate: true };
+    }
+    throw error;
+  }
 
-  return {
+  const trace: DecisionTrace = {
     id,
+    operation_id: input.operation_id ?? null,
     decision_type: input.decision_type,
     epic_id: input.epic_id ?? null,
     bead_id: input.bead_id ?? null,
@@ -211,6 +252,7 @@ export async function createDecisionTrace(
     timestamp,
     created_at: null, // Set by database default
   };
+  return { trace, duplicate: false };
 }
 
 /**
