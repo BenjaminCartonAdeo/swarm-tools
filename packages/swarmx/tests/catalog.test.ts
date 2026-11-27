@@ -359,13 +359,13 @@ describe("JSON Schemas", () => {
     expect(schemaProperties(ready as ToolSpec)).toEqual({});
   });
 
-  test("swarm_review requires a non-empty path list for scoped diff generation", () => {
+  test("swarm_review allows an empty path list so read-only cells can be reviewed", () => {
     const review = findToolSpec("swarm_review");
     expect(review).toBeDefined();
     expect(review?.inputSchema.required).toContain("files_touched");
     expect(schemaProperties(review as ToolSpec).files_touched).toMatchObject({
       type: "array",
-      minItems: 1,
+      minItems: 0,
     });
   });
 
@@ -374,13 +374,17 @@ describe("JSON Schemas", () => {
     expect(complete).toBeDefined();
     expect(complete?.inputSchema.required).not.toContain("start_time");
     expect(complete?.inputSchema.required).toContain("files_touched");
+    expect(complete?.inputSchema.required).not.toContain("read_only");
     expect(schemaProperties(complete as ToolSpec).start_time).toMatchObject({
       type: "integer",
       minimum: 0,
     });
     expect(schemaProperties(complete as ToolSpec).files_touched).toMatchObject({
       type: "array",
-      minItems: 1,
+      minItems: 0,
+    });
+    expect(schemaProperties(complete as ToolSpec).read_only).toMatchObject({
+      type: "boolean",
     });
     expect(schemaProperties(complete as ToolSpec).summary).toMatchObject({
       type: "string",

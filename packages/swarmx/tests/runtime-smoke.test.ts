@@ -872,6 +872,52 @@ describe("mission gate → settle sequence", () => {
     ]);
   });
 
+  test("swarmmail_init accepts a caller name that differs only in case or separators", async () => {
+    const projectPath = await realpath(process.cwd());
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-init-normalized", epicID: "epic-1" },
+    });
+    await dispatchWorker(rig, "cell-init-normalized", "call-dispatch-init-normalized");
+    const init = rig.tools.get("swarmmail_init");
+
+    await init?.execute(
+      { project_path: projectPath, agent_name: "SWARM_Worker", task_description: "normalized" },
+      workerToolContext("swarm/swarm-worker", "call-init-normalized"),
+    );
+
+    expect(rig.runCalls).toEqual([
+      {
+        name: "swarmmail_init",
+        args: {
+          project_path: projectPath,
+          agent_name: "swarm-worker",
+          task_description: "normalized",
+        },
+      },
+    ]);
+  });
+
+  test("swarmmail_init still rejects another agent's name", async () => {
+    const projectPath = await realpath(process.cwd());
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-init-spoof", epicID: "epic-1" },
+    });
+    await dispatchWorker(rig, "cell-init-spoof", "call-dispatch-init-spoof");
+    const init = rig.tools.get("swarmmail_init");
+
+    await expect(
+      init?.execute(
+        { project_path: projectPath, agent_name: "swarm-coordinator", task_description: "spoof" },
+        workerToolContext("swarm/swarm-worker", "call-init-spoof-normalized"),
+      ),
+    ).rejects.toThrow(/agent_name must match the V2 caller/);
+    expect(rig.runCalls).toHaveLength(0);
+  });
+
   test("subagents can report completion without bypassing review or verification", async () => {
     const rig = await createRig({
       agents: GATE_AGENTS,
@@ -2334,6 +2380,265 @@ describe("mission gate → settle sequence", () => {
       ),
     ).rejects.toThrow(/scoped review receipt/);
     expect(rig.runCalls.map((call) => call.name)).toEqual(["swarm_review"]);
+  });
+
+  test("swarm_review approves a read-only cell with no diff", async () => {
+    const projectPath = await realpath(process.cwd());
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-read-only", epicID: "epic-1" },
+      payload: {
+        review_prompt: [
+          "## Files Modified",
+          "",
+          "## Code Changes",
+          "```diff",
+          "(no diff available)",
+          "```",
+          "",
+          "## Review Criteria",
+        ].join("\n"),
+        context: { files_touched: [] },
+      },
+    });
+    await dispatchWorker(rig, "cell-read-only", "call-dispatch-read-only");
+    await rig.tools.get("swarm_complete")?.execute(
+      {
+        project_key: projectPath,
+        agent_name: "swarm-worker",
+        bead_id: "cell-read-only",
+        summary: "Completed the read-only task.",
+        start_time: 1,
+        read_only: true,
+        files_touched: [],
+      },
+      workerToolContext("swarm/swarm-worker", "call-completion-read-only"),
+    );
+
+    await expect(
+      rig.tools.get("swarm_review")?.execute(
+        { project_key: projectPath, epic_id: "epic-1", task_id: "cell-read-only", files_touched: [] },
+        toolContext("swarm/swarm-coordinator", "call-review-read-only"),
+      ),
+    ).resolves.toBeDefined();
+  });
+
+  test("swarm_review still requires the assigned worker completion for a read-only cell", async () => {
+    const projectPath = await realpath(process.cwd());
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-read-only-no-completion", epicID: "epic-1" },
+      payload: {
+        review_prompt: [
+          "## Files Modified",
+          "",
+          "## Code Changes",
+          "```diff",
+          "(no diff available)",
+          "```",
+          "",
+          "## Review Criteria",
+        ].join("\n"),
+        context: { files_touched: [] },
+      },
+    });
+    await dispatchWorker(rig, "cell-read-only-no-completion", "call-dispatch-read-only-no-completion");
+
+    await expect(
+      rig.tools.get("swarm_review")?.execute(
+        {
+          project_key: projectPath,
+          epic_id: "epic-1",
+          task_id: "cell-read-only-no-completion",
+          files_touched: [],
+        },
+        toolContext("swarm/swarm-coordinator", "call-review-read-only-no-completion"),
+      ),
+    ).rejects.toThrow(/matching completion/);
+  });
+
+  test("swarm_review still rejects an incomplete diff when files are touched", async () => {
+    const projectPath = await realpath(process.cwd());
+    const file = SWARMX_FILE;
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-read-only-incomplete-diff", epicID: "epic-1" },
+      payload: {
+        review_prompt: [
+          "## Files Modified",
+          "",
+          "## Code Changes",
+          "```diff",
+          "(no diff available)",
+          "```",
+          "",
+          "## Review Criteria",
+        ].join("\n"),
+        context: { files_touched: [file] },
+      },
+    });
+    await dispatchWorker(rig, "cell-read-only-incomplete-diff", "call-dispatch-incomplete-diff");
+    await rig.tools.get("swarm_complete")?.execute(
+      {
+        project_key: projectPath,
+        agent_name: "swarm-worker",
+        bead_id: "cell-read-only-incomplete-diff",
+        summary: "Completed the task.",
+        start_time: 1,
+        files_touched: [file],
+      },
+      workerToolContext("swarm/swarm-worker", "call-completion-incomplete-diff"),
+    );
+
+    await expect(
+      rig.tools.get("swarm_review")?.execute(
+        {
+          project_key: projectPath,
+          epic_id: "epic-1",
+          task_id: "cell-read-only-incomplete-diff",
+          files_touched: [file],
+        },
+        toolContext("swarm/swarm-coordinator", "call-review-incomplete-diff"),
+      ),
+    ).rejects.toThrow(/non-empty scoped diff/);
+  });
+
+  test("swarm_finish closes the mission after a read-only review is approved", async () => {
+    const projectPath = await realpath(process.cwd());
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-read-only-finish", epicID: "epic-1" },
+      payloadFor: (name) =>
+        name === "swarm_review"
+          ? {
+              review_prompt: [
+                "## Files Modified",
+                "",
+                "## Code Changes",
+                "```diff",
+                "(no diff available)",
+                "```",
+                "",
+                "## Review Criteria",
+              ].join("\n"),
+              context: { files_touched: [] },
+            }
+          : { success: true },
+    });
+    await dispatchWorker(rig, "cell-read-only-finish", "call-dispatch-read-only-finish");
+    await rig.tools.get("swarm_complete")?.execute(
+      {
+        project_key: projectPath,
+        agent_name: "swarm-worker",
+        bead_id: "cell-read-only-finish",
+        summary: "Completed the read-only task.",
+        start_time: 1,
+        read_only: true,
+        files_touched: [],
+      },
+      workerToolContext("swarm/swarm-worker", "call-completion-read-only-finish"),
+    );
+    await rig.tools.get("swarm_review")?.execute(
+      {
+        project_key: projectPath,
+        epic_id: "epic-1",
+        task_id: "cell-read-only-finish",
+        files_touched: [],
+      },
+      toolContext("swarm/swarm-coordinator", "call-review-read-only-finish"),
+    );
+    await rig.tools.get("swarm_review_feedback")?.execute(
+      {
+        project_key: projectPath,
+        task_id: "cell-read-only-finish",
+        worker_id: "swarm-worker",
+        status: "approved",
+        summary: "Read-only task approved.",
+      },
+      toolContext("swarm/swarm-coordinator", "call-feedback-read-only-finish"),
+    );
+
+    await expect(
+      rig.tools.get("swarm_finish")?.execute(
+        { reason: "Read-only review approved." },
+        toolContext("swarm/swarm-coordinator", "call-finish-read-only"),
+      ),
+    ).resolves.toBeDefined();
+  });
+
+  test("swarm_complete rejects an empty file list without read_only", async () => {
+    const projectPath = await realpath(process.cwd());
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-empty-files-not-read-only", epicID: "epic-1" },
+    });
+    await dispatchWorker(rig, "cell-empty-files-not-read-only", "call-dispatch-empty-files-not-read-only");
+
+    await expect(
+      rig.tools.get("swarm_complete")?.execute(
+        {
+          project_key: projectPath,
+          agent_name: "swarm-worker",
+          bead_id: "cell-empty-files-not-read-only",
+          summary: "Completed without declaring the task read-only.",
+          start_time: 1,
+          files_touched: [],
+        },
+        workerToolContext("swarm/swarm-worker", "call-completion-empty-files-not-read-only"),
+      ),
+    ).rejects.toThrow(/files_touched must contain at least one file/);
+  });
+
+  test("swarm_review rejects an empty file list when the completion was not read-only", async () => {
+    const projectPath = await realpath(process.cwd());
+    const file = SWARMX_FILE;
+    const rig = await createRig({
+      agents: GATE_AGENTS,
+      projectPath,
+      workerCell: { cellID: "cell-empty-review-not-read-only", epicID: "epic-1" },
+      payload: {
+        review_prompt: [
+          "## Files Modified",
+          "",
+          "## Code Changes",
+          "```diff",
+          "(no diff available)",
+          "```",
+          "",
+          "## Review Criteria",
+        ].join("\n"),
+        context: { files_touched: [] },
+      },
+    });
+    await dispatchWorker(rig, "cell-empty-review-not-read-only", "call-dispatch-empty-review-not-read-only");
+    await rig.tools.get("swarm_complete")?.execute(
+      {
+        project_key: projectPath,
+        agent_name: "swarm-worker",
+        bead_id: "cell-empty-review-not-read-only",
+        summary: "Completed a task that touched a file.",
+        start_time: 1,
+        files_touched: [file],
+      },
+      workerToolContext("swarm/swarm-worker", "call-completion-empty-review-not-read-only"),
+    );
+
+    await expect(
+      rig.tools.get("swarm_review")?.execute(
+        {
+          project_key: projectPath,
+          epic_id: "epic-1",
+          task_id: "cell-empty-review-not-read-only",
+          files_touched: [],
+        },
+        toolContext("swarm/swarm-coordinator", "call-review-empty-not-read-only"),
+      ),
+    ).rejects.toThrow(/matching completion/);
   });
 
   test("swarm_review refuses a missing diff and cannot create an approval receipt", async () => {

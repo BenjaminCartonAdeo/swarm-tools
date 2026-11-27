@@ -1548,6 +1548,68 @@ ${learnings.join("\n")}
 // Helper Functions
 // ============================================================================
 
+export const AUDIT_PROMPT = `# [AUDIT] Read-only audit for: **{audit_id}**
+
+## [IDENTITY]
+Audit: {audit_id}
+Epic: {epic_id}
+
+## [MISSION]
+Audit the listed targets against the requirements. The coordinator already chose the targets; do not expand or replace the scope.
+
+## [TARGETS]
+{target_list}
+
+## [WORKFLOW]
+### Step 1: Initialize (MANDATORY FIRST)
+\`\`\`
+swarmmail_init(project_path="{project_path}", task_description="{audit_id}: read-only audit")
+\`\`\`
+
+### Step 2: Read every target file
+Read every listed target file before assessing it. If a target cannot be read, report it as a finding instead of guessing.
+
+### Step 3: Trace each requirement to code
+For each requirement, identify the code that implements it and determine whether the behavior matches.
+
+### Step 4: Record findings with file:line evidence
+Record each finding with its severity, requirement, exact file and line, and supporting evidence.
+
+### Step 5: Send a summary to the coordinator
+\`\`\`
+swarmmail_send(to=["coordinator"], subject="Audit Complete: {audit_id}", body="<summary and verdict>", thread_id="{epic_id}")
+\`\`\`
+
+### Step 6: Return structured JSON
+Return JSON in this shape:
+\`\`\`json
+{
+  "findings": [{ "severity": "high|medium|low", "file": "string", "line": "number", "requirement": "string", "evidence": "string" }],
+  "verdict": "pass|fail",
+  "summary": "string"
+}
+\`\`\`
+
+## [CRITICAL REQUIREMENTS]
+- This is read-only: do not modify any files; no edits are allowed.
+- Every finding must include file:line evidence and explain the requirement it relates to.
+- If a target cannot be read, report it as a finding instead of guessing.
+- Report only evidence-backed findings; do not infer missing behavior.
+
+Begin the audit now.`;
+
+export function formatAuditPrompt(params: {
+  audit_id: string;
+  epic_id: string;
+  targets: string[];
+  project_path: string;
+}): string {
+  return AUDIT_PROMPT.replaceAll("{audit_id}", params.audit_id)
+    .replaceAll("{epic_id}", params.epic_id)
+    .replaceAll("{target_list}", params.targets.map((target) => `- ${target}`).join("\n"))
+    .replaceAll("{project_path}", params.project_path);
+}
+
 /**
  * Format the researcher prompt for a documentation research task
  */
@@ -1956,6 +2018,10 @@ export const swarm_spawn_researcher = tool({
   args: {
     research_id: tool.schema.string().describe("Unique ID for this research task"),
     epic_id: tool.schema.string().describe("Parent epic ID"),
+    cell_kind: tool.schema
+      .enum(["research", "audit"])
+      .optional()
+      .describe("Type of read-only work to prepare: documentation research or code audit"),
     tech_stack: tool.schema
       .array(tool.schema.string())
       .describe("Explicit list of technologies to research (from coordinator)"),
@@ -1968,37 +2034,60 @@ export const swarm_spawn_researcher = tool({
       .describe("If true, compare installed vs latest versions (default: false)"),
   },
   async execute(args) {
-    const prompt = formatResearcherPrompt({
-      research_id: args.research_id,
-      epic_id: args.epic_id,
-      tech_stack: args.tech_stack,
-      project_path: args.project_path,
-      check_upgrades: args.check_upgrades ?? false,
-    });
+    const cellKind = args.cell_kind ?? "research";
+    const prompt = cellKind === "audit"
+      ? formatAuditPrompt({
+          audit_id: args.research_id,
+          epic_id: args.epic_id,
+          targets: args.tech_stack,
+          project_path: args.project_path,
+        })
+      : formatResearcherPrompt({
+          research_id: args.research_id,
+          epic_id: args.epic_id,
+          tech_stack: args.tech_stack,
+          project_path: args.project_path,
+          check_upgrades: args.check_upgrades ?? false,
+        });
 
     return JSON.stringify(
       {
         prompt,
         research_id: args.research_id,
         epic_id: args.epic_id,
+        cell_kind: cellKind,
         tech_stack: args.tech_stack,
         project_path: args.project_path,
         check_upgrades: args.check_upgrades ?? false,
         subagent_type: "swarm-researcher",
-        expected_output: {
-          technologies: [
-            {
-              name: "string",
-              installed_version: "string",
-              latest_version: "string | null",
-              key_patterns: ["string"],
-              gotchas: ["string"],
-              breaking_changes: ["string"],
-              memory_id: "string",
+        expected_output: cellKind === "audit"
+          ? {
+              findings: [
+                {
+                  severity: "high|medium|low",
+                  file: "string",
+                  line: "number",
+                  requirement: "string",
+                  evidence: "string",
+                },
+              ],
+              verdict: "pass|fail",
+              summary: "string",
+            }
+          : {
+              technologies: [
+                {
+                  name: "string",
+                  installed_version: "string",
+                  latest_version: "string | null",
+                  key_patterns: ["string"],
+                  gotchas: ["string"],
+                  breaking_changes: ["string"],
+                  memory_id: "string",
+                },
+              ],
+              summary: "string",
             },
-          ],
-          summary: "string",
-        },
       },
       null,
       2,

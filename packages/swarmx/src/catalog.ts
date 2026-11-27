@@ -492,7 +492,7 @@ const SWARM_SPECS: readonly ToolSpec[] = [
   ),
   backend(
     "swarm_complete",
-    "Submit a worker's completion for coordinator review. Requires a non-empty files_touched list; start_time is optional and defaults to the submission time. swarmx runs the verification gate and finalizes only after an approved scoped review. Skip flags are rejected.",
+    "Submit a worker's completion for coordinator review. Requires a non-empty files_touched list unless read_only is true; start_time is optional and defaults to the submission time. swarmx runs the verification gate and finalizes only after an approved scoped review. Skip flags are rejected.",
     {
       project_key: str("Project key"),
       agent_name: str("Agent name"),
@@ -500,8 +500,11 @@ const SWARM_SPECS: readonly ToolSpec[] = [
       summary: str("Completion summary", { minLength: 1 }),
       evaluation: str("Self-evaluation JSON"),
       files_touched: withDescription(
-        { type: "array", items: str(), minItems: 1 },
-        "Non-empty list of changed file paths; these paths will be verified",
+        { type: "array", items: str(), minItems: 0 },
+        "Changed file paths to verify; empty only for a read-only audit cell completed with read_only: true",
+      ),
+      read_only: bool(
+        "Audit/read-only cell: allows an empty files_touched and records a read-only completion",
       ),
       start_time: num(
         "Optional task start timestamp in Unix milliseconds; defaults to the submission time",
@@ -647,14 +650,14 @@ const WORKTREE_REVIEW_SPECS: readonly ToolSpec[] = [
   ),
   backend(
     "swarm_review",
-    "Coordinator-only: generate a review prompt with the epic context and a complete diff limited to non-empty files_touched paths in the active project.",
+    "Coordinator-only: generate a review prompt with the epic context and a complete diff limited to files_touched paths in the active project. An empty files_touched list is accepted only for a cell whose completion was submitted with read_only: true.",
     {
       project_key: str("Canonical active project root"),
       epic_id: str("Epic bead ID"),
       task_id: str("Subtask bead ID to review"),
       files_touched: withDescription(
-        { type: "array", items: str(), minItems: 1 },
-        "Non-empty list of changed paths; review output includes only these files' diff",
+        { type: "array", items: str(), minItems: 0 },
+        "Changed paths to scope the review diff; empty only for a read-only cell completed with read_only: true",
       ),
     },
     ["project_key", "epic_id", "task_id", "files_touched"],
@@ -2039,6 +2042,9 @@ async function validateProjectFiles(
   input: Record<string, unknown>,
   projectRoot: string,
 ): Promise<Record<string, unknown>> {
+  if (tool === "swarm_review" && Array.isArray(input.files_touched) && input.files_touched.length === 0) {
+    return input;
+  }
   if (!Array.isArray(input.files_touched) || input.files_touched.length === 0) {
     throw new LocalToolError(tool, "invalid_input", "files_touched must contain at least one file");
   }
@@ -2171,6 +2177,7 @@ interface PendingCompletionReceipt {
   readonly summary: string;
   readonly startTime: number;
   readonly filesTouched: readonly string[];
+  readonly readOnly?: boolean;
   readonly submittedAt: number;
   readonly finalizing?: boolean;
   readonly finalized?: boolean;
@@ -2547,11 +2554,12 @@ async function recordScopedReview(
   const taskID = requireStringInput("swarm_review", args, "task_id");
   const epicID = requireStringInput("swarm_review", args, "epic_id");
   const filesTouched = args.files_touched as string[];
-  const check = checkScopedReviewDiff(output, filesTouched);
-  if (!check.ok) {
+  const readOnlyReview = filesTouched.length === 0;
+  const check = readOnlyReview ? undefined : checkScopedReviewDiff(output, filesTouched);
+  if (check !== undefined && !check.ok) {
     throw new LocalToolError("swarm_review", "conflict", scopedDiffFailureMessage(check.missing));
   }
-  const diff = check.diff;
+  const diff = check?.diff ?? "";
 
   const lockKey = [scope.projectID, scope.sessionID].map(encodeURIComponent).join(":");
   await withReviewDecisionLock(lockKey, async () => {
@@ -2586,6 +2594,13 @@ async function recordScopedReview(
       pending.workerAgentID !== assignedAgent.id ||
       !samePaths(pending.filesTouched, filesTouched)
     ) {
+      throw new LocalToolError(
+        "swarm_review",
+        "conflict",
+        "review requires the assigned worker's matching completion submission and file list",
+      );
+    }
+    if (readOnlyReview && pending.readOnly !== true) {
       throw new LocalToolError(
         "swarm_review",
         "conflict",
@@ -2655,7 +2670,6 @@ async function readScopedReview(
       value.projectPath === projectPath &&
       value.taskID === taskID &&
       (workerID === value.assignedAgentID || workerID === value.assignedAgentName) &&
-      value.filesTouched.length > 0 &&
       value.approval !== undefined
     ) {
       throw new LocalToolError(
@@ -2671,8 +2685,7 @@ async function readScopedReview(
       value.missionID !== missionID ||
       value.projectPath !== projectPath ||
       value.taskID !== taskID ||
-      (workerID !== value.assignedAgentID && workerID !== value.assignedAgentName) ||
-      value.filesTouched.length === 0
+      (workerID !== value.assignedAgentID && workerID !== value.assignedAgentName)
     ) {
       throw new LocalToolError(
         "swarm_review_feedback",
@@ -2839,6 +2852,7 @@ async function submitPendingCompletion(
   }
   const parentMission = worker.parentMission;
   const receipt: PendingCompletionReceipt = {
+    readOnly: args.read_only === true && (args.files_touched as string[]).length === 0,
     projectID,
     parentSessionID: parentMission.sessionID,
     missionID: reviewMissionID(parentMission),
@@ -3276,31 +3290,36 @@ async function executeReviewFeedbackLocked(
     );
   }
 
-  const currentDiff = await runToolForSession(
-    runtime,
-    "swarm_review",
-    {
-      project_key: receipt.projectPath,
-      epic_id: receipt.epicID,
-      task_id: receipt.taskID,
-      files_touched: receipt.filesTouched,
-    },
-    receipt.sessionID,
-    120_000,
-  );
-  const check = checkScopedReviewDiff(currentDiff, receipt.filesTouched);
-  if (!check.ok) {
-    throw new LocalToolError("swarm_review_feedback", "conflict", scopedDiffFailureMessage(check.missing));
-  }
-  if (createHash("sha256").update(check.diff).digest("hex") !== receipt.diffHash) {
-    throw new LocalToolError(
-      "swarm_review_feedback",
-      "conflict",
-      "the diff changed after review; request a fresh review before feedback",
+  const readOnlyReceipt = receipt.filesTouched.length === 0;
+  if (!readOnlyReceipt) {
+    const currentDiff = await runToolForSession(
+      runtime,
+      "swarm_review",
+      {
+        project_key: receipt.projectPath,
+        epic_id: receipt.epicID,
+        task_id: receipt.taskID,
+        files_touched: receipt.filesTouched,
+      },
+      receipt.sessionID,
+      120_000,
     );
+    const check = checkScopedReviewDiff(currentDiff, receipt.filesTouched);
+    if (!check.ok) {
+      throw new LocalToolError("swarm_review_feedback", "conflict", scopedDiffFailureMessage(check.missing));
+    }
+    if (createHash("sha256").update(check.diff).digest("hex") !== receipt.diffHash) {
+      throw new LocalToolError(
+        "swarm_review_feedback",
+        "conflict",
+        "the diff changed after review; request a fresh review before feedback",
+      );
+    }
   }
 
-  const docOnly = receipt.filesTouched.every(isDocOnlyPath);
+  // A read-only cell writes nothing, so there is no build to verify: treat it
+  // like a doc-only cell and record the approval as unverifiable.
+  const docOnly = readOnlyReceipt || receipt.filesTouched.every(isDocOnlyPath);
   let unverifiable = false;
   let completionOutput: unknown;
   let verificationReceipt: VerificationGateReceipt | undefined;
@@ -3952,6 +3971,17 @@ async function requireCoordinatorOrMissionOwner(
   }
 }
 
+function matchesAgentIdentity(requested: unknown, expected: string): boolean {
+  if (typeof requested !== "string") return false;
+  const normalize = (value: string) =>
+    value
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+  return normalize(requested) === normalize(expected);
+}
+
 async function bindSwarmMailIdentity(
   runtime: SwarmxRuntime,
   context: ToolExecuteContextLike,
@@ -3969,8 +3999,16 @@ async function bindSwarmMailIdentity(
     throw new LocalToolError("swarmmail_init", "agent_unknown", "the V2 caller is not present in the agent roster");
   }
   const requestedName = input.agent_name;
-  if (requestedName !== undefined && requestedName !== caller.id && requestedName !== caller.name) {
-    throw new LocalToolError("swarmmail_init", "conflict", "agent_name must match the V2 caller");
+  if (
+    requestedName !== undefined &&
+    !matchesAgentIdentity(requestedName, caller.id) &&
+    !matchesAgentIdentity(requestedName, caller.name)
+  ) {
+    throw new LocalToolError(
+      "swarmmail_init",
+      "conflict",
+      `agent_name must match the V2 caller (${caller.name})`,
+    );
   }
   if ((await resolveCallerMode(runtime, context, "swarmmail_init")) !== "primary") {
     await requireAssignedWorkerScope(runtime, context, "swarmmail_init");
@@ -4089,12 +4127,16 @@ async function executeSpec(
         },
       });
     }
-    args = await validateProjectFiles(
-      runtime,
-      "swarm_complete",
-      args,
-      await validateProjectRoot(runtime, "swarm_complete", args.project_key),
-    );
+    const completedFiles = args.files_touched as string[];
+    const readOnlyCompletion = args.read_only === true && completedFiles.length === 0;
+    if (!readOnlyCompletion) {
+      args = await validateProjectFiles(
+        runtime,
+        "swarm_complete",
+        args,
+        await validateProjectRoot(runtime, "swarm_complete", args.project_key),
+      );
+    }
     return submitPendingCompletion(runtime, context, args, scope);
   }
   if (spec.name === "swarmmail_init") {
