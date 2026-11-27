@@ -597,6 +597,76 @@ describe("on-demand research section", () => {
   });
 });
 
+describe("swarm_spawn_researcher audit mode", () => {
+  test("cell_kind=audit returns an audit prompt instead of documentation research", async () => {
+    const { swarm_spawn_researcher } = await import("./swarm-prompts");
+    const result = await swarm_spawn_researcher.execute({
+      research_id: "audit-abc123",
+      epic_id: "epic-xyz789",
+      tech_stack: ["src/main/java/Foo.java"],
+      project_path: "/path/to/project",
+      cell_kind: "audit",
+    });
+
+    const parsed = JSON.parse(result);
+    expect(parsed.prompt).toContain("[AUDIT]");
+    expect(parsed.prompt).toContain("swarmmail_init");
+    expect(parsed.prompt).not.toContain("Step 4: Fetch Documentation");
+    expect(parsed.prompt).not.toContain("nextjs_docs");
+    expect(parsed.subagent_type).toBe("swarm-researcher");
+  });
+
+  test("audit prompt forbids writes and requires sourced findings", async () => {
+    const { swarm_spawn_researcher } = await import("./swarm-prompts");
+    const result = await swarm_spawn_researcher.execute({
+      research_id: "audit-abc123",
+      epic_id: "epic-xyz789",
+      tech_stack: ["src/main/java/Foo.java"],
+      project_path: "/path/to/project",
+      cell_kind: "audit",
+    });
+
+    const parsed = JSON.parse(result);
+    expect(parsed.prompt).toContain("do not modify");
+    expect(parsed.prompt).toContain("file:line");
+    expect(parsed.prompt).toContain("findings");
+  });
+
+  test("cell_kind defaults to research and keeps the existing prompt", async () => {
+    const { swarm_spawn_researcher } = await import("./swarm-prompts");
+    const args = {
+      research_id: "research-abc123",
+      epic_id: "epic-xyz789",
+      tech_stack: ["Next.js", "React"],
+      project_path: "/path/to/project",
+      check_upgrades: false,
+    };
+    const result = await swarm_spawn_researcher.execute(args);
+
+    expect(JSON.parse(result).prompt).toBe(formatResearcherPrompt(args));
+  });
+
+  test("cell_kind=audit is echoed in the returned JSON", async () => {
+    const { swarm_spawn_researcher } = await import("./swarm-prompts");
+    const auditResult = await swarm_spawn_researcher.execute({
+      research_id: "audit-abc123",
+      epic_id: "epic-xyz789",
+      tech_stack: ["src/main/java/Foo.java"],
+      project_path: "/path/to/project",
+      cell_kind: "audit",
+    });
+    const researchResult = await swarm_spawn_researcher.execute({
+      research_id: "research-abc123",
+      epic_id: "epic-xyz789",
+      tech_stack: ["Next.js"],
+      project_path: "/path/to/project",
+    });
+
+    expect(JSON.parse(auditResult).cell_kind).toBe("audit");
+    expect(JSON.parse(researchResult).cell_kind).toBe("research");
+  });
+});
+
 describe("swarm_spawn_researcher tool", () => {
   test("returns JSON with prompt field", async () => {
     const { swarm_spawn_researcher } = await import("./swarm-prompts");
