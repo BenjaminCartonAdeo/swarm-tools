@@ -1,5 +1,57 @@
 # swarm-mail
 
+## 1.12.0
+
+### Minor Changes
+
+- [`a6aae33`](https://github.com/joelhooks/swarm-tools/commit/a6aae3320d43ea5cedb16de49c711b6565c06069) Thanks [@BenjaminCartonAdeo](https://github.com/BenjaminCartonAdeo)! - > « The purpose of abstracting is not to be vague, but to create a new semantic level in which one can be absolutely precise. »
+
+  > — Edsger W. Dijkstra, _The Humble Programmer_ (1972)
+
+  ## 🐝 Tests stop targeting the real swarm database
+
+  Streams tests now use guarded temporary database paths, so cleanup can no longer unlink `~/.config/swarm-tools/swarm.db`. `SWARM_DB_PATH` also preserves legacy migration behavior instead of bypassing it.
+
+  ## Durable completion signals work across processes
+
+  DurableDeferred accepts an optional stable key and always resolves through its persisted database state. This fixes completion signals that were written to SQLite but never observed by an in-memory waiter. Schema validation now sees SQLite generated columns, and missing optional AI credentials degrade quietly without network calls.
+
+  **Backward compatible:** Existing deferred callers can omit `key`; random URLs remain the default. Public swarm tool names and arguments are unchanged.
+
+- [`ad38888`](https://github.com/joelhooks/swarm-tools/commit/ad38888d9fa3f1bf019e70a3e7bdb28403dd6e19) Thanks [@BenjaminCartonAdeo](https://github.com/BenjaminCartonAdeo)! - > « The purpose of abstracting is not to be vague, but to create a new semantic level in which one can be absolutely precise. »
+
+  > — Edsger W. Dijkstra, _The Humble Programmer_ (1972)
+
+  ## 🐝 Durable identity across Hive and review feedback
+
+  **What changed:** Hive v11 adds nullable `operation_id` and its partial unique index. Hive v12 separately adds nullable, unique `completion_operation_id`, exposed in the `cells` view. The package also exports additive durable review-feedback and recovery APIs.
+
+  **Why it matters:** Operation identity can be persisted for idempotent feedback and completion while keeping the additive lifecycle/recovery APIs available to callers that need them.
+
+  **Migration and rollback:** Apply the numbered migrations in order. Rolling back v12 → v11 removes `completion_operation_id`; rolling back v11 → v10 discards `operation_id`. The fallback is read-only for one release. Import writes the tombstone last; lifecycle-store writes are disabled, and tombstone-guarded storage rejects lifecycle `set`/`remove` calls. Reads may still use the legacy projection. Raw KV remains technically accessible; only supported lifecycle-store and tombstone-guarded paths are blocked.
+
+  **Backward compatible:** Readers selecting existing named columns remain compatible. `SELECT *` readers observe changed column counts as the new fields are added, and should select columns explicitly. Both operation IDs are nullable, so existing rows need no synthesized identity.
+
+### Patch Changes
+
+- [`feb227e`](https://github.com/joelhooks/swarm-tools/commit/feb227e8911311c6619a75c04b3d58c898a18ad0) Thanks [@joelhooks](https://github.com/joelhooks)! - Fix hivemind memory CLI pointing at wrong database
+
+  The `swarm memory` CLI commands (stats, find, store, etc.) were connecting to a per-project `streams.db` in `/tmp/` instead of the global `~/.config/swarm-tools/swarm.db` where all memories actually live. This caused `swarm memory stats` to show 0 and `swarm memory find` to return no results.
+
+  Also fixes libSQL `COUNT(*)` returning 0 on tables with F32_BLOB vector columns — replaced with `COUNT(id)` across all memory-touching code paths.
+
+- [`ba2b507`](https://github.com/joelhooks/swarm-tools/commit/ba2b507f92382935084f18cb4bad84a5535ecf6c) Thanks [@BenjaminCartonAdeo](https://github.com/BenjaminCartonAdeo)! - > « The purpose of abstracting is not to be vague, but to create a new semantic level in which one can be absolutely precise. »
+
+  > — Edsger W. Dijkstra, _The Humble Programmer_ (1972)
+
+  ## 🐝 Partial cell lookups keep their operation identities
+
+  `hive_cells({ id })` and other partial-ID lookups now preserve `operation_id` and `completion_operation_id` instead of silently returning `null`.
+
+  **Why it matters:** Approved completions could be closed with the correct durable identity in the database while the public lookup output appeared to have no identity, making reconciliation and audit misleading.
+
+  **Backward compatible:** The fields were already part of the cell contract; this restores them on the partial-ID query path without changing tool names or arguments.
+
 ## 1.11.2
 
 ### Patch Changes

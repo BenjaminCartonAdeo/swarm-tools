@@ -1,5 +1,63 @@
 # swarm-tools
 
+## 0.60.0
+
+### Minor Changes
+
+- [`2ad83e6`](https://github.com/joelhooks/swarm-tools/commit/2ad83e6ece83fb409267d5b92e6ff59444d9ebcd) Thanks [@joelhooks](https://github.com/joelhooks)! - Overhaul hivemind memory hooks to stop flooding sessions with garbage context
+
+  **Auto-recall fixes:**
+
+  - Add 30s cooldown between recall queries (was firing ~608x per 8hr session)
+  - Raise minScore from 0.3 to 0.55 (filter weak matches)
+  - Skip system messages (watchdog, heartbeat, exec logs, telegrams, etc.)
+  - Truncate query to first 200 chars instead of sending full prompt
+  - Move console.log spam behind debug flag
+  - Reduce maxRecallResults from 5 to 3
+
+  **Auto-capture fixes:**
+
+  - Only capture assistant responses (was also capturing user messages and system prompts)
+  - Replace loose CAPTURE_PATTERNS with STRONG_CAPTURE_PATTERNS requiring actual knowledge signals
+  - Add 19-pattern system message blocklist (heartbeat, watchdog, OUTCOME/DECISION blocks, etc.)
+  - Raise min capture length from 50 to 80 chars
+  - Long messages (300+) only captured if also entity-rich
+  - Reduce captures per turn from 2 to 1
+  - Increase truncation from 500 to 1000 chars (capture complete thoughts)
+
+  **Format improvements:**
+
+  - Increase recalled content from 300 to 600 chars
+  - Drop emoji decay badges (waste tokens)
+  - Drop "Relevant memories:" header and "Use naturally" instruction
+  - Cleaner format: `- (85%) [tags] content`
+
+  **Tag detection:**
+
+  - Remove "task" tag (matched every system log)
+  - Add "gotcha", "architecture", "config" tags
+
+  **Session handler:**
+
+  - Don't store "Session ended without summary" garbage (require 50+ char summary)
+  - Better session start query, limit results from 5 to 3
+
+  **New config options:** recallCooldownMs, maxCapturePerTurn, captureContentLimit, recallContentLimit
+
+- [`ad38888`](https://github.com/joelhooks/swarm-tools/commit/ad38888d9fa3f1bf019e70a3e7bdb28403dd6e19) Thanks [@BenjaminCartonAdeo](https://github.com/BenjaminCartonAdeo)! - > « The purpose of abstracting is not to be vague, but to create a new semantic level in which one can be absolutely precise. »
+
+  > — Edsger W. Dijkstra, _The Humble Programmer_ (1972)
+
+  ## MCP keeps optional operation identity intact
+
+  **What changed:** The MCP tool bridge accepts and forwards the complete JSON argument object, including optional `operation_id`, to the Swarm CLI unchanged.
+
+  **Why it matters:** Callers can pass an idempotency key across the MCP/CLI boundary without a separate adapter-specific translation.
+
+  **Migration and rollback:** No migration is required. If rolling back this bridge change, callers should stop relying on `operation_id` being forwarded through this package.
+
+  **Backward compatible:** `operation_id` remains optional. Existing callers that omit it continue to work, and omission stays omission; no new tool names or required arguments are introduced.
+
 ## 0.59.7
 
 ### Patch Changes
