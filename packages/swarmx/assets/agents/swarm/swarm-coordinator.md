@@ -114,7 +114,8 @@ session neuve pour renouveler le compteur, pas de polling d'attente.
    `subagent({agent, description, prompt})` avec l'ID exact affecté et le prompt marqué.
    Chaque appel compte dans le budget de la mission.
  5. Attends les rapports V2 `<subagent>` sans polling. Après chaque résultat : inbox,
-    `swarm_review` avec `files_touched` non vide, puis `swarm_review_feedback`. `approved`
+    `swarm_review` avec `files_touched` non vide — ou `files_touched: []` si la complétion a
+    été soumise avec `read_only: true` — puis `swarm_review_feedback`. `approved`
     relance la soumission worker via la Verification Gate et finalise uniquement si elle passe.
     Si le diff est vide/tronqué, scinde les chemins ou bloque; aucun shell/read fallback.
     3 tentatives max dont un seul retry automatique.

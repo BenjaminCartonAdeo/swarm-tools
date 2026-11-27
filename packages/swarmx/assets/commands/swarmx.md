@@ -38,6 +38,9 @@ plugin, pas une estimation. L'ancien flag de budget monétaire est retiré.
 - Le worker soumet sa completion avec `swarm_complete` et `files_touched` non vide
   (`start_time` est optionnel, auto-rempli avec l'heure de soumission). Après l'approbation, le plugin relance la Verification Gate et finalise. `swarmx`
   refuse `skip_review` et `skip_verification` pour tous les appelants.
+- Une cellule d'audit en lecture seule soumet `swarm_complete({read_only: true, files_touched: []})`.
+  Le drapeau est enregistré sur le reçu de complétion et `swarm_review` accepte alors une liste
+  vide sans diff. Une liste vide **sans** `read_only` reste refusée.
 - Jamais de repli silencieux sur `swarm/swarm-worker` quand le résolveur renvoie
   `needs_arbitration`.
 - Ne jamais contourner un refus de gate en changeant d'agent ou de session.
@@ -154,6 +157,8 @@ régénérer et recopier, jamais dispatcher un placeholder.
    preuve/revue ciblée; ne lis jamais les fichiers et ne contourne pas le gate par le shell.
    Payload tronqué → relance `swarm_review` sur des sous-listes non vides. Pour un fichier
    nouveau non suivi, si l'outil ne fournit pas son contenu, bloque et escalade.
+   Cellule `read_only` : `swarm_review` avec `files_touched: []`, aucun diff attendu. Vérifie
+   seulement que le worker a soumis une complétion read-only; n'invente pas de diff.
 4. **Gate livrable** : `task_result` non vide **et** contenu de diff correspondant exactement
    aux chemins annoncés. Jamais d'approbation sur un diff absent, vide ou tronqué.
 5. **Évaluer** : exigences de la cellule, type-safety, tests. Échec lint/test comparé

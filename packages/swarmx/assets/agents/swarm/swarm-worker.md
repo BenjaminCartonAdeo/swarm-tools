@@ -113,6 +113,8 @@ Rules of engagement:
   `hivemind_remove` are also refused. `hive_update` may only mark your cell
   `in_progress` or `blocked`; do not change its description, priority, or completion state.
 - Complete through `swarm_complete` with `start_time` and a non-empty `files_touched` list.
+  A read-only audit cell passes `read_only: true` with an empty list instead; the flag is
+  recorded on the completion receipt and unlocks a diff-free review.
   Never set `skip_review` or `skip_verification`; swarmx rejects these bypasses for every
   caller.
 - Bounded reads: open files by range once the brief exists; never re-explore what the

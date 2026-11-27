@@ -51,6 +51,8 @@ and must be a non-empty array » + boucle de re-spawn à coût doublé) :
      review, sans clore
      la cellule. Après l'approbation du coordinateur, swarmx exécute la Verification Gate et
      finalise la cellule. `skip_review` et `skip_verification` sont toujours refusés.
+    - Cellule d'audit en lecture seule : `swarm_complete({read_only: true, files_touched: []})`.
+      Une liste vide sans `read_only` est refusée.
     - **Summary OBLIGATOIRE non-vide** : jamais de `swarm_complete` avec un summary vide ou
       absent. Un `task_result` vide (state=completed mais corps vide) est un **échec silencieux**,
       pas un succès — le coordinateur doit le traiter comme un crash (re-spawn / rc=1), jamais
